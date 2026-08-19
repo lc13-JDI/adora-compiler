@@ -180,6 +180,18 @@ class ValidatorCLITest(unittest.TestCase):
             self.assertTrue(result.stderr.startswith(
                 "HANDOFF PACKAGE INVALID category=hash detail="), result.stderr)
 
+    def test_listed_symlink_loop_is_one_line_hash_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp))
+            (package / "artifacts/loop").symlink_to("loop")
+            with (package / "SHA256SUMS").open("a", encoding="utf-8") as stream:
+                stream.write(f"{'0' * 64}  artifacts/loop\n")
+            result = self.run_cli(package)
+            self.assertEqual(result.returncode, 11, result.stderr)
+            self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+            self.assertTrue(result.stderr.startswith(
+                "HANDOFF PACKAGE INVALID category=hash detail="), result.stderr)
+
     def test_resealed_invalid_utf8_json_is_one_line_schema_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = create_package(Path(tmp))

@@ -45,11 +45,15 @@ def safe_file(package, value, code=SCHEMA):
     if path.is_absolute() or ".." in path.parts or any(part in ("", ".") for part in path.parts):
         fail(code, "schema" if code == SCHEMA else "hash", "unsafe path")
     candidate = package / path
+    if candidate.is_symlink():
+        fail(code, "schema" if code == SCHEMA else "hash", "path is not a regular file")
     try:
         candidate.resolve().relative_to(package.resolve())
     except ValueError:
         fail(code, "schema" if code == SCHEMA else "hash", "path escapes package")
-    if candidate.is_symlink() or not candidate.is_file():
+    except (RuntimeError, OSError):
+        fail(code, "schema" if code == SCHEMA else "hash", "path cannot be resolved")
+    if not candidate.is_file():
         fail(code, "schema" if code == SCHEMA else "hash", "path is not a regular file")
     return candidate
 
