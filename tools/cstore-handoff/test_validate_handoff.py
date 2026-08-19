@@ -170,6 +170,17 @@ class ValidatorCLITest(unittest.TestCase):
             (package / "artifacts/SHA256SUMS").write_text("unlisted payload\n")
             self.assert_invalid(package, 11, "hash")
 
+    def test_resealed_invalid_utf8_json_is_one_line_schema_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp))
+            (package / "artifacts/operations.json").write_bytes(b"\xff")
+            reseal(package)
+            result = self.run_cli(package)
+            self.assertEqual(result.returncode, 12, result.stderr)
+            self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+            self.assertTrue(result.stderr.startswith(
+                "HANDOFF PACKAGE INVALID category=schema detail="), result.stderr)
+
     def test_manifest_json_schema_placeholder_and_unsafe_path_are_schema_failures(self):
         mutations = [
             lambda p: (p / "manifest.json").write_text("{"),

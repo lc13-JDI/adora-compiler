@@ -95,7 +95,7 @@ def recursively_no_placeholders(value, name="manifest"):
 def json_file(path, label):
     try:
         with path.open(encoding="utf-8") as stream: return json.load(stream)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         fail(SCHEMA, "schema", f"invalid JSON in {label}: {exc}")
 
 
