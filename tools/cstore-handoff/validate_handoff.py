@@ -306,8 +306,9 @@ def validate_adg(data):
     instances = require_list(adg.get("instances"), "ADG instances")
     for module in modules:
         module_id = validate_iob(module, top_edges)
-        matching = [item for item in instances if isinstance(item, dict) and item.get("module_id") == module_id and item.get("type") == "IOB"]
-        if not matching: fail(CONTRACT, "contract", "IOB module is not instantiated")
+        matching = [item for item in instances if isinstance(item, dict) and item.get("module_id") == module_id]
+        if not matching or any(item.get("type") != "IOB" for item in matching):
+            fail(CONTRACT, "contract", "IOB module is not instantiated as IOB")
         for item in matching:
             ports = {dst_port for _, _, _, dst_id, dst_type, dst_port in top_edges if dst_id == item.get("id") and dst_type == "IOB"}
             if ports != {0, 1, 2, 3, 4, 5}: fail(CONTRACT, "contract", "IOB top-level inputs are incomplete")

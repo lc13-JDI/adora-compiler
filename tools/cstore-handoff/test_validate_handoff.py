@@ -280,6 +280,11 @@ class ValidatorCLITest(unittest.TestCase):
             package = create_package(Path(tmp)); spoofed_top_level_iob_type(package); reseal(package)
             self.assert_invalid(package, 13, "contract")
 
+    def test_extra_spoofed_top_level_iob_instance_is_contract_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp)); extra_spoofed_top_level_iob_instance(package); reseal(package)
+            self.assert_invalid(package, 13, "contract")
+
     def test_disconnected_delaypipe_path_is_contract_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = create_package(Path(tmp)); disconnect_delaypipe_path(package); reseal(package)
@@ -456,6 +461,12 @@ def ghost_iocontroller_endpoint(package):
 def spoofed_top_level_iob_type(package):
     path, value = json_file(package, "artifacts/adg.json")
     value["instances"][0]["type"] = "GIB"
+    dump(path, value)
+
+
+def extra_spoofed_top_level_iob_instance(package):
+    path, value = json_file(package, "artifacts/adg.json")
+    value["instances"].append({"id": 43, "type": "GIB", "module_id": 1})
     dump(path, value)
 
 
