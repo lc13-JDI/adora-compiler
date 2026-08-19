@@ -34,7 +34,7 @@ def reseal(package):
         package / "artifacts/generator-input/vitra_spec.json")
     dump(manifest_path, manifest)
     payload = sorted(p for p in package.rglob("*") if p.is_file() and
-                     p.name != "SHA256SUMS")
+                     p != package / "SHA256SUMS")
     (package / "SHA256SUMS").write_text("".join(
         f"{digest(p)}  {p.relative_to(package).as_posix()}\n" for p in payload),
         encoding="utf-8")
@@ -162,6 +162,12 @@ class ValidatorCLITest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             package = create_package(Path(tmp)); path = package / "artifacts/adg.json"
             path.write_bytes(path.read_bytes() + b" ")
+            self.assert_invalid(package, 11, "hash")
+
+    def test_unlisted_nested_sha256sums_is_hash_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp))
+            (package / "artifacts/SHA256SUMS").write_text("unlisted payload\n")
             self.assert_invalid(package, 11, "hash")
 
     def test_manifest_json_schema_placeholder_and_unsafe_path_are_schema_failures(self):

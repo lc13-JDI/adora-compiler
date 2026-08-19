@@ -123,7 +123,7 @@ def verify_layout_and_hashes(package):
     payload = set()
     for path in package.rglob("*"):
         if path.is_symlink(): fail(HASH, "hash", "symlink in package")
-        if path.is_file() and path.name != "SHA256SUMS": payload.add(path.relative_to(package).as_posix())
+        if path.is_file() and path != package / "SHA256SUMS": payload.add(path.relative_to(package).as_posix())
     if set(listed) != payload: fail(HASH, "hash", "SHA256SUMS does not cover exactly the payload")
     for rel, expected in listed.items():
         if sha256(package / rel) != expected: fail(HASH, "hash", f"digest mismatch: {rel}")
