@@ -29,6 +29,11 @@ def fail(code, category, detail):
     raise Invalid(code, category, detail)
 
 
+class HandoffArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Invalid(2, "usage", message)
+
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -249,7 +254,7 @@ def validate_iob(module, top_edges):
     if aggregate is None or aggregate[1] < aggregate[2]: fail(CONTRACT, "contract", "invalid aggregate configuration")
     intervals = []
     for value in config.values():
-        if not isinstance(value, list) or len(value) != 3 or not isinstance(value[1], int) or not isinstance(value[2], int) or value[1] < value[2] or value[2] < 0 or value[1] > aggregate[1]:
+        if not isinstance(value, list) or len(value) != 3 or not isinstance(value[1], int) or not isinstance(value[2], int) or value[1] < value[2] or value[2] < aggregate[2] or value[1] > aggregate[1]:
             fail(CONTRACT, "contract", "configuration tuple out of range")
         if value[0] != "This": intervals.append((value[2], value[1]))
     for index, (low, high) in enumerate(intervals):
@@ -266,7 +271,15 @@ def validate_iob(module, top_edges):
         muxes = {dst_id for src_id, src_type, src_port, dst_id, dst_type, dst_port in local
                  if src_type == "This" and src_port in {2 * operand, 2 * operand + 1} and dst_type == "Muxn"}
         muxes = {mux for mux in muxes if sum(1 for _, st, sp, did, dtp, _ in local if did == mux and dtp == "Muxn" and st == "This" and sp in {2 * operand, 2 * operand + 1}) == 2}
-        if not any(instance_types.get(mux) == "Muxn" and any(sid == mux and st == "Muxn" and did == next_id and dtp == "DelayPipe" and dp == operand for sid, st, _, did, dtp, dp in local) and any(st == "DelayPipe" and sp == operand and dtp == "IOController" and dp == operand for _, st, sp, _, dtp, dp in local) for mux in muxes for next_id in {did for sid, st, _, did, dtp, dp in local if sid == mux and st == "Muxn" and dtp == "DelayPipe" and dp == operand}):
+        if not any(instance_types.get(mux) == "Muxn" and any(
+                instance_types.get(delay_pipe) == "DelayPipe" and any(
+                    sid == delay_pipe and st == "DelayPipe" and sp == operand and
+                    dtp == "IOController" and dp == operand
+                    for sid, st, sp, _, dtp, dp in local)
+                for delay_pipe in {did for sid, st, _, did, dtp, dp in local
+                                   if sid == mux and st == "Muxn" and
+                                   dtp == "DelayPipe" and dp == operand})
+                   for mux in muxes):
             fail(CONTRACT, "contract", f"IOB operand {operand} path missing")
     module_id = module.get("id")
     # Every top-level instance of this IOB module must receive all six ports.
@@ -302,16 +315,25 @@ def validate(package):
     listed = verify_layout_and_hashes(package)
     manifest = validate_manifest(package, listed)
     contract = require_contract(manifest)
-    validate_operations(json_file(package / "artifacts/operations.json", "operations.json"), contract)
-    validate_adg(json_file(package / "artifacts/adg.json", "adg.json"))
+    operations = json_file(package / "artifacts/operations.json", "operations.json")
+    adg = json_file(package / "artifacts/adg.json", "adg.json")
+    try:
+        validate_operations(operations, contract)
+        validate_adg(adg)
+    except Invalid as exc:
+        if exc.code == SCHEMA:
+            fail(CONTRACT, "contract", "malformed operations or ADG contract data")
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError):
+        fail(CONTRACT, "contract", "malformed operations or ADG contract data")
     return manifest
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = HandoffArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path)
-    args = parser.parse_args(argv)
     try:
+        args = parser.parse_args(argv)
         package = args.package if args.package is not None else default_package()
         manifest = validate(package)
     except Invalid as exc:

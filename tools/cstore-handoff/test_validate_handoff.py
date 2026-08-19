@@ -125,6 +125,10 @@ class ValidatorCLITest(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), "--package", str(package)],
                               text=True, capture_output=True, check=False)
 
+    def run_args(self, *args):
+        return subprocess.run([sys.executable, str(SCRIPT), *args],
+                              text=True, capture_output=True, check=False)
+
     def assert_invalid(self, package, code, category):
         result = self.run_cli(package)
         self.assertEqual(result.returncode, code, result.stderr)
@@ -198,6 +202,35 @@ class ValidatorCLITest(unittest.TestCase):
                 package = create_package(Path(tmp)); mutation(package); reseal(package)
                 self.assert_invalid(package, 13, "contract")
 
+    def test_disconnected_delaypipe_path_is_contract_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp)); disconnect_delaypipe_path(package); reseal(package)
+            self.assert_invalid(package, 13, "contract")
+
+    def test_configuration_below_aggregate_low_is_contract_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp)); configuration_below_aggregate_low(package); reseal(package)
+            self.assert_invalid(package, 13, "contract")
+
+    def test_malformed_operation_and_adg_shapes_are_contract_failures(self):
+        mutations = [operations_not_array, iob_operations_not_array,
+                     top_level_port_not_hashable]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation.__name__), tempfile.TemporaryDirectory() as tmp:
+                package = create_package(Path(tmp)); mutation(package); reseal(package)
+                result = self.run_cli(package)
+                self.assertEqual(result.returncode, 13, result.stderr)
+                self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+                self.assertTrue(result.stderr.startswith(
+                    "HANDOFF PACKAGE INVALID category=contract detail="), result.stderr)
+
+    def test_unknown_cli_argument_is_one_line_usage_failure(self):
+        result = self.run_args("--unknown")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith(
+            "HANDOFF PACKAGE INVALID category=usage detail="), result.stderr)
+
 
 def mutate_manifest(package, change):
     path = package / "manifest.json"; manifest = json.loads(path.read_text()); change(manifest); dump(path, manifest)
@@ -244,6 +277,38 @@ def omit_top_input_five(package):
 
 def contradict_write_counts(package):
     mutate_manifest(package, lambda m: m["validation"]["false_zero_write"].__setitem__("write_count", 1))
+
+
+def disconnect_delaypipe_path(package):
+    path, value, a = attrs(package)
+    a["instances"].append({"id": 6, "type": "DelayPipe"})
+    a["connections"]["11"][0] = 6
+    dump(path, value)
+
+
+def configuration_below_aggregate_low(package):
+    path, value, a = attrs(package)
+    a["configuration"]["0"] = ["This", 142, 100]
+    a["configuration"]["17"] = ["IsStore", 99, 99]
+    dump(path, value)
+
+
+def operations_not_array(package):
+    path, value = json_file(package, "artifacts/operations.json")
+    value["Operations"] = 1
+    dump(path, value)
+
+
+def iob_operations_not_array(package):
+    path, value, a = attrs(package)
+    a["operations"] = 1
+    dump(path, value)
+
+
+def top_level_port_not_hashable(package):
+    path, value = json_file(package, "artifacts/adg.json")
+    value["connections"]["5"][-1] = []
+    dump(path, value)
 
 
 if __name__ == "__main__":
