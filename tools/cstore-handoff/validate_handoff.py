@@ -210,9 +210,9 @@ def require_contract(manifest):
     alternating = require_dict(validation.get("alternating"), "validation.alternating")
     normal = require_dict(validation.get("normal_store"), "validation.normal_store")
     regression = require_dict(validation.get("full_regression"), "validation.full_regression")
-    if true.get("write_count") != 1 or false.get("write_count") != 0 or alternating.get("predicates") != [1, 0, 1, 0] or not isinstance(alternating.get("writes"), int) or alternating["writes"] <= 0 or not isinstance(alternating.get("suppressions"), int) or alternating["suppressions"] <= 0 or normal.get("passed") is not True:
+    if type(true.get("write_count")) is not int or true["write_count"] != 1 or type(false.get("write_count")) is not int or false["write_count"] != 0 or alternating.get("predicates") != [1, 0, 1, 0] or type(alternating.get("writes")) is not int or alternating["writes"] <= 0 or type(alternating.get("suppressions")) is not int or alternating["suppressions"] <= 0 or normal.get("passed") is not True:
         fail(CONTRACT, "contract", "validation evidence does not prove conditional writes")
-    if regression.get("tests") != regression.get("succeeded") or not isinstance(regression.get("tests"), int) or regression["tests"] <= 0 or not isinstance(regression.get("suites"), int) or regression["suites"] <= 0 or regression.get("failed") != 0:
+    if any(type(regression.get(key)) is not int for key in ("tests", "suites", "succeeded", "failed")) or regression["tests"] != regression["succeeded"] or regression["tests"] <= 0 or regression["suites"] <= 0 or regression["failed"] != 0:
         fail(CONTRACT, "contract", "full regression evidence is invalid")
     return contract
 

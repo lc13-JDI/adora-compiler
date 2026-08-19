@@ -229,6 +229,23 @@ class ValidatorCLITest(unittest.TestCase):
                 package = create_package(Path(tmp)); mutation(package); reseal(package)
                 self.assert_invalid(package, 13, "contract")
 
+    def test_boolean_evidence_counts_are_contract_failures(self):
+        mutations = [true_write_count_boolean, false_write_count_boolean,
+                     alternating_writes_boolean, alternating_suppressions_boolean,
+                     regression_tests_boolean, regression_succeeded_boolean,
+                     regression_suites_boolean, regression_failed_boolean]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation.__name__), tempfile.TemporaryDirectory() as tmp:
+                package = create_package(Path(tmp)); mutation(package); reseal(package)
+                self.assert_invalid(package, 13, "contract")
+
+    def test_boolean_elapsed_seconds_is_schema_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp))
+            mutate_manifest(package, lambda m: m["generation"].__setitem__("elapsed_seconds", True))
+            reseal(package)
+            self.assert_invalid(package, 12, "schema")
+
     def test_duplicate_iob_operand_ports_are_contract_failures(self):
         mutations = [duplicate_this_source_port, duplicate_mux_destination_port]
         for mutation in mutations:
@@ -311,6 +328,46 @@ def omit_top_input_five(package):
 
 def contradict_write_counts(package):
     mutate_manifest(package, lambda m: m["validation"]["false_zero_write"].__setitem__("write_count", 1))
+
+
+def true_write_count_boolean(package):
+    mutate_manifest(package, lambda m: m["validation"]["true_write"].__setitem__("write_count", True))
+
+
+def false_write_count_boolean(package):
+    mutate_manifest(package, lambda m: m["validation"]["false_zero_write"].__setitem__("write_count", False))
+
+
+def alternating_writes_boolean(package):
+    mutate_manifest(package, lambda m: m["validation"]["alternating"].__setitem__("writes", True))
+
+
+def alternating_suppressions_boolean(package):
+    mutate_manifest(package, lambda m: m["validation"]["alternating"].__setitem__("suppressions", True))
+
+
+def regression_tests_boolean(package):
+    def change(manifest):
+        regression = manifest["validation"]["full_regression"]
+        regression["tests"] = True
+        regression["succeeded"] = 1
+    mutate_manifest(package, change)
+
+
+def regression_succeeded_boolean(package):
+    def change(manifest):
+        regression = manifest["validation"]["full_regression"]
+        regression["tests"] = 1
+        regression["succeeded"] = True
+    mutate_manifest(package, change)
+
+
+def regression_suites_boolean(package):
+    mutate_manifest(package, lambda m: m["validation"]["full_regression"].__setitem__("suites", True))
+
+
+def regression_failed_boolean(package):
+    mutate_manifest(package, lambda m: m["validation"]["full_regression"].__setitem__("failed", False))
 
 
 def disconnect_delaypipe_path(package):
