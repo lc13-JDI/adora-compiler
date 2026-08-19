@@ -112,6 +112,8 @@ def verify_layout_and_hashes(package):
         lines = (package / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         fail(MISSING, "missing", str(exc))
+    except UnicodeError as exc:
+        fail(HASH, "hash", f"invalid SHA256SUMS: {exc}")
     listed = {}
     for line in lines:
         match = SHA_LINE.fullmatch(line)
@@ -268,9 +270,14 @@ def validate_iob(module, top_edges):
     instance_types = {item.get("id"): item.get("type") for item in instances if isinstance(item, dict)}
     local = edges(attrs, "IOB")
     for operand in range(3):
-        muxes = {dst_id for src_id, src_type, src_port, dst_id, dst_type, dst_port in local
-                 if src_type == "This" and src_port in {2 * operand, 2 * operand + 1} and dst_type == "Muxn"}
-        muxes = {mux for mux in muxes if sum(1 for _, st, sp, did, dtp, _ in local if did == mux and dtp == "Muxn" and st == "This" and sp in {2 * operand, 2 * operand + 1}) == 2}
+        source_ports = {2 * operand, 2 * operand + 1}
+        muxes = {dst_id for _, src_type, _, dst_id, dst_type, _ in local
+                 if src_type == "This" and dst_type == "Muxn"}
+        muxes = {mux for mux in muxes if
+                 {src_port for _, src_type, src_port, dst_id, dst_type, _ in local
+                  if src_type == "This" and dst_id == mux and dst_type == "Muxn"} == source_ports and
+                 {dst_port for _, src_type, _, dst_id, dst_type, dst_port in local
+                  if src_type == "This" and dst_id == mux and dst_type == "Muxn"} == {0, 1}}
         if not any(instance_types.get(mux) == "Muxn" and any(
                 instance_types.get(delay_pipe) == "DelayPipe" and any(
                     sid == delay_pipe and st == "DelayPipe" and sp == operand and

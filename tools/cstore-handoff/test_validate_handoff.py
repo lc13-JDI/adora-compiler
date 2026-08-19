@@ -170,6 +170,16 @@ class ValidatorCLITest(unittest.TestCase):
             (package / "artifacts/SHA256SUMS").write_text("unlisted payload\n")
             self.assert_invalid(package, 11, "hash")
 
+    def test_invalid_utf8_root_sha256sums_is_one_line_hash_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp))
+            (package / "SHA256SUMS").write_bytes(b"\xff")
+            result = self.run_cli(package)
+            self.assertEqual(result.returncode, 11, result.stderr)
+            self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+            self.assertTrue(result.stderr.startswith(
+                "HANDOFF PACKAGE INVALID category=hash detail="), result.stderr)
+
     def test_resealed_invalid_utf8_json_is_one_line_schema_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = create_package(Path(tmp))
@@ -214,6 +224,13 @@ class ValidatorCLITest(unittest.TestCase):
         mutations = [remove_cstore, add_cload, remove_use_en, two_operands,
                      disconnect_operand_two, overlap_configuration, omit_top_input_five,
                      contradict_write_counts]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation.__name__), tempfile.TemporaryDirectory() as tmp:
+                package = create_package(Path(tmp)); mutation(package); reseal(package)
+                self.assert_invalid(package, 13, "contract")
+
+    def test_duplicate_iob_operand_ports_are_contract_failures(self):
+        mutations = [duplicate_this_source_port, duplicate_mux_destination_port]
         for mutation in mutations:
             with self.subTest(mutation=mutation.__name__), tempfile.TemporaryDirectory() as tmp:
                 package = create_package(Path(tmp)); mutation(package); reseal(package)
@@ -325,6 +342,18 @@ def iob_operations_not_array(package):
 def top_level_port_not_hashable(package):
     path, value = json_file(package, "artifacts/adg.json")
     value["connections"]["5"][-1] = []
+    dump(path, value)
+
+
+def duplicate_this_source_port(package):
+    path, value, a = attrs(package)
+    a["connections"]["9"][2] = 4
+    dump(path, value)
+
+
+def duplicate_mux_destination_port(package):
+    path, value, a = attrs(package)
+    a["connections"]["9"][5] = 0
     dump(path, value)
 
 
