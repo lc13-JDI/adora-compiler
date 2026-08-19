@@ -265,6 +265,21 @@ class ValidatorCLITest(unittest.TestCase):
                 package = create_package(Path(tmp)); mutation(package); reseal(package)
                 self.assert_invalid(package, 13, "contract")
 
+    def test_ghost_this_endpoint_is_contract_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp)); ghost_this_endpoint(package); reseal(package)
+            self.assert_invalid(package, 13, "contract")
+
+    def test_ghost_iocontroller_endpoint_is_contract_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp)); ghost_iocontroller_endpoint(package); reseal(package)
+            self.assert_invalid(package, 13, "contract")
+
+    def test_spoofed_top_level_iob_type_is_contract_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = create_package(Path(tmp)); spoofed_top_level_iob_type(package); reseal(package)
+            self.assert_invalid(package, 13, "contract")
+
     def test_disconnected_delaypipe_path_is_contract_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = create_package(Path(tmp)); disconnect_delaypipe_path(package); reseal(package)
@@ -423,6 +438,24 @@ def duplicate_this_source_port(package):
 def duplicate_mux_destination_port(package):
     path, value, a = attrs(package)
     a["connections"]["9"][5] = 0
+    dump(path, value)
+
+
+def ghost_this_endpoint(package):
+    path, value, a = attrs(package)
+    a["connections"]["8"][0] = 99
+    dump(path, value)
+
+
+def ghost_iocontroller_endpoint(package):
+    path, value, a = attrs(package)
+    a["connections"]["11"][3] = 99
+    dump(path, value)
+
+
+def spoofed_top_level_iob_type(package):
+    path, value = json_file(package, "artifacts/adg.json")
+    value["instances"][0]["type"] = "GIB"
     dump(path, value)
 
 

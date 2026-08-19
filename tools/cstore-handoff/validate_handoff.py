@@ -275,18 +275,18 @@ def validate_iob(module, top_edges):
     local = edges(attrs, "IOB")
     for operand in range(3):
         source_ports = {2 * operand, 2 * operand + 1}
-        muxes = {dst_id for _, src_type, _, dst_id, dst_type, _ in local
-                 if src_type == "This" and dst_type == "Muxn"}
+        muxes = {dst_id for src_id, src_type, _, dst_id, dst_type, _ in local
+                 if instance_types.get(src_id) == "This" and src_type == "This" and dst_type == "Muxn"}
         muxes = {mux for mux in muxes if
-                 {src_port for _, src_type, src_port, dst_id, dst_type, _ in local
-                  if src_type == "This" and dst_id == mux and dst_type == "Muxn"} == source_ports and
-                 {dst_port for _, src_type, _, dst_id, dst_type, dst_port in local
-                  if src_type == "This" and dst_id == mux and dst_type == "Muxn"} == {0, 1}}
+                 {src_port for src_id, src_type, src_port, dst_id, dst_type, _ in local
+                  if instance_types.get(src_id) == "This" and src_type == "This" and dst_id == mux and dst_type == "Muxn"} == source_ports and
+                 {dst_port for src_id, src_type, _, dst_id, dst_type, dst_port in local
+                  if instance_types.get(src_id) == "This" and src_type == "This" and dst_id == mux and dst_type == "Muxn"} == {0, 1}}
         if not any(instance_types.get(mux) == "Muxn" and any(
                 instance_types.get(delay_pipe) == "DelayPipe" and any(
                     sid == delay_pipe and st == "DelayPipe" and sp == operand and
-                    dtp == "IOController" and dp == operand
-                    for sid, st, sp, _, dtp, dp in local)
+                    instance_types.get(did) == "IOController" and dtp == "IOController" and dp == operand
+                    for sid, st, sp, did, dtp, dp in local)
                 for delay_pipe in {did for sid, st, _, did, dtp, dp in local
                                    if sid == mux and st == "Muxn" and
                                    dtp == "DelayPipe" and dp == operand})
@@ -306,7 +306,7 @@ def validate_adg(data):
     instances = require_list(adg.get("instances"), "ADG instances")
     for module in modules:
         module_id = validate_iob(module, top_edges)
-        matching = [item for item in instances if isinstance(item, dict) and item.get("module_id") == module_id]
+        matching = [item for item in instances if isinstance(item, dict) and item.get("module_id") == module_id and item.get("type") == "IOB"]
         if not matching: fail(CONTRACT, "contract", "IOB module is not instantiated")
         for item in matching:
             ports = {dst_port for _, _, _, dst_id, dst_type, dst_port in top_edges if dst_id == item.get("id") and dst_type == "IOB"}
