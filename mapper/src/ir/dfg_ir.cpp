@@ -696,6 +696,7 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
             // } else{
             DFGedge->setEdge(srcId, srcPort, dstId, dstPort);
             // }
+            DFGedge->setType(edge->type());
             dfg->addEdge(DFGedge);
             if(isBackEdge){
                 int iterdist = edge->IterDist();
@@ -712,6 +713,44 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
     //         node->setImmIdx(1);
     //     }
     // }
+    for(auto& elem : dfg->nodes()){
+        DFGNode* node = elem.second;
+        if(node->operation() != "CSTORE"){
+            continue;
+        }
+        const std::string prefix = "Invalid CSTORE DFG node " +
+                                   std::to_string(node->id()) + ": ";
+        if(Operations::numOperands("CSTORE") != 3 ||
+           Operations::numRes("CSTORE") != 0){
+            std::cout << prefix << "operation spec must have 3 operands and 0 results"
+                      << std::endl;
+            exit(1);
+        }
+        std::map<int, int> logicalPortUse;
+        for(auto& edge : dfg->edges()){
+            DFGEdge* dfgEdge = edge.second;
+            if(dfgEdge->dstId() == node->id() && !dfgEdge->isMemEdge()){
+                logicalPortUse[dfgEdge->dstPortIdx()]++;
+            }
+        }
+        if(node->hasImm()){
+            logicalPortUse[node->immIdx()]++;
+        }
+        for(int operand = 0; operand < 3; ++operand){
+            if(logicalPortUse[operand] != 1){
+                std::cout << prefix << "logical operand " << operand
+                          << " must be covered exactly once" << std::endl;
+                exit(1);
+            }
+        }
+        for(auto& use : logicalPortUse){
+            if(use.first < 0 || use.first > 2){
+                std::cout << prefix << "logical operand " << use.first
+                          << " is out of range" << std::endl;
+                exit(1);
+            }
+        }
+    }
     dfg->printVariableConfigNodes();
     return dfg;
 }
@@ -724,4 +763,3 @@ DFG* DFGIR::parseDFG(std::string filename, std::string format){
     return parseDFGJson(filename);
     // }
 }
-

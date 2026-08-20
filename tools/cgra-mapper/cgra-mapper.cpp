@@ -413,6 +413,7 @@ int main(int argc, char **argv) {
 
   std::atomic<int> kernel_cnt{0};
   std::atomic<bool> generation_failed{false};
+  std::atomic<bool> mapping_failed{false};
   std::mutex mlir_mutex;
   std::mutex emitter_mutex;
   std::mutex vector_mutex;
@@ -509,6 +510,9 @@ int main(int argc, char **argv) {
         CEmitter.GenerateCGRAConfig(kernel, mapper);
       }
     }
+    else {
+      mapping_failed.store(true);
+    }
   };
 
   moduleop.walk([&](func::FuncOp func) {
@@ -545,7 +549,7 @@ int main(int argc, char **argv) {
     return WalkResult::advance();
   });
 
-  if (generation_failed.load()) {
+  if (generation_failed.load() || mapping_failed.load()) {
     for (auto mapper : mapper_Vec)
       delete mapper;
     for (auto ir : DFGIR_Vec)

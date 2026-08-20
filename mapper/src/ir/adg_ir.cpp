@@ -277,6 +277,10 @@ void ADGIR::parseADGEdges(ADG* adg, json& edgeJson){
         int dstId = edge[3].get<int>();
         // std::string dstType = edge[4].get<std::string>();
         int dstPort = edge[5].get<int>();
+        if((srcId != adg->id() && !adg->node(srcId)) ||
+           (dstId != adg->id() && !adg->node(dstId))){
+            continue;
+        }
         ADGEdge* adg_edge = new ADGEdge(srcId, dstId);
         adg_edge->setId(edgeId);
         adg_edge->setSrcId(srcId);
@@ -313,19 +317,65 @@ void ADGIR::analyzeIntraConnect(GPENode* node){
 void ADGIR::analyzeIntraConnect(IOBNode* node){
     ADG* subAdg = node->subADG();
     for(auto& elem : subAdg->inputs()){
-        auto input = elem.second.begin(); // one input only connected to one sub-module
-        ADGNode* subNode = subAdg->node(input->first);
-        int opeIdx = input->second; // operand index
-        while (subNode->type() != "IOController"){
+        if(elem.second.empty()){
+            continue;
+        }
+        std::vector<std::pair<int, int>> pending(elem.second.begin(), elem.second.end());
+        std::set<std::pair<int, int>> visited;
+        while(!pending.empty()){
+            auto current = pending.back();
+            pending.pop_back();
+            ADGNode* subNode = subAdg->node(current.first);
+            int opeIdx = current.second;
+            if(!subNode || !visited.emplace(current).second){
+                continue;
+            }
+            if(subNode->type() == "IOController"){
+                if(opeIdx >= 0 && opeIdx < node->numOperands()){
+                    node->addOperandInputs(opeIdx, elem.first);
+                }
+                continue;
+            }
             if(subNode->outputs().size() == 1){ // only one output
                 opeIdx = 0;
             }
-            auto out = subNode->output(opeIdx).begin(); 
-            subNode = subAdg->node(out->first);
-            opeIdx = out->second;
+            auto outputs = subNode->output(opeIdx);
+            for(auto& output : outputs){
+                pending.push_back(output);
+            }
         }
-        // opeIdx is ALU operand index now
-        node->addOperandInputs(opeIdx, elem.first);
+    }
+}
+
+static void validateCStoreIOB(IOBNode* node){
+    if(!node->opCapable("CSTORE")){
+        return;
+    }
+    const std::string prefix = "Invalid CSTORE IOB " + std::to_string(node->id()) + ": ";
+    if(node->numOperands() != 3){
+        std::cout << prefix << "expected num_operands=3" << std::endl;
+        exit(1);
+    }
+    if(!node->cfgIdMap.count("UseEn")){
+        std::cout << prefix << "missing UseEn" << std::endl;
+        exit(1);
+    }
+    for(int operand = 0; operand < 3; ++operand){
+        if(node->operandInputs(operand).empty()){
+            std::cout << prefix << "operand " << operand
+                      << " has no physical input path" << std::endl;
+            exit(1);
+        }
+    }
+    for(int first = 0; first < 3; ++first){
+        for(int second = first + 1; second < 3; ++second){
+            for(int input : node->operandInputs(first)){
+                if(node->operandInputs(second).count(input)){
+                    std::cout << prefix << "physical input sets overlap" << std::endl;
+                    exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -377,7 +427,9 @@ void ADGIR::postProcess(ADG* adg){
             analyzeIntraConnect(dynamic_cast<GPENode*>(nodePtr));
         } else if(nodePtr->type() == "IOB"){
             numIobNodes++;
-            analyzeIntraConnect(dynamic_cast<IOBNode*>(nodePtr));
+            IOBNode* iob = dynamic_cast<IOBNode*>(nodePtr);
+            analyzeIntraConnect(iob);
+            validateCStoreIOB(iob);
         } else if(nodePtr->type() == "GIB"){
             analyzeIntraConnect(dynamic_cast<GIBNode*>(nodePtr));
             analyzeOutReg(adg, dynamic_cast<GIBNode*>(nodePtr));
