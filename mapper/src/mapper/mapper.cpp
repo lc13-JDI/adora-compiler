@@ -426,6 +426,7 @@ bool Mapper::execute(bool dumpCallFunc, bool dumpMappedViz, std::string resultDi
             viz.drawDFG();
             viz.drawADG();
             viz.dumpDFGIO(); 
+            viz.dumpMappedRoutes();
             // viz.printDFGEdgePath();
         }
         Configuration cfg(_mapping);

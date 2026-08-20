@@ -140,6 +140,12 @@ int main(int argc, char **argv) {
     cl::desc("max-iters"), 
     cl::value_desc("int"), 
     cl::init(2000));
+
+  static cl::opt<unsigned> randomSeed(
+    "seed",
+    cl::Optional,
+    cl::desc("random seed"),
+    cl::value_desc("uint"));
     
   static cl::opt<std::string> adg_fn(
     "adg",
@@ -238,6 +244,12 @@ int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv, helpHeader);
   MlirOptMainConfig config = MlirOptMainConfig::createFromCLOptions();
 
+  unsigned seed = randomSeed.getNumOccurrences() > 0
+                      ? randomSeed.getValue()
+                      : static_cast<unsigned>(time(0));
+  srand(seed);
+  std::cout << "Random seed: " << seed << std::endl;
+
 
 
   // When reading from stdin and the input is a tty, it is often a user mistake
@@ -295,8 +307,6 @@ int main(int argc, char **argv) {
   //////////////////////////////////////////
   /// Parse Operation file and ADG file
   //////////////////////////////////////////
-  unsigned seed = time(0); // random seed using current time
-  srand(seed);  // set random generator seed 
   std::cout << "Parse Operations: " << op_fn << std::endl;
   Operations::Instance(op_fn);
   // Operations::print();
