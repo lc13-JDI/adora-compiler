@@ -135,23 +135,33 @@ ADGNode* ADGIR::parseADGNode(json& nodeJson){
                     std::string cyclesName = "Cycles" + std::to_string(i);
                     node->cfgIdMap[cyclesName] = iocCfgId[cyclesName].get<int>();
                 }
-                int iobMode = attrs["iob_mode"].get<int>();
-                std::string modeName = _iobModeNames[iobMode];
-                if(modeName == "FIFO_MODE"){
-                    node->addOperation("INPUT");
-                    node->addOperation("OUTPUT");
-                }else if(modeName == "SRAM_MODE"){ // SRAM_MODE
-                    node->addOperation("INPUT");
-                    node->addOperation("OUTPUT");
-                    node->addOperation("LOAD");
-                    node->addOperation("STORE");
-                }else{ // COND_LS_MODE
-                    node->addOperation("INPUT");
-                    node->addOperation("OUTPUT");
-                    node->addOperation("LOAD");
-                    node->addOperation("STORE");
-                    node->addOperation("CLOAD");
-                    node->addOperation("CSTORE");
+                if(attrs.contains("operations")){
+                    if(attrs["operations"].is_array()){
+                        for(auto& op : attrs["operations"]){
+                            if(op.is_string()){
+                                node->addOperation(op.get<std::string>());
+                            }
+                        }
+                    }
+                }else{
+                    int iobMode = attrs["iob_mode"].get<int>();
+                    std::string modeName = _iobModeNames[iobMode];
+                    if(modeName == "FIFO_MODE"){
+                        node->addOperation("INPUT");
+                        node->addOperation("OUTPUT");
+                    }else if(modeName == "SRAM_MODE"){ // SRAM_MODE
+                        node->addOperation("INPUT");
+                        node->addOperation("OUTPUT");
+                        node->addOperation("LOAD");
+                        node->addOperation("STORE");
+                    }else{ // COND_LS_MODE
+                        node->addOperation("INPUT");
+                        node->addOperation("OUTPUT");
+                        node->addOperation("LOAD");
+                        node->addOperation("STORE");
+                        node->addOperation("CLOAD");
+                        node->addOperation("CSTORE");
+                    }
                 }
                 fu_node = node;
             }
