@@ -22,6 +22,8 @@ CASES = (
     "invalid-cstore-results",
 )
 
+HARDWARE_CASES = frozenset(CASES[1:7])
+
 
 def load(path):
     with path.open() as stream:
@@ -67,7 +69,7 @@ def mutate(case, adg, operations):
         raise AssertionError("pinned CSTORE IOB has no physical input 4")
     if case == "missing-intra-endpoint":
         attrs["connections"]["12"][3] = 99
-        return "operand 2 has no physical input path",
+        return "malformed endpoint", "IOB module 1"
     if case == "cyclic-intra-connect":
         attrs["connections"]["11"][3] = 5
         attrs["connections"]["11"][4] = "Muxn"
@@ -86,6 +88,32 @@ def mutate(case, adg, operations):
     raise AssertionError("pinned operations has no CSTORE entry")
 
 
+def store_kernel():
+    return """module {
+  func.func @store_only(%value: i32, %output: memref<8xi32>) {
+    %index = arith.constant 0 : index
+    ADORA.kernel {
+      affine.store %value, %output[%index] : memref<8xi32>
+      ADORA.terminator
+    } {KernelName = \"store_only\"}
+    return
+  }
+}
+"""
+
+
+def run(mapper, adg_path, operations_path, kernel, output, environment, cwd):
+    command = [
+        str(mapper), "--seed=7", f"--adg={adg_path}",
+        f"--op-file={operations_path}", "--output-type=pytest",
+        "--obj-opt=false", "--max-iters=30", "--timeout=30000",
+        str(kernel), f"--output={output}",
+    ]
+    return subprocess.run(command, cwd=cwd, text=True, env=environment,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=60, check=False)
+
+
 def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
     case_dir = workdir / case
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -99,18 +127,11 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
     dump(adg_path, adg)
     dump(operations_path, operations)
 
-    command = [
-        str(mapper), "--seed=7", f"--adg={adg_path}",
-        f"--op-file={operations_path}", "--output-type=pytest",
-        "--obj-opt=false", "--max-iters=30", "--timeout=30000",
-        str(kernel), f"--output={case_dir / 'mapped.py'}",
-    ]
     environment = dict(os.environ)
     environment["GeneralOpNameFile"] = str(
         kernel.parents[3] / "lib/DFG/Documents/GeneralOpName.txt")
-    result = subprocess.run(command, cwd=case_dir, text=True, env=environment,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            timeout=60, check=False)
+    result = run(mapper, adg_path, operations_path, kernel,
+                 case_dir / "mapped.py", environment, case_dir)
     if result.returncode != 1:
         raise AssertionError(
             f"{case}: expected exit status 1, got {result.returncode}\n{result.stdout}")
@@ -118,6 +139,42 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
         if message not in result.stdout:
             raise AssertionError(
                 f"{case}: missing diagnostic {message!r}\n{result.stdout}")
+    if case in HARDWARE_CASES and "Invalid CSTORE IOB" not in result.stdout:
+        raise AssertionError(f"{case}: missing CSTORE IOB identity\n{result.stdout}")
+    if case == "no-cstore":
+        normal_store = case_dir / "normal-store.mlir"
+        normal_store.write_text(store_kernel())
+        normal_result = run(mapper, adg_path, operations_path, normal_store,
+                            case_dir / "normal-store.py", environment, case_dir)
+        if normal_result.returncode != 0:
+            raise AssertionError(
+                f"no-cstore normal STORE failed with {normal_result.returncode}\n"
+                f"{normal_result.stdout}")
+        if not (case_dir / "normal-store.py").is_file():
+            raise AssertionError("no-cstore normal STORE produced no output")
+
+
+def run_dfg_contract_tests(mapper):
+    unit = mapper.with_name("cstore-dfg-contract-test")
+    expected = {
+        "valid": (0, ()),
+        "missing": (1, ("Invalid CSTORE DFG node", "logical operand 2")),
+        "duplicate": (1, ("Invalid CSTORE DFG node", "logical operand 0")),
+        "out-of-range": (1, ("Invalid CSTORE DFG node", "out of range")),
+        "memory-ignored": (0, ()),
+    }
+    for case, (status, messages) in expected.items():
+        result = subprocess.run([str(unit), case], text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=60, check=False)
+        if result.returncode != status:
+            raise AssertionError(
+                f"dfg-{case}: expected exit status {status}, got {result.returncode}\n"
+                f"{result.stdout}")
+        for message in messages:
+            if message not in result.stdout:
+                raise AssertionError(
+                    f"dfg-{case}: missing diagnostic {message!r}\n{result.stdout}")
 
 
 def main():
@@ -134,6 +191,7 @@ def main():
     args.operations = args.operations.resolve()
     args.kernel = args.kernel.resolve()
     args.workdir = args.workdir.resolve()
+    run_dfg_contract_tests(args.mapper)
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
         run_case(case, args.workdir, args.mapper, args.adg, args.operations,

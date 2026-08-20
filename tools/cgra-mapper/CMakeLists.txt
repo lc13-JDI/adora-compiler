@@ -63,6 +63,13 @@ llvm_update_compile_flags(cgra-mapper)
 
 mlir_check_link_libraries(cgra-mapper)
 
+add_llvm_executable(cstore-dfg-contract-test
+  ${CMAKE_SOURCE_DIR}/test/cgra-mapper/cstore_contract/dfg_contract_unit.cpp)
+target_include_directories(cstore-dfg-contract-test PRIVATE
+  ${CMAKE_SOURCE_DIR}/mapper/include)
+llvm_update_compile_flags(cstore-dfg-contract-test)
+add_dependencies(cgra-mapper cstore-dfg-contract-test)
+
 
 
 install(TARGETS cgra-mapper)

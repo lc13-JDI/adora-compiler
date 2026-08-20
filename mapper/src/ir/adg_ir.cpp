@@ -23,7 +23,7 @@ ADGIR::~ADGIR()
 
 
 // parse ADG json object
-ADG* ADGIR::parseADG(json& adgJson){
+ADG* ADGIR::parseADG(json& adgJson, const std::string& owner){
     // std::cout << "Parse ADG..." << std::endl;
     ADG* adg = new ADG();
     adg->setBitWidth(adgJson["data_width"].get<int>());    
@@ -80,7 +80,7 @@ ADG* ADGIR::parseADG(json& adgJson){
             adg->setId(nodeId);
         }
     }
-    parseADGEdges(adg, adgJson["connections"]);
+    parseADGEdges(adg, adgJson["connections"], owner);
     postProcess(adg);  
     return adg; 
 }
@@ -179,7 +179,12 @@ ADGNode* ADGIR::parseADGNode(json& nodeJson){
         // adg_node->setType(type);
         // adg_node->setBitWidth(bitWidth);
         adg_node->setCfgBlkIdx(attrs["cfg_blk_index"].get<int>());
-        ADG* subADG = parseADG(attrs); // parse sub-adg
+        std::string subADGOwner;
+        if(type == "IOB" && dynamic_cast<IOBNode*>(adg_node)->opCapable("CSTORE")){
+            subADGOwner = "CSTORE IOB module " + std::to_string(nodeId) +
+                          " (iob_index " + std::to_string(attrs["iob_index"].get<int>()) + ")";
+        }
+        ADG* subADG = parseADG(attrs, subADGOwner); // parse sub-adg
         adg_node->setSubADG(subADG);
         if(attrs.count("configuration")){
             for(auto& elem : attrs["configuration"].items()){
@@ -266,7 +271,7 @@ ADGNode* ADGIR::parseADGNode(json& nodeJson, std::map<int, std::pair<ADGNode*, b
 
 
 // parse ADGEdge json object
-void ADGIR::parseADGEdges(ADG* adg, json& edgeJson){
+void ADGIR::parseADGEdges(ADG* adg, json& edgeJson, const std::string& owner){
     // std::cout << "Parse ADG Edge" << std::endl;
     for(auto& elem : edgeJson.items()){
         int edgeId = std::stoi(elem.key());
@@ -277,9 +282,21 @@ void ADGIR::parseADGEdges(ADG* adg, json& edgeJson){
         int dstId = edge[3].get<int>();
         // std::string dstType = edge[4].get<std::string>();
         int dstPort = edge[5].get<int>();
-        if((srcId != adg->id() && !adg->node(srcId)) ||
-           (dstId != adg->id() && !adg->node(dstId))){
-            continue;
+        bool missingSrc = srcId != adg->id() && !adg->node(srcId);
+        bool missingDst = dstId != adg->id() && !adg->node(dstId);
+        if(missingSrc || missingDst){
+            const std::string endpoint = missingSrc ? "source" : "destination";
+            const int endpointId = missingSrc ? srcId : dstId;
+            if(!owner.empty()){
+                std::cout << "Invalid " << owner << ": malformed endpoint "
+                          << endpoint << " node " << endpointId
+                          << " in edge " << edgeId << std::endl;
+            }else{
+                std::cout << "Invalid ADG edge " << edgeId
+                          << ": malformed endpoint " << endpoint
+                          << " node " << endpointId << std::endl;
+            }
+            exit(1);
         }
         ADGEdge* adg_edge = new ADGEdge(srcId, dstId);
         adg_edge->setId(edgeId);
@@ -351,7 +368,8 @@ static void validateCStoreIOB(IOBNode* node){
     if(!node->opCapable("CSTORE")){
         return;
     }
-    const std::string prefix = "Invalid CSTORE IOB " + std::to_string(node->id()) + ": ";
+    const std::string prefix = "Invalid CSTORE IOB " + node->name() +
+                               " (id=" + std::to_string(node->id()) + "): ";
     if(node->numOperands() != 3){
         std::cout << prefix << "expected num_operands=3" << std::endl;
         exit(1);

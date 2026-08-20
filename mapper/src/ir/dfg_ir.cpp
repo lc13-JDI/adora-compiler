@@ -1,5 +1,6 @@
 
 #include "ir/dfg_ir.h"
+#include "ir/cstore_contract.h"
 
 
 DFGIR::DFGIR(std::string filename)
@@ -639,6 +640,7 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
     // parse edges
     std::map<std::pair<LLVMCDFGNode*, LLVMCDFGNode*>, std::vector<int>> visited_edgeidx;    
     std::map<int, LLVMCDFGEdge*> edges = CDFG->edges();
+    std::map<int, std::map<int, int>> cstorePortUse;
     for(auto &elem : edges){
         int edge_id = elem.first;
         LLVMCDFGEdge* edge = elem.second;
@@ -666,6 +668,11 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         srcPort = 0; // default one output for each node
 
         bool isBackEdge = edge->src()->isOutputBackEdge(edge->dst());
+        if(edge->dst()->getTypeName() == "CSTORE"){
+            CStoreContract::recordNonMemoryLogicalPort(cstorePortUse[dstId],
+                                                       dstPort,
+                                                       edge->type() == EDGE_TYPE_MEM);
+        }
         // if(isBackEdge){continue;}
         // if(edgeJson.contains("operand")){
         //     dstPort = std::stoi(edgeJson["operand"].get<std::string>());
@@ -726,29 +733,11 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
                       << std::endl;
             exit(1);
         }
-        std::map<int, int> logicalPortUse;
-        for(auto& edge : dfg->edges()){
-            DFGEdge* dfgEdge = edge.second;
-            if(dfgEdge->dstId() == node->id() && !dfgEdge->isMemEdge()){
-                logicalPortUse[dfgEdge->dstPortIdx()]++;
-            }
-        }
-        if(node->hasImm()){
-            logicalPortUse[node->immIdx()]++;
-        }
-        for(int operand = 0; operand < 3; ++operand){
-            if(logicalPortUse[operand] != 1){
-                std::cout << prefix << "logical operand " << operand
-                          << " must be covered exactly once" << std::endl;
-                exit(1);
-            }
-        }
-        for(auto& use : logicalPortUse){
-            if(use.first < 0 || use.first > 2){
-                std::cout << prefix << "logical operand " << use.first
-                          << " is out of range" << std::endl;
-                exit(1);
-            }
+        const std::string portViolation =
+            CStoreContract::logicalPortViolation(cstorePortUse[node->id()]);
+        if(!portViolation.empty()){
+            std::cout << prefix << portViolation << std::endl;
+            exit(1);
         }
     }
     dfg->printVariableConfigNodes();
