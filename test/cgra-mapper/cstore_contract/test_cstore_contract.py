@@ -12,8 +12,13 @@ import sys
 
 CASES = (
     "no-cstore",
+    "missing-controller-map",
+    "non-object-controller-map",
     "missing-use-en",
+    "non-integer-use-en",
     "two-operands",
+    "missing-num-operands",
+    "malformed-num-operands",
     "missing-enable-path",
     "overlapping-input-paths",
     "missing-intra-endpoint",
@@ -22,7 +27,10 @@ CASES = (
     "invalid-cstore-results",
 )
 
-HARDWARE_CASES = frozenset(CASES[1:7])
+HARDWARE_CASES = frozenset(
+    case for case in CASES
+    if case not in ("no-cstore", "invalid-cstore-operands",
+                    "invalid-cstore-results"))
 
 
 def load(path):
@@ -49,11 +57,26 @@ def mutate(case, adg, operations):
     if case == "no-cstore":
         attrs["operations"].remove("CSTORE")
         return "No legal ADG node supports CSTORE", "required=1", "available=0"
+    if case == "missing-controller-map":
+        del attrs["io_controller_cfg_id"]
+        return "missing io_controller_cfg_id",
+    if case == "non-object-controller-map":
+        attrs["io_controller_cfg_id"] = []
+        return "expected io_controller_cfg_id object",
     if case == "missing-use-en":
         del attrs["io_controller_cfg_id"]["UseEn"]
         return "missing UseEn",
+    if case == "non-integer-use-en":
+        attrs["io_controller_cfg_id"]["UseEn"] = "enabled"
+        return "UseEn must be an integer",
     if case == "two-operands":
         attrs["num_operands"] = 2
+        return "expected num_operands=3",
+    if case == "missing-num-operands":
+        del attrs["num_operands"]
+        return "expected num_operands=3",
+    if case == "malformed-num-operands":
+        attrs["num_operands"] = "3"
         return "expected num_operands=3",
     if case == "missing-enable-path":
         del attrs["connections"]["12"]
@@ -96,6 +119,21 @@ def store_kernel():
       memref.store %value, %output[%index] : memref<8xi32>
       ADORA.terminator
     } {KernelName = \"store_only\"}
+    return
+  }
+}
+"""
+
+
+def cstore_two_immediate_kernel():
+    return """module {
+  func.func @cstore_two_immediate(%index: index, %output: memref<8xi32>) {
+    ADORA.kernel {
+      %value = arith.constant 7 : i32
+      %condition = arith.constant true
+      ADORA.cond_store %value, %output[%index] if %condition : memref<8xi32>
+      ADORA.terminator
+    } {KernelName = \"cstore_two_immediate\"}
     return
   }
 }
@@ -165,11 +203,20 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
 def run_dfg_contract_tests(mapper, operations):
     unit = mapper.with_name("cstore-dfg-contract-test")
     expected = {
-        "valid": (0, ()),
+        "zero-immediate": (0, ()),
+        "one-immediate": (0, ()),
+        "two-immediate": (1, ("Invalid CSTORE DFG node", "immediate inputs")),
         "missing": (1, ("Invalid CSTORE DFG node", "logical operand 2")),
         "duplicate": (1, ("Invalid CSTORE DFG node", "logical operand 0")),
         "out-of-range": (1, ("Invalid CSTORE DFG node", "out of range")),
         "memory-ignored": (0, ()),
+        "store-zero-immediate": (0, ()),
+        "store-one-immediate": (0, ()),
+        "store-two-immediate": (1, ("Invalid STORE DFG node", "immediate inputs")),
+        "store-missing": (1, ("Invalid STORE DFG node", "logical operand 1")),
+        "store-duplicate": (1, ("Invalid STORE DFG node", "logical operand 0")),
+        "store-out-of-range": (1, ("Invalid STORE DFG node", "out of range")),
+        "store-memory-ignored": (0, ()),
     }
     for case, (status, messages) in expected.items():
         result = subprocess.run([str(unit), case, str(operations)], text=True,
@@ -185,6 +232,28 @@ def run_dfg_contract_tests(mapper, operations):
                     f"dfg-{case}: missing diagnostic {message!r}\n{result.stdout}")
 
 
+def run_cstore_immediate_mapper_test(workdir, mapper, adg, operations,
+                                     environment):
+    case_dir = workdir / "cstore-two-immediate-mapper"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    kernel = case_dir / "kernel.mlir"
+    kernel.write_text(cstore_two_immediate_kernel())
+    output = case_dir / "mapped.py"
+    result = run(mapper, adg, operations, kernel, output, environment, case_dir)
+    if result.returncode != 1:
+        raise AssertionError(
+            "cstore-two-immediate-mapper: expected exit status 1, got "
+            f"{result.returncode}\n{result.stdout}")
+    for message in ("Invalid CSTORE DFG node", "immediate inputs"):
+        if message not in result.stdout:
+            raise AssertionError(
+                f"cstore-two-immediate-mapper: missing {message!r}\n{result.stdout}")
+    if output.exists() or (case_dir / "cstore_two_immediate_map_result" /
+                           "mapped_routes.tsv").exists():
+        raise AssertionError(
+            "cstore-two-immediate-mapper emitted mapped output after rejection")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("workdir", type=Path)
@@ -193,13 +262,20 @@ def main():
     parser.add_argument("operations", type=Path)
     parser.add_argument("kernel", type=Path)
     parser.add_argument("--case", choices=("all",) + CASES, default="all")
+    parser.add_argument("--skip-dfg-contract", action="store_true")
     args = parser.parse_args()
     args.mapper = args.mapper.resolve()
     args.adg = args.adg.resolve()
     args.operations = args.operations.resolve()
     args.kernel = args.kernel.resolve()
     args.workdir = args.workdir.resolve()
-    run_dfg_contract_tests(args.mapper, args.operations)
+    if not args.skip_dfg_contract:
+        run_dfg_contract_tests(args.mapper, args.operations)
+        environment = dict(os.environ)
+        environment["GeneralOpNameFile"] = str(
+            args.kernel.parents[3] / "lib/DFG/Documents/GeneralOpName.txt")
+        run_cstore_immediate_mapper_test(
+            args.workdir, args.mapper, args.adg, args.operations, environment)
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
         run_case(case, args.workdir, args.mapper, args.adg, args.operations,

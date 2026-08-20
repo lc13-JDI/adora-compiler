@@ -1,6 +1,89 @@
 
 #include "ir/adg_ir.h"
 
+namespace {
+
+bool rawIOBCapableOfCStore(const json &attrs,
+                          const std::map<int, std::string> &iobModeNames) {
+    auto operations = attrs.find("operations");
+    if(operations != attrs.end()){
+        if(!operations->is_array())
+            return false;
+        for(const auto &operation : *operations){
+            if(operation.is_string() && operation.get<std::string>() == "CSTORE")
+                return true;
+        }
+        return false;
+    }
+
+    auto mode = attrs.find("iob_mode");
+    if(mode == attrs.end() || !mode->is_number_integer())
+        return false;
+    auto name = iobModeNames.find(mode->get<int>());
+    return name != iobModeNames.end() && name->second != "FIFO_MODE" &&
+           name->second != "SRAM_MODE";
+}
+
+[[noreturn]] void invalidRawCStoreIOB(int moduleId, const json &attrs,
+                                      const std::string &message) {
+    std::cout << "Invalid CSTORE IOB module " << moduleId;
+    auto index = attrs.find("iob_index");
+    if(index != attrs.end() && index->is_number_integer())
+        std::cout << " (iob_index " << index->get<int>() << ")";
+    std::cout << ": " << message << std::endl;
+    exit(1);
+}
+
+void validateRawCStoreIOB(int moduleId, const json &attrs) {
+    auto controller = attrs.find("io_controller_cfg_id");
+    if(controller == attrs.end())
+        invalidRawCStoreIOB(moduleId, attrs, "missing io_controller_cfg_id");
+    if(!controller->is_object())
+        invalidRawCStoreIOB(moduleId, attrs,
+                            "expected io_controller_cfg_id object");
+
+    auto useEn = controller->find("UseEn");
+    if(useEn == controller->end())
+        invalidRawCStoreIOB(moduleId, attrs, "missing UseEn");
+    if(!useEn->is_number_integer())
+        invalidRawCStoreIOB(moduleId, attrs, "UseEn must be an integer");
+
+    auto numOperands = attrs.find("num_operands");
+    if(numOperands == attrs.end() || !numOperands->is_number_integer() ||
+       numOperands->get<int>() != 3)
+        invalidRawCStoreIOB(moduleId, attrs, "expected num_operands=3");
+
+    for(const char *field : {"BaseAddr", "II", "Latency", "IsStore"}){
+        auto value = controller->find(field);
+        if(value == controller->end() || !value->is_number_integer())
+            invalidRawCStoreIOB(
+                moduleId, attrs,
+                std::string("expected integer io_controller_cfg_id.") + field);
+    }
+    auto useAddr = controller->find("UseAddr");
+    if(useAddr != controller->end() && !useAddr->is_number_integer())
+        invalidRawCStoreIOB(moduleId, attrs, "UseAddr must be an integer");
+
+    auto nestLevels = attrs.find("ag_nest_levels");
+    if(nestLevels == attrs.end() || !nestLevels->is_number_integer() ||
+       nestLevels->get<int>() < 0)
+        invalidRawCStoreIOB(moduleId, attrs,
+                            "expected nonnegative integer ag_nest_levels");
+    for(int level = 0; level < nestLevels->get<int>(); ++level){
+        for(const std::string &field :
+            {"Stride" + std::to_string(level),
+             "Cycles" + std::to_string(level)}){
+            auto value = controller->find(field);
+            if(value == controller->end() || !value->is_number_integer())
+                invalidRawCStoreIOB(
+                    moduleId, attrs,
+                    "expected integer io_controller_cfg_id." + field);
+        }
+    }
+}
+
+} // namespace
+
 
 ADGIR::ADGIR(std::string filename)
 {
@@ -97,6 +180,8 @@ ADGNode* ADGIR::parseADGNode(json& nodeJson){
     ADGNode* adg_node;
     if(type == "GPE" || type == "GIB" || type == "IOB"){
         auto& attrs = nodeJson["attributes"];
+        if(type == "IOB" && rawIOBCapableOfCStore(attrs, _iobModeNames))
+            validateRawCStoreIOB(nodeId, attrs);
         if(type == "GPE" || type == "IOB"){
             FUNode *fu_node;
             if(type == "GPE"){

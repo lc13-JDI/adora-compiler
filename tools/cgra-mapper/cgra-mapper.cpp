@@ -28,6 +28,7 @@
 #include "ADORA/Misc/DFG.h"
 
 #include <iostream>
+#include <cstdint>
 #include <set>
 #include <cstdlib>
 #include <ctime>
@@ -61,6 +62,22 @@ using namespace llvm;
 using namespace mlir;
 
 // static int kernel_cnt = 0;
+
+static unsigned deriveKernelSeed(unsigned globalSeed, uint64_t ordinal,
+                                 llvm::StringRef kernelName) {
+  uint32_t hash = 2166136261u;
+  auto mixByte = [&](uint8_t value) {
+    hash ^= value;
+    hash *= 16777619u;
+  };
+  for (unsigned shift = 0; shift < 32; shift += 8)
+    mixByte(static_cast<uint8_t>(globalSeed >> shift));
+  for (unsigned shift = 0; shift < 64; shift += 8)
+    mixByte(static_cast<uint8_t>(ordinal >> shift));
+  for (char value : kernelName)
+    mixByte(static_cast<uint8_t>(value));
+  return hash;
+}
 
 int main(int argc, char **argv) {
   // mlir::registerAllDialects();
@@ -247,7 +264,6 @@ int main(int argc, char **argv) {
   unsigned seed = randomSeed.getNumOccurrences() > 0
                       ? randomSeed.getValue()
                       : static_cast<unsigned>(time(0));
-  srand(seed);
   std::cout << "Random seed: " << seed << std::endl;
 
 
@@ -411,7 +427,6 @@ int main(int argc, char **argv) {
   //   kernels.push_back(kernel);
   // });
 
-  std::atomic<int> kernel_cnt{0};
   std::atomic<bool> generation_failed{false};
   std::atomic<bool> mapping_failed{false};
   std::mutex mlir_mutex;
@@ -419,14 +434,9 @@ int main(int argc, char **argv) {
   std::mutex vector_mutex;
   int max_threads = std::max(1, parallel_cores.getValue());
 
-  auto map_kernel = [&](ADORA::KernelOp kernel) {
+  auto map_kernel = [&](ADORA::KernelOp kernel, size_t kernelOrdinal) {
     if (generation_failed.load())
       return;
-    MapperSA* mapper = new MapperSA(subadg, timeout_ms, max_iters, objOpt);
-    {
-      std::lock_guard<std::mutex> lock(vector_mutex);
-      mapper_Vec.push_back(mapper);
-    }
     /// Generating DFG
     std::string kernelName;
     {
@@ -434,7 +444,14 @@ int main(int argc, char **argv) {
       kernelName = kernel.getKernelName();
     }
     if(kernelName.empty()){
-      kernelName = "kernel_" + std::to_string(kernel_cnt.fetch_add(1));
+      kernelName = "kernel_" + std::to_string(kernelOrdinal);
+    }
+    MapperSA* mapper = new MapperSA(
+        subadg, timeout_ms, max_iters, objOpt,
+        deriveKernelSeed(seed, kernelOrdinal, kernelName));
+    {
+      std::lock_guard<std::mutex> lock(vector_mutex);
+      mapper_Vec.push_back(mapper);
     }
     LLVMCDFG *CDFG = new LLVMCDFG(kernelName, GeneralOpNameFile_str);
     LogicalResult generationResult = failure();
@@ -515,6 +532,7 @@ int main(int argc, char **argv) {
     }
   };
 
+  size_t nextKernelOrdinal = 0;
   moduleop.walk([&](func::FuncOp func) {
     SmallVector<ADORA::KernelOp> kernels;
     func.walk([&](ADORA::KernelOp kernel) {
@@ -527,6 +545,8 @@ int main(int argc, char **argv) {
     if(kernels.empty()){
       return WalkResult::advance();
     }
+    const size_t ordinalBase = nextKernelOrdinal;
+    nextKernelOrdinal += kernels.size();
 
     size_t num_workers = std::min<size_t>(max_threads, kernels.size());
     std::atomic<size_t> next_index{0};
@@ -539,7 +559,7 @@ int main(int argc, char **argv) {
           if(idx >= kernels.size() || generation_failed.load()){
             break;
           }
-          map_kernel(kernels[idx]);
+          map_kernel(kernels[idx], ordinalBase + idx);
         }
       });
     }

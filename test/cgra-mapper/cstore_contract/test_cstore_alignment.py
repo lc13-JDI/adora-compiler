@@ -79,21 +79,26 @@ def assert_pre_mapping_cdfg(cgra_opt, kernel, workdir, environment):
         raise AssertionError(f"unexpected CSTORE producer depths: {depths}")
 
 
-def mapper_command(mapper, seed, adg, operations, kernel, output):
-    return (
+def mapper_command(mapper, seed, adg, operations, kernel, output,
+                   parallel_cores=None):
+    command = [
         mapper, f"--seed={seed}", f"--adg={adg}",
         f"--op-file={operations}", "--output-type=pytest",
         "--obj-opt=false", "--max-iters=30", "--timeout=30000",
         kernel, f"--output={output}",
-    )
+    ]
+    if parallel_cores is not None:
+        command.append(f"--parallel-cores={parallel_cores}")
+    return command
 
 
 def run_mapping(label, seed, workdir, mapper, adg, operations, kernel,
-                kernel_name, environment, expected=0):
+                kernel_name, environment, expected=0, parallel_cores=None):
     run_dir = workdir / label
     run_dir.mkdir()
     output = run_dir / "mapped.py"
-    log = run(mapper_command(mapper, seed, adg, operations, kernel, output),
+    log = run(mapper_command(mapper, seed, adg, operations, kernel, output,
+                             parallel_cores),
               run_dir, environment, expected=expected)
     if log.count(f"Random seed: {seed}\n") != 1:
         raise AssertionError(f"{label}: mapper did not log seed {seed} exactly once")
@@ -137,13 +142,47 @@ def validate_cstore_manifest(path):
     return rows
 
 
-def validate_store_manifest(path):
+def validate_store_manifest(path, expected_routed_ports):
     rows = read_manifest(path)
     store_rows = [row for row in rows if row["dst_operation"] == "STORE"]
     if not store_rows:
         raise AssertionError(f"{path}: normal STORE has no route rows")
+    routed_ports = [int(row["logical_operand"]) for row in store_rows]
+    if sorted(routed_ports) != sorted(expected_routed_ports):
+        raise AssertionError(
+            f"{path}: expected STORE routed ports {sorted(expected_routed_ports)}, "
+            f"got {sorted(routed_ports)}")
     if any(int(row["logical_operand"]) == 2 for row in rows):
         raise AssertionError(f"{path}: normal STORE unexpectedly uses logical operand 2")
+
+
+def validate_parallel_seed(mapper, adg, operations, kernel, workdir,
+                           environment):
+    reference = None
+    kernel_names = ("parallel_cstore_a", "parallel_cstore_b")
+    for repetition in range(4):
+        run_dir = workdir / f"parallel-repeat-{repetition}"
+        run_dir.mkdir()
+        output = run_dir / "mapped.py"
+        log = run(mapper_command(mapper, 7, adg, operations, kernel, output,
+                                 parallel_cores=2),
+                  run_dir, environment)
+        if log.count("Random seed: 7\n") != 1:
+            raise AssertionError(
+                f"parallel repeat {repetition}: seed was not logged exactly once")
+        manifests = []
+        for kernel_name in kernel_names:
+            manifest = run_dir / f"{kernel_name}_map_result" / "mapped_routes.tsv"
+            if not manifest.is_file():
+                raise AssertionError(
+                    f"parallel repeat {repetition}: missing {kernel_name} manifest")
+            validate_cstore_manifest(manifest)
+            manifests.append(manifest.read_bytes())
+        if reference is None:
+            reference = manifests
+        elif manifests != reference:
+            raise AssertionError(
+                "parallel seed 7 manifests differ across repeated two-kernel runs")
 
 
 def make_no_cstore_adg(source, destination):
@@ -163,11 +202,12 @@ def make_no_cstore_adg(source, destination):
 
 
 def main():
-    if len(sys.argv) != 8:
+    if len(sys.argv) != 9:
         raise AssertionError(
             "usage: test_cstore_alignment.py WORKDIR CGRA_OPT MAPPER ADG "
-            "OPERATIONS CSTORE_KERNEL STORE_KERNEL")
-    workdir, cgra_opt, mapper, adg, operations, cstore_kernel, store_kernel = (
+            "OPERATIONS CSTORE_KERNEL STORE_KERNEL PARALLEL_KERNEL")
+    (workdir, cgra_opt, mapper, adg, operations, cstore_kernel, store_kernel,
+     parallel_kernel) = (
         Path(value).resolve() for value in sys.argv[1:])
     workdir.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
@@ -195,7 +235,12 @@ def main():
     _, store_manifest = run_mapping(
         "normal-store", 7, workdir, mapper, adg, operations, store_kernel,
         "normal_store_route", environment)
-    validate_store_manifest(store_manifest)
+    validate_store_manifest(store_manifest, {0})
+    normal_store_dir = workdir / "normal-store"
+    for kernel_name in ("store_block_arg", "store_index_cast"):
+        validate_store_manifest(
+            normal_store_dir / f"{kernel_name}_map_result" / "mapped_routes.tsv",
+            {0, 1})
 
     no_cstore_adg = workdir / "no-cstore-adg.json"
     make_no_cstore_adg(adg, no_cstore_adg)
@@ -208,9 +253,12 @@ def main():
     _, no_cstore_store = run_mapping(
         "no-cstore-normal-store", 7, workdir, mapper, no_cstore_adg,
         operations, store_kernel, "normal_store_route", environment)
-    validate_store_manifest(no_cstore_store)
+    validate_store_manifest(no_cstore_store, {0})
 
-    print("CSTORE alignment passed for seeds 7, 19, 101; normal STORE passed")
+    validate_parallel_seed(mapper, adg, operations, parallel_kernel, workdir,
+                           environment)
+
+    print("CSTORE alignment and parallel determinism passed; STORE addresses passed")
 
 
 if __name__ == "__main__":

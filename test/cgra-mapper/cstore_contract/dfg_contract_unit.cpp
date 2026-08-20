@@ -34,9 +34,12 @@ int main(int argc, char **argv) {
   }
 
   const std::string testCase = argv[1];
-  if (testCase != "valid" && testCase != "missing" &&
-      testCase != "duplicate" && testCase != "out-of-range" &&
-      testCase != "memory-ignored") {
+  const bool isStore = testCase.rfind("store-", 0) == 0;
+  const std::string shape = isStore ? testCase.substr(6) : testCase;
+  if (shape != "zero-immediate" && shape != "one-immediate" &&
+      shape != "two-immediate" && shape != "missing" &&
+      shape != "duplicate" && shape != "out-of-range" &&
+      shape != "memory-ignored") {
     std::cerr << "unknown case: " << testCase << "\n";
     return 2;
   }
@@ -45,22 +48,30 @@ int main(int argc, char **argv) {
   mlir::MLIRContext context;
   context.allowUnregisteredDialects();
   LLVMCDFG cdfg("contract-unit");
-  LLVMCDFGNode *cstore = addNode(cdfg, context, "CSTORE");
-  LLVMCDFGNode *first = addNode(cdfg, context, "CONST");
-  LLVMCDFGNode *second = addNode(cdfg, context, "CONST");
-  LLVMCDFGNode *third = addNode(cdfg, context, "CONST");
-
-  addEdge(cdfg, first, cstore, 0);
-  addEdge(cdfg, second, cstore, testCase == "duplicate" ? 0 : 1);
-  if (testCase != "missing")
-    addEdge(cdfg, third, cstore, testCase == "out-of-range" ? 3 : 2);
-  if (testCase == "duplicate") {
-    LLVMCDFGNode *fourth = addNode(cdfg, context, "CONST");
-    addEdge(cdfg, fourth, cstore, 2);
+  LLVMCDFGNode *destination = addNode(cdfg, context, isStore ? "store" : "CSTORE");
+  const int operandCount = isStore ? 2 : 3;
+  for (int operand = 0; operand < operandCount; ++operand) {
+    if (shape == "missing" && operand == operandCount - 1)
+      continue;
+    const bool immediate =
+        (shape == "one-immediate" && operand == operandCount - 1) ||
+        (shape == "two-immediate" && operand >= operandCount - 2);
+    LLVMCDFGNode *source =
+        addNode(cdfg, context, immediate ? "CONST" : "Input");
+    int logicalPort = operand;
+    if (shape == "duplicate" && operand == operandCount - 1)
+      logicalPort = 0;
+    if (shape == "out-of-range" && operand == operandCount - 1)
+      logicalPort = operandCount;
+    addEdge(cdfg, source, destination, logicalPort);
   }
-  if (testCase == "memory-ignored") {
-    LLVMCDFGNode *memorySource = addNode(cdfg, context, "CONST");
-    addEdge(cdfg, memorySource, cstore, 2, EDGE_TYPE_MEM);
+  if (shape == "duplicate") {
+    LLVMCDFGNode *last = addNode(cdfg, context, "Input");
+    addEdge(cdfg, last, destination, operandCount - 1);
+  }
+  if (shape == "memory-ignored") {
+    LLVMCDFGNode *memorySource = addNode(cdfg, context, "Input");
+    addEdge(cdfg, memorySource, destination, operandCount - 1, EDGE_TYPE_MEM);
   }
 
   DFGIR dfg(&cdfg);

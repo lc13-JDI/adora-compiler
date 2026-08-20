@@ -1,6 +1,6 @@
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %cgra-mapper --help | %FileCheck %s --check-prefix=HELP
-// RUN: python3 %S/test_cstore_alignment.py %t %cgra-opt %cgra-mapper %S/../../spec/cgra_cstore_vitra/artifacts/adg.json %S/../../spec/cgra_cstore_vitra/artifacts/operations.json %s %S/normal_store.mlir.in
+// RUN: python3 %S/test_cstore_alignment.py %t %cgra-opt %cgra-mapper %S/../../spec/cgra_cstore_vitra/artifacts/adg.json %S/../../spec/cgra_cstore_vitra/artifacts/operations.json %s %S/normal_store.mlir.in %S/parallel_kernels.mlir.in
 
 // HELP: --seed=<uint>
 module {

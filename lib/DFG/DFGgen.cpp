@@ -3095,34 +3095,63 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     return false;
   };
 
-  std::function<void(mlir::Value)> collectCondStoreProducer;
-  collectCondStoreProducer = [&](mlir::Value value) {
+  bool invalidDirectStoreProducer = false;
+  std::function<bool(mlir::Value, mlir::Operation *, llvm::StringRef)>
+      collectMappedProducer;
+  collectMappedProducer = [&](mlir::Value value, mlir::Operation *consumer,
+                              llvm::StringRef operationName) {
     mlir::Operation *producer = value.getDefiningOp();
     if (!producer || producer->getParentOfType<func::FuncOp>() != kernelFunction)
-      return;
+      return true;
     if (producer->getNumRegions() != 0 ||
         producer->hasTrait<mlir::OpTrait::IsTerminator>() ||
         mappedOperationNames.count(
-            producer->getName().getStringRef().str()) == 0)
-      return;
+            producer->getName().getStringRef().str()) == 0) {
+      if (operationName == "STORE") {
+        consumer->emitError(
+            "Invalid STORE CDFG node: unsupported direct operand producer '")
+            << producer->getName()
+            << "'; expected a block argument or a loop-free chain of mapped operations";
+      }
+      return false;
+    }
     if (!slicedOps.insert(producer).second)
-      return;
+      return true;
 
-    for (mlir::Value operand : producer->getOperands())
-      collectCondStoreProducer(operand);
+    for (mlir::Value operand : producer->getOperands()) {
+      if (!collectMappedProducer(operand, consumer, operationName))
+        return false;
+    }
     if (!isInsideAffineLoop(producer))
       addOutsideFor(producer);
+    return true;
   };
 
+  bool hasConditionalStore = false;
   kernel.walk([&](ADORA::CondStoreOp store) {
-    collectCondStoreProducer(store.getValue());
+    hasConditionalStore = true;
+    collectMappedProducer(store.getValue(), store, "CSTORE");
     for (mlir::Value index : store.getIndices())
-      collectCondStoreProducer(index);
-    collectCondStoreProducer(store.getCondition());
+      collectMappedProducer(index, store, "CSTORE");
+    collectMappedProducer(store.getCondition(), store, "CSTORE");
     if (!isInsideAffineLoop(store) &&
         slicedOps.insert(store.getOperation()).second)
       addOutsideFor(store.getOperation());
   });
+  kernel.walk([&](memref::StoreOp store) {
+    // Preserve the conditional-store slice boundary: ordinary memory traffic
+    // in a CSTORE kernel is unrelated unless it feeds a CSTORE operand.
+    if (hasConditionalStore || store->getParentOp() != kernel.getOperation())
+      return;
+    if (!collectMappedProducer(store.getValue(), store, "STORE"))
+      invalidDirectStoreProducer = true;
+    for (mlir::Value index : store.getIndices()) {
+      if (!collectMappedProducer(index, store, "STORE"))
+        invalidDirectStoreProducer = true;
+    }
+  });
+  if (invalidDirectStoreProducer)
+    return false;
   level_total = level;
   // scf::ForOp scf_for;
   mlir::Operation* for_op;

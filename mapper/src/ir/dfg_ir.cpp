@@ -639,9 +639,10 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
     }
     // parse edges
     std::map<std::pair<LLVMCDFGNode*, LLVMCDFGNode*>, std::vector<int>> visited_edgeidx;    
-    std::map<std::pair<LLVMCDFGNode*, LLVMCDFGNode*>, size_t> cstoreEdgePortIdx;
+    std::map<std::pair<LLVMCDFGNode*, LLVMCDFGNode*>, size_t> rawEdgePortIdx;
     std::map<int, LLVMCDFGEdge*> edges = CDFG->edges();
-    std::map<int, std::map<int, int>> cstorePortUse;
+    std::map<int, std::map<int, int>> logicalPortUse;
+    std::map<int, int> immediateCount;
     for(auto &elem : edges){
         int edge_id = elem.first;
         LLVMCDFGEdge* edge = elem.second;
@@ -650,14 +651,20 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         std::vector<int> dstPorts;
         int srcPort, dstPort; // default one output for each node
 
-        const bool isCStoreDestination = edge->dst()->getTypeName() == "CSTORE";
-        if(isCStoreDestination){
+        const std::string destinationType = edge->dst()->getTypeName();
+        const bool isCStoreDestination = destinationType == "CSTORE";
+        const bool isStoreDestination = destinationType == "store";
+        const bool hasExactIOContract =
+            isCStoreDestination || isStoreDestination;
+        if(hasExactIOContract){
             auto inputInfo = edge->dst()->inputInfoMap().find(edge->src());
             auto edgePair = std::make_pair(edge->src(), edge->dst());
-            size_t& portIdx = cstoreEdgePortIdx[edgePair];
+            size_t& portIdx = rawEdgePortIdx[edgePair];
             if(inputInfo == edge->dst()->inputInfoMap().end() ||
                portIdx >= inputInfo->second.size()){
-                std::cout << "Invalid CSTORE DFG node " << dstId
+                std::cout << "Invalid "
+                          << (isCStoreDestination ? "CSTORE" : "STORE")
+                          << " DFG node " << dstId
                           << ": missing logical operand path for raw edge "
                           << edge_id << std::endl;
                 exit(1);
@@ -684,10 +691,12 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         srcPort = 0; // default one output for each node
 
         bool isBackEdge = edge->src()->isOutputBackEdge(edge->dst());
-        if(isCStoreDestination){
-            CStoreContract::recordNonMemoryLogicalPort(cstorePortUse[dstId],
+        if(hasExactIOContract){
+            CStoreContract::recordNonMemoryLogicalPort(logicalPortUse[dstId],
                                                        dstPort,
                                                        edge->type() == EDGE_TYPE_MEM);
+            if(edge->type() != EDGE_TYPE_MEM && isConst(srcId))
+                ++immediateCount[dstId];
         }
         // if(isBackEdge){continue;}
         // if(edgeJson.contains("operand")){
@@ -738,19 +747,31 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
     // }
     for(auto& elem : dfg->nodes()){
         DFGNode* node = elem.second;
-        if(node->operation() != "CSTORE"){
+        const bool isCStore = node->operation() == "CSTORE";
+        const bool isStore = node->operation() == "STORE";
+        if(!isCStore && !isStore){
             continue;
         }
-        const std::string prefix = "Invalid CSTORE DFG node " +
+        const std::string operation = isCStore ? "CSTORE" : "STORE";
+        const int expectedOperands = isCStore ? 3 : 2;
+        const std::string prefix = "Invalid " + operation + " DFG node " +
                                    std::to_string(node->id()) + ": ";
-        if(Operations::numOperands("CSTORE") != 3 ||
-           Operations::numRes("CSTORE") != 0){
-            std::cout << prefix << "operation spec must have 3 operands and 0 results"
+        if(Operations::numOperands(operation) != expectedOperands ||
+           Operations::numRes(operation) != 0){
+            std::cout << prefix << "operation spec must have "
+                      << expectedOperands << " operands and 0 results"
                       << std::endl;
             exit(1);
         }
+        const std::string immediateViolation =
+            CStoreContract::immediateViolation(immediateCount[node->id()]);
+        if(!immediateViolation.empty()){
+            std::cout << prefix << immediateViolation << std::endl;
+            exit(1);
+        }
         const std::string portViolation =
-            CStoreContract::logicalPortViolation(cstorePortUse[node->id()]);
+            CStoreContract::logicalPortViolation(logicalPortUse[node->id()],
+                                                 expectedOperands);
         if(!portViolation.empty()){
             std::cout << prefix << portViolation << std::endl;
             exit(1);

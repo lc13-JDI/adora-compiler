@@ -7,4 +7,23 @@ module {
     } {KernelName = "normal_store_route"}
     return
   }
+
+  func.func @store_block_arg(%value: i32, %index: index,
+                             %output: memref<16xi32>) {
+    ADORA.kernel {
+      memref.store %value, %output[%index] : memref<16xi32>
+      ADORA.terminator
+    } {KernelName = "store_block_arg"}
+    return
+  }
+
+  func.func @store_index_cast(%value: i32, %raw_index: i32,
+                              %output: memref<16xi32>) {
+    ADORA.kernel {
+      %index = arith.index_cast %raw_index : i32 to index
+      memref.store %value, %output[%index] : memref<16xi32>
+      ADORA.terminator
+    } {KernelName = "store_index_cast"}
+    return
+  }
 }
