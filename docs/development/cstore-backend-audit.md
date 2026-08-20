@@ -73,7 +73,7 @@ lines 142--164.
 
 ## Available operation and hardware artifacts
 
-The three checked operation catalogs contain a `STORE` entry but no `CSTORE`
+The legacy checked operation catalogs contain a `STORE` entry but no `CSTORE`
 entry:
 
 | Catalog | `STORE` | `CSTORE` |
@@ -92,9 +92,31 @@ but no `UseEn`:
 | [`test/spec/cgra_bf16/vitra_cgra_adg.json`](../../test/spec/cgra_bf16/vitra_cgra_adg.json) | lines 8782--8839, 8853 |
 | [`lib/DFG/Documents/cgra_adg20241118.json`](../../lib/DFG/Documents/cgra_adg20241118.json) | lines 1771--1824, 1838 |
 
-Consequently, the current hardware artifacts cannot validate conditional-store
+Consequently, the legacy default artifacts cannot validate conditional-store
 suppression: their I/O block only accepts two operands and has no `UseEn`
-configuration bit for the enable input.
+configuration bit for the enable input. They remain the untouched defaults for
+the existing fp32/bf16 flows.
+
+Task 1 additionally introduced an opt-in, tracked regression fixture at
+[`test/spec/cgra_cstore_vitra/`](../../test/spec/cgra_cstore_vitra/). It is a
+byte-for-byte copy of the accepted VITRA handoff generated at
+`MIONkb/VITRA-CGRA@15e432f83427fc3121c50e2d4832a76b86d7a64f`, not a replacement
+for any legacy catalog. Its pinned payload hashes are:
+
+| Payload | SHA-256 |
+| --- | --- |
+| `manifest.json` | `ca4b352640fd789a8013fd9c8f0734484a0385624911252a60db29ce4e63190f` |
+| `artifacts/operations.json` | `0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d` |
+| `artifacts/adg.json` | `e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7` |
+
+The fixture advertises exactly `INPUT`, `OUTPUT`, `LOAD`, `STORE`, and
+`CSTORE`; it deliberately does not advertise `CLOAD`. When an IOB JSON object
+has `attributes.operations`, the ADG parser treats that field as authoritative:
+only its string entries are capabilities, and an explicit empty or malformed
+value contributes no mode-derived fallback. The legacy FIFO/SRAM/conditional
+mode fallback runs only when the field is absent. Thus the fixture's explicit
+list neither gains `CLOAD` by inference nor changes the untouched legacy
+defaults, whose operation lists are absent.
 
 ## Repository-history check
 
@@ -109,11 +131,13 @@ hardware/fixture artifacts:
 - `CSTORE` in test DFG-style `.dot`, `.json`, or `.mlir` fixtures (excluding
   operation and ADG catalog hits).
 
-All four searches returned no result at that point. This feature branch now
-contains compiler/CDFG MLIR fixtures for Stage A. It still does not contain a
-usable CSTORE operation entry, a three-input (`iob_mode=2`) I/O block with
-`UseEn`, or a hardware-backed CSTORE fixture. The mapper source does contain
-the dormant CSTORE/UseEn handling described above.
+All four searches returned no result at that point. The repository now contains
+the opt-in tracked VITRA fixture above, alongside the compiler/CDFG MLIR
+fixtures for Stage A; the legacy catalogs remain unchanged. The fixture makes
+the input contract reproducible, but does not establish a successful ADORA
+mapping or execute ADORA-generated hardware configuration. Its focused mapper
+contract reaches the stable, controlled first failure `FOR is not supported!`
+after accepting the CSTORE operation and explicit IOB capabilities.
 
 ## Delivery boundary
 
@@ -162,3 +186,8 @@ current lowering deliberately fails closed at these boundaries:
 
 Until then, mapping or compiling a CSTORE must not be treated as proof of
 conditional-store hardware behavior.
+
+Task 1 only ingested and validated the opt-in input contract; it did not fix
+placement, routing, scheduling, configuration, `FOR` support, or hardware
+execution. The VITRA handoff's own hardware evidence is provenance for the
+fixture, not evidence that ADORA has completed a compiler-to-hardware run.

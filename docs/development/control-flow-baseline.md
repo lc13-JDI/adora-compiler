@@ -89,9 +89,22 @@ The nesting expresses which value commits on each path; it does not make pure ca
 - CSTORE uses explicit `data=0`, `address=1`, and `enable=2` ports, complete I/O
   metadata, byte-scaled addresses, structured path predicates, conservative
   memory ordering, and transactional fail-closed generation.
-- The repository operation specs still lack `CSTORE`, and the available ADG/IOB
-  descriptions still lack a three-input I/O block with `UseEn`. Hardware-level
-  conditional-store execution therefore remains outside the validated scope.
+- Legacy fp32/bf16 operation specs still lack `CSTORE`, and their ADG/IOB
+  descriptions still lack a three-input I/O block with `UseEn`; those defaults
+  remain unchanged. Task 1 adds an opt-in, tracked VITRA fixture at
+  [`test/spec/cgra_cstore_vitra/`](../../test/spec/cgra_cstore_vitra/) from
+  `MIONkb/VITRA-CGRA@15e432f83427fc3121c50e2d4832a76b86d7a64f` (operations
+  SHA-256 `0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d`,
+  ADG SHA-256 `e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7`).
+- The fixture's explicit IOB operations are authoritative and exactly
+  `INPUT`, `OUTPUT`, `LOAD`, `STORE`, `CSTORE`; `CLOAD` is deliberately absent.
+  Legacy mode-derived capabilities are used only when that field is absent, so
+  the opt-in contract does not alter legacy defaults.
+- With this fixture the focused mapper contract accepts CSTORE and reaches the
+  controlled first failure `FOR is not supported!`. This is an ingestion
+  boundary, not mapping success: Task 1 did not fix placement, routing,
+  scheduling, configuration, `FOR`, or hardware execution. Hardware-level
+  conditional-store execution remains outside the validated ADORA scope.
 
 ### Mapper/spec limitations
 
