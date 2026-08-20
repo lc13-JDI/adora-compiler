@@ -13,12 +13,12 @@
 
 The fixed MLIR path is authoritative for this baseline. C sources record the intended source semantics and can be compared with frontend output when `cgeist` becomes available.
 
-This document preserves the Task 2 baseline at commit `4ef8fc6`. The current
+This document preserves the original control-flow baseline at commit `4ef8fc6`. The current
 branch has since completed the compiler/CDFG Stage A for conditional stores;
 the updated status is summarized below and the hardware boundary is documented
 in [`cstore-backend-audit.md`](cstore-backend-audit.md).
 
-## Implementation at the Task 2 baseline
+## Implementation at the original control-flow baseline
 
 The normal `adoracc.py` path normalizes the input, extracts affine loops into `ADORA.kernel`, optimizes block access, and finally invokes `--adora-kernel-dfg-gen`.
 
@@ -42,9 +42,9 @@ Important boundaries found by code inspection:
 - The false arm of each SEL is the single, compositional representation of predicate negation. Else-if and nested paths therefore compose through false/true SEL arms without a separate explicit NOT helper or repeated handwritten negation logic.
 - `ADORA.isel` represents loop-carried state selection; it is not the general branch predicate representation.
 
-## Task 2 results
+## Formal control-flow results
 
-The formal `control_flow_paths` lit regressions cover the four Task 2 completion cases. Each checks that the rewritten kernel has no remaining `scf.if`, has the expected SEL count, and has connected captured predicate Inputs at SEL condition port 2. The DOT checks also reject undefined and CTRL opcodes.
+The formal `control_flow_paths` lit regressions cover the four completion cases. Each checks that the rewritten kernel has no remaining `scf.if`, has the expected SEL count, and has connected captured predicate Inputs at SEL condition port 2. The DOT checks also reject undefined and CTRL opcodes.
 
 | Case | CDFG path-condition evidence | Result |
 |---|---|---|
@@ -72,10 +72,10 @@ The nesting expresses which value commits on each path; it does not make pure ca
 
 ## Known gaps and follow-up ownership
 
-### Task two: path conditions and control-flow correctness
+### Path conditions and control-flow correctness
 
 - Structured `scf.if` result paths are represented by nested SEL commits, with captured scalar and `i1` function arguments feeding SEL condition port 2. The false SEL arm is the uniform negation representation, and postorder lowering preserves the required inner-to-outer ordering.
-- Conditional load is still a known limitation: existing lowering/memory-footprint processing can make a load unconditional, and Task 2 did not add a conditional-load representation.
+- Conditional load is still a known limitation: existing lowering/memory-footprint processing can make a load unconditional, and this baseline did not add a conditional-load representation.
 - `affine.if`, `cf.cond_br`, switch, break, continue, and unstructured CFG remain out of scope and have no equivalent CDFG control-flow implementation.
 
 ### Current conditional-store status
@@ -91,7 +91,7 @@ The nesting expresses which value commits on each path; it does not make pure ca
   memory ordering, and transactional fail-closed generation.
 - Legacy fp32/bf16 operation specs still lack `CSTORE`, and their ADG/IOB
   descriptions still lack a three-input I/O block with `UseEn`; those defaults
-  remain unchanged. Task 1 adds an opt-in, tracked VITRA fixture at
+  remain unchanged. The ingestion phase adds an opt-in, tracked VITRA fixture at
   [`test/spec/cgra_cstore_vitra/`](../../test/spec/cgra_cstore_vitra/) from
   `MIONkb/VITRA-CGRA@15e432f83427fc3121c50e2d4832a76b86d7a64f` (operations
   SHA-256 `0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d`,
@@ -102,7 +102,7 @@ The nesting expresses which value commits on each path; it does not make pure ca
   the opt-in contract does not alter legacy defaults.
 - With this fixture the focused mapper contract accepts CSTORE and reaches the
   controlled first failure `FOR is not supported!`. This is an ingestion
-  boundary, not mapping success: Task 1 did not fix placement, routing,
+  boundary, not mapping success: the ingestion phase did not fix placement, routing,
   scheduling, configuration, `FOR`, or hardware execution. Hardware-level
   conditional-store execution remains outside the validated ADORA scope.
 

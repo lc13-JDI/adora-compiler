@@ -97,7 +97,7 @@ suppression: their I/O block only accepts two operands and has no `UseEn`
 configuration bit for the enable input. They remain the untouched defaults for
 the existing fp32/bf16 flows.
 
-Task 1 additionally introduced an opt-in, tracked regression fixture at
+The ingestion phase additionally introduced an opt-in, tracked regression fixture at
 [`test/spec/cgra_cstore_vitra/`](../../test/spec/cgra_cstore_vitra/). It is a
 byte-for-byte copy of the accepted VITRA handoff generated at
 `MIONkb/VITRA-CGRA@15e432f83427fc3121c50e2d4832a76b86d7a64f`, not a replacement
@@ -187,7 +187,7 @@ current lowering deliberately fails closed at these boundaries:
 Until then, mapping or compiling a CSTORE must not be treated as proof of
 conditional-store hardware behavior.
 
-Task 1 only ingested and validated the opt-in input contract; it did not fix
+This ingestion phase only ingested and validated the opt-in input contract; it did not fix
 placement, routing, scheduling, configuration, `FOR` support, or hardware
 execution. The VITRA handoff's own hardware evidence is provenance for the
 fixture, not evidence that ADORA has completed a compiler-to-hardware run.
