@@ -100,11 +100,24 @@ The nesting expresses which value commits on each path; it does not make pure ca
   `INPUT`, `OUTPUT`, `LOAD`, `STORE`, `CSTORE`; `CLOAD` is deliberately absent.
   Legacy mode-derived capabilities are used only when that field is absent, so
   the opt-in contract does not alter legacy defaults.
-- With this fixture the focused mapper contract accepts CSTORE and reaches the
-  controlled first failure `FOR is not supported!`. This is an ingestion
-  boundary, not mapping success: the ingestion phase did not fix placement, routing,
-  scheduling, configuration, `FOR`, or hardware execution. Hardware-level
-  conditional-store execution remains outside the validated ADORA scope.
+- With this fixture a direct loop-free CSTORE maps successfully with seeds 7,
+  19, and 101 using fixed mapper parameters. Its dynamic data, byte-address,
+  and enable chains have different producer depths. The pre-map CDFG has one
+  CSTORE with logical inputs 0, 1, and 2; each route manifest has three CSTORE
+  rows on disjoint physical input sets `{0,1}`, `{2,3}`, and `{4,5}`. Every
+  input arrives at its target latency, at least one uses nonzero RDU delay, and
+  repeating seed 7 produces a byte-identical manifest.
+- A loop-free normal STORE maps with the same VITRA fixture without logical
+  operand 2. A temporary ADG copy with CSTORE capability removed still maps
+  normal STORE and rejects CSTORE.
+- The real `if_store` workload is distinct from the direct loop-free
+  regression: it continues to fail in the stable, controlled way at `FOR is
+  not supported!`. No FOR support is implied by the successful direct case.
+- These mapper regressions prove placement, routing, and input-latency
+  alignment. They do not decode or validate configuration bits or packets and
+  do not execute hardware. CLOAD remains absent and unsupported; conditional
+  store suppression on ADORA-generated hardware remains outside the validated
+  scope.
 
 ### Mapper/spec limitations
 

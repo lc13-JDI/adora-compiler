@@ -1,10 +1,10 @@
 # CSTORE backend contract audit
 
-**Scope.** This is a source and repository-history audit of the conditional
-store (`CSTORE`) backend contract. It records what the mapper can represent
-today and the separate hardware-spec gap that prevents an end-to-end CSTORE
-claim. It does not add a CSTORE operation specification or change the hardware
-interface.
+**Scope.** This is a source, fixture, and regression audit of the conditional
+store (`CSTORE`) backend contract. It records the direct loop-free placement,
+routing, and input-alignment behavior that is reproducible today, together
+with the boundary beyond which no ADORA claim is made. It does not change the
+hardware interface or establish configuration or execution semantics.
 
 ## Mapper contract
 
@@ -57,19 +57,23 @@ CDFG generation also verifies, before writing a success DOT, that every CSTORE
 has exactly one connected data, byte-address, and enable input (ports 0, 1,
 and 2 respectively) and complete memory metadata.
 
-## Configuration contract
+## Unvalidated configuration code paths
 
-Both normal and ping-pong I/O configuration paths program CSTORE as follows:
+Source inspection shows that the normal and ping-pong I/O configuration paths
+contain the following CSTORE branches:
 
 - If the ADG exposes `UseAddr`, the mapper writes `1` for `CSTORE` (as it does
   for `LOAD`, `STORE`, and `CLOAD`).
 - If the ADG exposes `UseEn`, the mapper writes `1` only for `CLOAD` and
   `CSTORE`; it writes `0` for other operations.
 
-The existence checks are important: neither field is assumed to be present.
-See [`mapper/src/mapper/configuration/configuration.cpp`](../../mapper/src/mapper/configuration/configuration.cpp),
-lines 425--447, and [`mapper/src/mapper/configuration/pingpongCfg.cpp`](../../mapper/src/mapper/configuration/pingpongCfg.cpp),
-lines 142--164.
+The existence checks mean neither field is assumed to be present. See
+[`mapper/src/mapper/configuration/configuration.cpp`](../../mapper/src/mapper/configuration/configuration.cpp),
+lines 425--447, and
+[`mapper/src/mapper/configuration/pingpongCfg.cpp`](../../mapper/src/mapper/configuration/pingpongCfg.cpp),
+lines 142--164. These branches have not yet been decoded from emitted
+configuration bits or packets, so they are source intent rather than proven
+configuration semantics.
 
 ## Available operation and hardware artifacts
 
@@ -134,10 +138,12 @@ hardware/fixture artifacts:
 All four searches returned no result at that point. The repository now contains
 the opt-in tracked VITRA fixture above, alongside the compiler/CDFG MLIR
 fixtures for Stage A; the legacy catalogs remain unchanged. The fixture makes
-the input contract reproducible, but does not establish a successful ADORA
-mapping or execute ADORA-generated hardware configuration. Its focused mapper
-contract reaches the stable, controlled first failure `FOR is not supported!`
-after accepting the CSTORE operation and explicit IOB capabilities.
+the input contract reproducible. A direct loop-free CSTORE regression now
+establishes successful ADORA placement, three-port routing, and input alignment
+against it. The separate real `if_store` workload still reaches the stable,
+controlled first failure `FOR is not supported!` after accepting the CSTORE
+operation and explicit IOB capabilities. Neither result executes
+ADORA-generated hardware configuration.
 
 ## Delivery boundary
 
@@ -176,18 +182,31 @@ current lowering deliberately fails closed at these boundaries:
   and lowering plus both optimized/fallback CDFG attempts run on temporary
   kernels, so a failure leaves the original kernel unchanged.
 
-**Stage B is blocked** until the repository has all of the following:
+## Validated direct mapping boundary
 
-1. A real `CSTORE` operation specification.
-2. A three-input I/O block (`iob_mode=2`) exposing `UseEn`.
-3. Mapper placement/configuration against that ADG.
-4. Simulation demonstrating that `enable=0` suppresses the store and
-   `enable=1` performs it.
+The focused mapper regression uses a direct loop-free CSTORE whose data,
+byte-address, and enable values are all dynamic. Their CDFG producer depths are
+respectively one, two, and three supported operations. Before each mapping
+series, the regression requires exactly one CSTORE and exactly one incoming
+logical edge at each of ports 0, 1, and 2.
 
-Until then, mapping or compiling a CSTORE must not be treated as proof of
-conditional-store hardware behavior.
+The pinned VITRA ADG and operation catalog map that graph with seeds 7, 19,
+and 101, always using `--obj-opt=false --max-iters=30 --timeout=30000`. Every
+successful route manifest contains exactly three CSTORE rows. Logical ports
+0, 1, and 2 use the disjoint physical input sets `{0,1}`, `{2,3}`, and `{4,5}`
+respectively; every arrival latency equals its target latency. The runs include
+nonzero RDU delay, proving that the alignment check is not limited to
+equal-latency routes. Repeating seed 7 produces a byte-identical manifest.
 
-This ingestion phase only ingested and validated the opt-in input contract; it did not fix
-placement, routing, scheduling, configuration, `FOR` support, or hardware
-execution. The VITRA handoff's own hardware evidence is provenance for the
-fixture, not evidence that ADORA has completed a compiler-to-hardware run.
+A direct loop-free normal STORE maps with the same fixture and has no logical
+operand 2 route. Removing CSTORE from a temporary ADG copy still permits that
+STORE while rejecting the CSTORE with the explicit required/available
+capability diagnostic. The hash-pinned fixture itself is never modified.
+
+This evidence proves direct placement, routing, and mapper-level latency
+alignment only. It does not prove the meaning of emitted configuration bits or
+packets, hardware execution, false-enable write suppression, CLOAD support, or
+FOR support. The real loop-bearing `if_store` case remains intentionally at
+the `FOR is not supported!` operation-load/catalog boundary. The VITRA
+handoff's hardware evidence is fixture provenance, not an ADORA
+compiler-to-hardware execution result.
