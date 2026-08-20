@@ -69,7 +69,7 @@ def mutate(case, adg, operations):
         raise AssertionError("pinned CSTORE IOB has no physical input 4")
     if case == "missing-intra-endpoint":
         attrs["connections"]["12"][3] = 99
-        return "malformed endpoint", "IOB module 1"
+        return "malformed endpoint", "iob_index 0", "edge 12"
     if case == "cyclic-intra-connect":
         attrs["connections"]["11"][3] = 5
         attrs["connections"]["11"][4] = "Muxn"
@@ -93,7 +93,7 @@ def store_kernel():
   func.func @store_only(%value: i32, %output: memref<8xi32>) {
     %index = arith.constant 0 : index
     ADORA.kernel {
-      affine.store %value, %output[%index] : memref<8xi32>
+      memref.store %value, %output[%index] : memref<8xi32>
       ADORA.terminator
     } {KernelName = \"store_only\"}
     return
@@ -152,9 +152,17 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
                 f"{normal_result.stdout}")
         if not (case_dir / "normal-store.py").is_file():
             raise AssertionError("no-cstore normal STORE produced no output")
+        cdfg = case_dir / "store_only_map_result" / "before_map_store_only_CDFG.dot"
+        if not cdfg.is_file():
+            raise AssertionError("no-cstore normal STORE produced no before-map CDFG")
+        if 'opcode = "store"' not in cdfg.read_text():
+            raise AssertionError("no-cstore normal workload CDFG was not memref.store")
+        mapped_dfgio = case_dir / "store_only_map_result" / "mapped_dfgio.txt"
+        if not mapped_dfgio.is_file() or "STORE_" not in mapped_dfgio.read_text():
+            raise AssertionError("no-cstore normal workload was not mapped as STORE")
 
 
-def run_dfg_contract_tests(mapper):
+def run_dfg_contract_tests(mapper, operations):
     unit = mapper.with_name("cstore-dfg-contract-test")
     expected = {
         "valid": (0, ()),
@@ -164,7 +172,7 @@ def run_dfg_contract_tests(mapper):
         "memory-ignored": (0, ()),
     }
     for case, (status, messages) in expected.items():
-        result = subprocess.run([str(unit), case], text=True,
+        result = subprocess.run([str(unit), case, str(operations)], text=True,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=60, check=False)
         if result.returncode != status:
@@ -191,7 +199,7 @@ def main():
     args.operations = args.operations.resolve()
     args.kernel = args.kernel.resolve()
     args.workdir = args.workdir.resolve()
-    run_dfg_contract_tests(args.mapper)
+    run_dfg_contract_tests(args.mapper, args.operations)
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
         run_case(case, args.workdir, args.mapper, args.adg, args.operations,

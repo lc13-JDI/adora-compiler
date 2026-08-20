@@ -639,6 +639,7 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
     }
     // parse edges
     std::map<std::pair<LLVMCDFGNode*, LLVMCDFGNode*>, std::vector<int>> visited_edgeidx;    
+    std::map<std::pair<LLVMCDFGNode*, LLVMCDFGNode*>, size_t> cstoreEdgePortIdx;
     std::map<int, LLVMCDFGEdge*> edges = CDFG->edges();
     std::map<int, std::map<int, int>> cstorePortUse;
     for(auto &elem : edges){
@@ -649,26 +650,41 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         std::vector<int> dstPorts;
         int srcPort, dstPort; // default one output for each node
 
-        dstPorts = edge->dst()->getInputIndices(edge->src());
-        if(dstPorts.size() > 1){
-            for(int _ = 0; _ < dstPorts.size(); _++){
-                auto& visitedPorts = visited_edgeidx[std::make_pair(edge->src(), edge->dst())];
+        const bool isCStoreDestination = edge->dst()->getTypeName() == "CSTORE";
+        if(isCStoreDestination){
+            auto inputInfo = edge->dst()->inputInfoMap().find(edge->src());
+            auto edgePair = std::make_pair(edge->src(), edge->dst());
+            size_t& portIdx = cstoreEdgePortIdx[edgePair];
+            if(inputInfo == edge->dst()->inputInfoMap().end() ||
+               portIdx >= inputInfo->second.size()){
+                std::cout << "Invalid CSTORE DFG node " << dstId
+                          << ": missing logical operand path for raw edge "
+                          << edge_id << std::endl;
+                exit(1);
+            }
+            dstPort = inputInfo->second[portIdx++].idx;
+        }else{
+            dstPorts = edge->dst()->getInputIndices(edge->src());
+            if(dstPorts.size() > 1){
+                for(int _ = 0; _ < dstPorts.size(); _++){
+                    auto& visitedPorts = visited_edgeidx[std::make_pair(edge->src(), edge->dst())];
 
-                if (std::find(visitedPorts.begin(), visitedPorts.end(), dstPorts[_]) == visitedPorts.end()) {
-                    visitedPorts.push_back(dstPorts[_]);
-                    dstPort = dstPorts[_];
-                    break; 
+                    if (std::find(visitedPorts.begin(), visitedPorts.end(), dstPorts[_]) == visitedPorts.end()) {
+                        visitedPorts.push_back(dstPorts[_]);
+                        dstPort = dstPorts[_];
+                        break;
+                    }
                 }
             }
-        }
-        else{
-            dstPort = dstPorts[0];
+            else{
+                dstPort = dstPorts[0];
+            }
         }
 
         srcPort = 0; // default one output for each node
 
         bool isBackEdge = edge->src()->isOutputBackEdge(edge->dst());
-        if(edge->dst()->getTypeName() == "CSTORE"){
+        if(isCStoreDestination){
             CStoreContract::recordNonMemoryLogicalPort(cstorePortUse[dstId],
                                                        dstPort,
                                                        edge->type() == EDGE_TYPE_MEM);

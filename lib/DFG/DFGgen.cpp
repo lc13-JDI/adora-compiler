@@ -3067,6 +3067,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     }
     else if((isa<affine::AffineLoadOp>(op)
         || isa<affine::AffineStoreOp>(op)
+        || isa<memref::StoreOp>(op)
         || isa<arith::AddFOp>(op)
         || isa<arith::AddIOp>(op)
         || isa<arith::SubFOp>(op)
@@ -3450,6 +3451,34 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
       node->setMemrefName(ref_name);
       node->setLSaffine(true);
     }
+    else if (lsop->getName().getStringRef() == "memref.store") {
+      auto store = dyn_cast<memref::StoreOp>(lsop);
+      mlir::Operation* mrefop = store.getMemref().getDefiningOp();
+      std::string ref_name;
+      if(!mrefop){
+        auto barg = store.getMemref().dyn_cast<mlir::BlockArgument>();
+        ref_name = std::string(kernel.getKernelName()) + ":arg" +
+                   std::to_string(barg ? (int)barg.getArgNumber() : -1);
+      }
+      else if(isa<ADORA::DataBlockLoadOp>(mrefop)){
+        auto blockLoad = dyn_cast<ADORA::DataBlockLoadOp>(mrefop);
+        ref_name = std::string(kernel.getKernelName()) + ":" +
+                   std::string(blockLoad.getId());
+      }
+      else if(isa<ADORA::LocalMemAllocOp>(mrefop)){
+        auto localAlloc = dyn_cast<ADORA::LocalMemAllocOp>(mrefop);
+        ref_name = std::string(kernel.getKernelName()) + ":" +
+                   std::string(localAlloc.getId());
+      }
+      else{
+        ref_name = std::string(kernel.getKernelName()) + ":local";
+      }
+      node->setLinearAccess("0,1");
+      node->setInitAddr("0");
+      node->setMemrefSize(GetMemrefSize(store));
+      node->setMemrefName(ref_name);
+      node->setLSaffine(true);
+    }
   }
 
   // CSTORE is an I/O node with an explicit scalar address, so it still needs
@@ -3510,6 +3539,9 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     mlir::Operation *op = SuccNode->operation();
     if (!op)
       continue;
+    const bool isDirectMemrefStore =
+        SuccNode->getTypeName() == "store" &&
+        isa<ADORA::KernelOp>(op->getParentOp());
     if(verbose) {errs() << nodepair.first << ".Node:";}
     if(verbose) {op->dump();}
     for (unsigned operand_idx = 0; operand_idx < op->getNumOperands(); operand_idx++)
@@ -3521,6 +3553,9 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
       if (SuccNode->getTypeName() == "CSTORE" && operand_idx == 1)
         // ADORA.cond_store operand 1 is the memref SSA value, not a CDFG input.
         continue;
+      if (isDirectMemrefStore && operand_idx == 1)
+        // A direct memref.store operand 1 is its memref SSA value, not a CDFG input.
+        continue;
 
       int edgeidx;
       if (SuccNode->getTypeName() == "load")
@@ -3528,6 +3563,9 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
         edgeidx = (operand_idx >= 1) ? (int)(operand_idx - 1) : (int)operand_idx;
       else if (SuccNode->getTypeName() == "CSTORE")
         // ADORA.cond_store: value, memref, index, condition -> data, address, enable.
+        edgeidx = operand_idx == 0 ? 0 : (int)(operand_idx - 1);
+      else if (isDirectMemrefStore)
+        // A direct memref.store is value, memref, index -> data, address.
         edgeidx = operand_idx == 0 ? 0 : (int)(operand_idx - 1);
       else
         edgeidx = operand_idx;
