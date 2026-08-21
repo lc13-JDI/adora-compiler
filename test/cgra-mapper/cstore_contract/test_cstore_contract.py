@@ -77,6 +77,8 @@ def mutate(case, adg, operations):
     attrs = cstore_iob(adg)
     if case == "no-cstore":
         attrs["operations"].remove("CSTORE")
+        use_en_id = attrs["io_controller_cfg_id"].pop("UseEn")
+        del attrs["configuration"][str(use_en_id)]
         return "No legal ADG node supports CSTORE", "required=1", "available=0"
     if case == "missing-controller-map":
         del attrs["io_controller_cfg_id"]
