@@ -109,15 +109,21 @@ The nesting expresses which value commits on each path; it does not make pure ca
   repeating seed 7 produces a byte-identical manifest.
 - A loop-free normal STORE maps with the same VITRA fixture without logical
   operand 2. A temporary ADG copy with CSTORE capability removed still maps
-  normal STORE and rejects CSTORE.
+  normal STORE even when its legacy-style IOB also lacks the `UseEn` field and
+  bit range; the same copy rejects CSTORE.
 - The real `if_store` workload is distinct from the direct loop-free
   regression: it continues to fail in the stable, controlled way at `FOR is
   not supported!`. No FOR support is implied by the successful direct case.
-- These mapper regressions prove placement, routing, and input-latency
-  alignment. They do not decode or validate configuration bits or packets and
-  do not execute hardware. CLOAD remains absent and unsupported; conditional
-  store suppression on ADORA-generated hardware remains outside the validated
-  scope.
+- These mapper regressions prove placement, routing, input-latency alignment,
+  and emitted configuration packet values. ADG-derived decoding checks
+  CSTORE=`IsStore/UseAddr/UseEn=1/1/1`, normal
+  STORE=`1/1/0`, INPUT=`0/0/0`, each selected physical input, and the packed
+  DelayPipe lane delays against `mapped_routes.tsv`. `config.bit` and the
+  generated `cfgbit_<kernel>` array agree exactly, including repeated seed 7.
+  The current single-phase path is covered; runtime ping-pong switching and
+  hardware execution are not. CLOAD remains absent and unsupported;
+  conditional-store suppression on ADORA-generated hardware remains outside
+  the validated scope.
 
 ### Mapper/spec limitations
 

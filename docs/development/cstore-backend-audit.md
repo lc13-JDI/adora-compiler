@@ -4,7 +4,8 @@
 store (`CSTORE`) backend contract. It records the direct loop-free placement,
 routing, and input-alignment behavior that is reproducible today, together
 with the boundary beyond which no ADORA claim is made. It does not change the
-hardware interface or establish configuration or execution semantics.
+hardware interface or establish hardware-execution semantics. It does validate
+the emitted I/O-controller, input-mux, and DelayPipe configuration packets.
 
 ## Mapper contract
 
@@ -57,23 +58,42 @@ CDFG generation also verifies, before writing a success DOT, that every CSTORE
 has exactly one connected data, byte-address, and enable input (ports 0, 1,
 and 2 respectively) and complete memory metadata.
 
-## Unvalidated configuration code paths
+## Validated configuration packet contract
 
-Source inspection shows that the normal and ping-pong I/O configuration paths
-contain the following CSTORE branches:
+The normal and ping-pong I/O configuration paths contain the following CSTORE
+branches:
 
 - If the ADG exposes `UseAddr`, the mapper writes `1` for `CSTORE` (as it does
   for `LOAD`, `STORE`, and `CLOAD`).
 - If the ADG exposes `UseEn`, the mapper writes `1` only for `CLOAD` and
   `CSTORE`; it writes `0` for other operations.
 
-The existence checks mean neither field is assumed to be present. See
+The existence checks mean neither field is assumed to be present for IOBs that
+do not advertise CSTORE. A CSTORE-capable IOB is validated separately and must
+provide a well-formed `UseEn` field. See
 [`mapper/src/mapper/configuration/configuration.cpp`](../../mapper/src/mapper/configuration/configuration.cpp),
-lines 425--447, and
+and
 [`mapper/src/mapper/configuration/pingpongCfg.cpp`](../../mapper/src/mapper/configuration/pingpongCfg.cpp),
-lines 142--164. These branches have not yet been decoded from emitted
-configuration bits or packets, so they are source intent rather than proven
-configuration semantics.
+for the two encoders. The current mapper dispatches IOB configuration through
+`getIobPingpongCfgData(..., false)`, so the emitted single-phase values exercise
+the latter path; runtime phase switching is not claimed.
+
+The focused black-box regression decodes the pinned ADG's configuration IDs,
+bit ranges, and packet addresses rather than duplicating numeric offsets. For
+each successful mapping it checks that every address/value pair in `config.bit`
+matches the generated `cfgbit_<kernel>` array. It then proves the following
+decoded values:
+
+- a mapped CSTORE has `IsStore=1`, `UseAddr=1`, and `UseEn=1`;
+- a mapped normal STORE has `IsStore=1`, `UseAddr=1`, and `UseEn=0`;
+- mapped INPUT nodes keep all three controller bits clear;
+- each IOB input mux selects the physical input recorded in
+  `mapped_routes.tsv`; and
+- the DelayPipe field packs every routed input's recorded alignment delay into
+  its ADG-defined lane.
+
+The checks run for CSTORE seeds 7, 19, and 101 and a repeated seed 7. The two
+seed-7 runs produce byte-identical route manifests and configuration packets.
 
 ## Available operation and hardware artifacts
 
@@ -142,8 +162,9 @@ the input contract reproducible. A direct loop-free CSTORE regression now
 establishes successful ADORA placement, three-port routing, and input alignment
 against it. The separate real `if_store` workload still reaches the stable,
 controlled first failure `FOR is not supported!` after accepting the CSTORE
-operation and explicit IOB capabilities. Neither result executes
-ADORA-generated hardware configuration.
+operation and explicit IOB capabilities. The direct regression also decodes
+the emitted configuration packets, but neither result executes them on
+hardware.
 
 ## Delivery boundary
 
@@ -204,9 +225,10 @@ STORE while rejecting the CSTORE with the explicit required/available
 capability diagnostic. The hash-pinned fixture itself is never modified.
 
 This evidence proves direct placement, routing, and mapper-level latency
-alignment only. It does not prove the meaning of emitted configuration bits or
-packets, hardware execution, false-enable write suppression, CLOAD support, or
-FOR support. The real loop-bearing `if_store` case remains intentionally at
-the `FOR is not supported!` operation-load/catalog boundary. The VITRA
-handoff's hardware evidence is fixture provenance, not an ADORA
-compiler-to-hardware execution result.
+alignment, plus the emitted controller, mux, and DelayPipe packet values
+described above. It does not prove hardware execution, false-enable write
+suppression, runtime ping-pong phase switching, CLOAD support, or FOR support.
+The real loop-bearing `if_store` case remains intentionally at the `FOR is not
+supported!` operation-load/catalog boundary. The VITRA handoff's hardware
+evidence is fixture provenance, not an ADORA compiler-to-hardware execution
+result.
