@@ -23,6 +23,15 @@ CASES = (
     "overlapping-input-paths",
     "missing-intra-endpoint",
     "cyclic-intra-connect",
+    "missing-module-iob-index",
+    "non-integer-module-iob-index",
+    "missing-instance-iob-index",
+    "non-integer-instance-iob-index",
+    "non-object-connections",
+    "truncated-connection",
+    "non-array-connection",
+    "non-integer-connection-endpoint",
+    "non-integer-connection-port",
     "invalid-cstore-operands",
     "invalid-cstore-results",
 )
@@ -44,12 +53,24 @@ def dump(path, value):
         stream.write("\n")
 
 
-def cstore_iob(adg):
+def cstore_iob_module(adg):
     for module in adg["sub_modules"]:
         attrs = module.get("attributes", {})
         if module.get("type") == "IOB" and "CSTORE" in attrs.get("operations", []):
-            return attrs
+            return module
     raise AssertionError("pinned ADG has no CSTORE IOB")
+
+
+def cstore_iob(adg):
+    return cstore_iob_module(adg)["attributes"]
+
+
+def cstore_iob_instance(adg):
+    module_id = cstore_iob_module(adg)["id"]
+    for instance in adg["instances"]:
+        if instance.get("type") == "IOB" and instance.get("module_id") == module_id:
+            return instance
+    raise AssertionError("pinned ADG has no CSTORE IOB instance")
 
 
 def mutate(case, adg, operations):
@@ -98,6 +119,33 @@ def mutate(case, adg, operations):
         attrs["connections"]["11"][4] = "Muxn"
         attrs["connections"]["11"][5] = 1
         return "operand 2 has no physical input path",
+    if case == "missing-module-iob-index":
+        del attrs["iob_index"]
+        return "missing iob_index",
+    if case == "non-integer-module-iob-index":
+        attrs["iob_index"] = "zero"
+        return "iob_index must be an integer",
+    if case == "missing-instance-iob-index":
+        del cstore_iob_instance(adg)["iob_index"]
+        return "missing iob_index",
+    if case == "non-integer-instance-iob-index":
+        cstore_iob_instance(adg)["iob_index"] = "zero"
+        return "iob_index must be an integer",
+    if case == "non-object-connections":
+        attrs["connections"] = []
+        return "connections must be an object",
+    if case == "truncated-connection":
+        attrs["connections"]["12"] = [2, "DelayPipe"]
+        return "connection 12 must contain 6 fields",
+    if case == "non-array-connection":
+        attrs["connections"]["12"] = {}
+        return "connection 12 must be an array",
+    if case == "non-integer-connection-endpoint":
+        attrs["connections"]["12"][0] = "two"
+        return "connection 12 endpoint/port fields must be integers",
+    if case == "non-integer-connection-port":
+        attrs["connections"]["12"][2] = "two"
+        return "connection 12 endpoint/port fields must be integers",
     for operation in operations["Operations"]:
         if operation["name"] != "CSTORE":
             continue
@@ -134,6 +182,39 @@ def cstore_two_immediate_kernel():
       ADORA.cond_store %value, %output[%index] if %condition : memref<8xi32>
       ADORA.terminator
     } {KernelName = \"cstore_two_immediate\"}
+    return
+  }
+}
+"""
+
+
+def mixed_cstore_store_kernel():
+    return """module {
+  func.func @mixed_cstore_store(%input: memref<8xi32>,
+                                %output: memref<8xi32>, %index: index,
+                                %value: i32, %condition: i1) {
+    ADORA.kernel {
+      ADORA.cond_store %value, %output[%index] if %condition : memref<8xi32>
+      %loaded = memref.load %input[%index] : memref<8xi32>
+      memref.store %loaded, %output[%index] : memref<8xi32>
+      ADORA.terminator
+    } {KernelName = "mixed_cstore_store"}
+    return
+  }
+}
+"""
+
+
+def unsupported_store_producer_kernel():
+    return """module {
+  func.func @unsupported_store_producer(%value: i32,
+                                        %output: memref<?xi32>) {
+    %c0 = arith.constant 0 : index
+    ADORA.kernel {
+      %index = memref.dim %output, %c0 : memref<?xi32>
+      memref.store %value, %output[%index] : memref<?xi32>
+      ADORA.terminator
+    } {KernelName = "unsupported_store_producer"}
     return
   }
 }
@@ -179,6 +260,10 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
                 f"{case}: missing diagnostic {message!r}\n{result.stdout}")
     if case in HARDWARE_CASES and "Invalid CSTORE IOB" not in result.stdout:
         raise AssertionError(f"{case}: missing CSTORE IOB identity\n{result.stdout}")
+    if case in HARDWARE_CASES:
+        if (case_dir / "mapped.py").exists() or any(
+                case_dir.glob("*_map_result/mapped_routes.tsv")):
+            raise AssertionError(f"{case}: emitted mapped output after rejection")
     if case == "no-cstore":
         normal_store = case_dir / "normal-store.mlir"
         normal_store.write_text(store_kernel())
@@ -254,6 +339,53 @@ def run_cstore_immediate_mapper_test(workdir, mapper, adg, operations,
             "cstore-two-immediate-mapper emitted mapped output after rejection")
 
 
+def run_unsupported_store_producer_test(workdir, mapper, adg, operations,
+                                        environment):
+    case_dir = workdir / "unsupported-store-producer"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    kernel = case_dir / "kernel.mlir"
+    kernel.write_text(unsupported_store_producer_kernel())
+    output = case_dir / "mapped.py"
+    result = run(mapper, adg, operations, kernel, output, environment, case_dir)
+    if result.returncode != 1:
+        raise AssertionError(
+            "unsupported-store-producer: expected exit status 1, got "
+            f"{result.returncode}\n{result.stdout}")
+    for message in ("Invalid STORE CDFG node", "unsupported direct operand producer"):
+        if message not in result.stdout:
+            raise AssertionError(
+                f"unsupported-store-producer: missing {message!r}\n{result.stdout}")
+    if output.exists() or (case_dir / "unsupported_store_producer_map_result" /
+                           "mapped_routes.tsv").exists():
+        raise AssertionError(
+            "unsupported-store-producer emitted mapped output after rejection")
+
+
+def run_mixed_cstore_store_test(workdir, mapper, adg, operations, environment):
+    case_dir = workdir / "mixed-cstore-store"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    kernel = case_dir / "kernel.mlir"
+    kernel.write_text(mixed_cstore_store_kernel())
+    output = case_dir / "mapped.py"
+    result = run(mapper, adg, operations, kernel, output, environment, case_dir)
+    if result.returncode != 0:
+        raise AssertionError(
+            "mixed-cstore-store: expected success, got "
+            f"{result.returncode}\n{result.stdout}")
+    cdfg = case_dir / "mixed_cstore_store_map_result" / \
+        "before_map_mixed_cstore_store_CDFG.dot"
+    manifest = case_dir / "mixed_cstore_store_map_result" / "mapped_routes.tsv"
+    if not output.is_file() or not manifest.is_file() or not cdfg.is_file():
+        raise AssertionError("mixed-cstore-store emitted incomplete mapped output")
+    text = cdfg.read_text()
+    if 'opcode = "CSTORE"' not in text:
+        raise AssertionError("mixed-cstore-store CDFG omitted CSTORE")
+    for opcode in ('opcode = "load"', 'opcode = "store"'):
+        if opcode in text:
+            raise AssertionError(
+                f"mixed-cstore-store CDFG leaked ordinary memory node {opcode}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("workdir", type=Path)
@@ -275,6 +407,10 @@ def main():
         environment["GeneralOpNameFile"] = str(
             args.kernel.parents[3] / "lib/DFG/Documents/GeneralOpName.txt")
         run_cstore_immediate_mapper_test(
+            args.workdir, args.mapper, args.adg, args.operations, environment)
+        run_unsupported_store_producer_test(
+            args.workdir, args.mapper, args.adg, args.operations, environment)
+        run_mixed_cstore_store_test(
             args.workdir, args.mapper, args.adg, args.operations, environment)
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:

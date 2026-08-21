@@ -3067,7 +3067,6 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     }
     else if((isa<affine::AffineLoadOp>(op)
         || isa<affine::AffineStoreOp>(op)
-        || isa<memref::StoreOp>(op)
         || isa<arith::AddFOp>(op)
         || isa<arith::AddIOp>(op)
         || isa<arith::SubFOp>(op)
@@ -3143,12 +3142,15 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     // in a CSTORE kernel is unrelated unless it feeds a CSTORE operand.
     if (hasConditionalStore || store->getParentOp() != kernel.getOperation())
       return;
-    if (!collectMappedProducer(store.getValue(), store, "STORE"))
-      invalidDirectStoreProducer = true;
+    bool validStore = collectMappedProducer(store.getValue(), store, "STORE");
     for (mlir::Value index : store.getIndices()) {
       if (!collectMappedProducer(index, store, "STORE"))
-        invalidDirectStoreProducer = true;
+        validStore = false;
     }
+    if (validStore)
+      addOutsideFor(store.getOperation());
+    else
+      invalidDirectStoreProducer = true;
   });
   if (invalidDirectStoreProducer)
     return false;

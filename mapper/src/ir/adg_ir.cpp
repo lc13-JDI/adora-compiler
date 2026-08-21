@@ -1,6 +1,9 @@
 
 #include "ir/adg_ir.h"
 
+#include <cctype>
+#include <limits>
+
 namespace {
 
 bool rawIOBCapableOfCStore(const json &attrs,
@@ -35,6 +38,50 @@ bool rawIOBCapableOfCStore(const json &attrs,
 }
 
 void validateRawCStoreIOB(int moduleId, const json &attrs) {
+    auto index = attrs.find("iob_index");
+    if(index == attrs.end())
+        invalidRawCStoreIOB(moduleId, attrs, "missing iob_index");
+    if(!index->is_number_integer())
+        invalidRawCStoreIOB(moduleId, attrs,
+                            "iob_index must be an integer");
+
+    auto connections = attrs.find("connections");
+    if(connections == attrs.end() || !connections->is_object())
+        invalidRawCStoreIOB(moduleId, attrs,
+                            "connections must be an object");
+    const std::string maxEdgeId =
+        std::to_string(std::numeric_limits<int>::max());
+    for(const auto &element : connections->items()){
+        const std::string &edgeId = element.key();
+        if(edgeId.empty() ||
+           !std::all_of(edgeId.begin(), edgeId.end(), [](unsigned char ch) {
+               return std::isdigit(ch);
+           }) ||
+           edgeId.size() > maxEdgeId.size() ||
+           (edgeId.size() == maxEdgeId.size() && edgeId > maxEdgeId))
+            invalidRawCStoreIOB(moduleId, attrs,
+                                "connection id must be a nonnegative integer");
+        const json &edge = element.value();
+        if(!edge.is_array())
+            invalidRawCStoreIOB(moduleId, attrs,
+                                "connection " + edgeId + " must be an array");
+        if(edge.size() != 6)
+            invalidRawCStoreIOB(
+                moduleId, attrs,
+                "connection " + edgeId + " must contain 6 fields");
+        for(int field : {0, 2, 3, 5}){
+            if(!edge[field].is_number_integer())
+                invalidRawCStoreIOB(
+                    moduleId, attrs,
+                    "connection " + edgeId +
+                    " endpoint/port fields must be integers");
+        }
+        if(!edge[1].is_string() || !edge[4].is_string())
+            invalidRawCStoreIOB(
+                moduleId, attrs,
+                "connection " + edgeId + " endpoint types must be strings");
+    }
+
     auto controller = attrs.find("io_controller_cfg_id");
     if(controller == attrs.end())
         invalidRawCStoreIOB(moduleId, attrs, "missing io_controller_cfg_id");
@@ -80,6 +127,23 @@ void validateRawCStoreIOB(int moduleId, const json &attrs) {
                     "expected integer io_controller_cfg_id." + field);
         }
     }
+}
+
+[[noreturn]] void invalidRawCStoreIOBInstance(
+    int nodeId, int moduleId, const std::string &message) {
+    std::cout << "Invalid CSTORE IOB instance " << nodeId
+              << " (module " << moduleId << "): " << message << std::endl;
+    exit(1);
+}
+
+void validateRawCStoreIOBInstance(int nodeId, int moduleId,
+                                  const json &nodeJson) {
+    auto index = nodeJson.find("iob_index");
+    if(index == nodeJson.end())
+        invalidRawCStoreIOBInstance(nodeId, moduleId, "missing iob_index");
+    if(!index->is_number_integer())
+        invalidRawCStoreIOBInstance(nodeId, moduleId,
+                                    "iob_index must be an integer");
 }
 
 } // namespace
@@ -300,6 +364,11 @@ ADGNode* ADGIR::parseADGNode(json& nodeJson, std::map<int, std::pair<ADGNode*, b
     int moduleId = nodeJson["module_id"].get<int>();
     ADGNode* adg_node;
     ADGNode* module = modules[moduleId].first;
+    if(type == "IOB"){
+        IOBNode *iobModule = dynamic_cast<IOBNode*>(module);
+        if(iobModule && iobModule->opCapable("CSTORE"))
+            validateRawCStoreIOBInstance(nodeId, moduleId, nodeJson);
+    }
     bool renewNode = modules[moduleId].second; // used, need to re-new ADGNode
     if(type == "GPE" || type == "GIB" || type == "IOB"){                
         if(renewNode){ // re-new ADGNode
