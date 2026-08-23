@@ -10,6 +10,12 @@ EXPECTED_OPERATIONS_SHA = "0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86a
 EXPECTED_ADG_SHA = "e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7"
 EXPECTED_LOOP_SHA = "c3d358639ef9470f5abb5c3a8146e75c6920c6055e28dfba780868073312489e"
 EXPECTED_CFG_FIELDS = {"InitVal", "WI", "Latency", "Cycles", "Repeats", "SkipFirst"}
+EXPECTED_OPERAND_PORTS = {"data": 0, "address": 1, "enable": 2}
+EXPECTED_ARTIFACTS = {
+    "operations": ("artifacts/operations.json", EXPECTED_OPERATIONS_SHA),
+    "adg": ("artifacts/adg.json", EXPECTED_ADG_SHA),
+    "loop_index_contract": ("artifacts/loop_index_contract.json", EXPECTED_LOOP_SHA),
+}
 
 
 def fail(message: str) -> None:
@@ -30,6 +36,18 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def check_manifest_artifact(manifest: dict, fixture: Path, name: str) -> Path:
+    expected_path, expected_sha = EXPECTED_ARTIFACTS[name]
+    artifact = manifest["artifacts"][name]
+    relpath = artifact["path"]
+    require(relpath == expected_path, f"manifest {name} path changed")
+    require(artifact["sha256"] == expected_sha, f"manifest {name} sha256 changed")
+    path = fixture / relpath
+    require(path.is_file(), f"fixture {name} payload is missing")
+    require(sha256(path) == expected_sha, f"fixture {name} payload hash mismatch")
+    return path
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <fixture-root>", file=sys.stderr)
@@ -37,20 +55,17 @@ def main(argv: list[str]) -> int:
 
     fixture = Path(argv[1]).resolve()
     manifest = load_json(fixture / "manifest.json")
-    ops_path = fixture / "artifacts" / "operations.json"
-    adg_path = fixture / "artifacts" / "adg.json"
-    loop_path = fixture / "artifacts" / "loop_index_contract.json"
 
     require(manifest["source"]["commit"] == EXPECTED_VITRA_COMMIT,
             "fixture is not pinned to the final VITRA commit")
     require(manifest["source"]["remote_commit"] == EXPECTED_VITRA_COMMIT,
             "fixture remote provenance does not match the final VITRA commit")
-    require(ops_path.is_file(), "fixture operations.json is missing")
-    require(adg_path.is_file(), "fixture adg.json is missing")
-    require(loop_path.is_file(), "fixture loop_index_contract.json is missing")
-    require(sha256(ops_path) == EXPECTED_OPERATIONS_SHA, "fixture operations hash mismatch")
-    require(sha256(adg_path) == EXPECTED_ADG_SHA, "fixture ADG hash mismatch")
-    require(sha256(loop_path) == EXPECTED_LOOP_SHA, "fixture loop-index contract hash mismatch")
+    require(manifest["cstore_contract"]["operand_ports"] == EXPECTED_OPERAND_PORTS,
+            "manifest CSTORE operand_ports changed")
+
+    ops_path = check_manifest_artifact(manifest, fixture, "operations")
+    adg_path = check_manifest_artifact(manifest, fixture, "adg")
+    loop_path = check_manifest_artifact(manifest, fixture, "loop_index_contract")
 
     operations = load_json(ops_path)["Operations"]
     by_name = {entry["name"]: entry for entry in operations}
