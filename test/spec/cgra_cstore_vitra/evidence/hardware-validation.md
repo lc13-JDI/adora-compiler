@@ -1,71 +1,48 @@
-# Hardware validation evidence
+# Hardware validation
 
-This record summarizes the completed VITRA-CGRA Task 1–4 evidence that defines the artifacts in this package. The authoritative source is branch `feature/cstore-hardware`, commit `15e432f83427fc3121c50e2d4832a76b86d7a64f`.
+## Source identity
 
-## Task 1 — baseline and failure localization
+- VITRA final commit: `da03f4ab0cf696466147ac9210518e7ead6c9589`
+- VITRA fix commit: `eba80a8f9595fcd67209938e03c643aecf6fc26c`
+- ADORA artifact commit: `ab70915a039a36bf949e41e536d785508ba97fa9`
+- Final clean-generated RTL SHA256:
+  `3dfdfe954ae2b6614d7e3a7e3b08c3feb9d899f0fef9d4f4e1eee230d24fbbc0`
 
-- Verified the lab Chipyard project list contains `fdra` and the README VITRA generation command works using the isolated writable build copy.
-- Recorded Chipyard `27981d26675e7fd2e41d772375b5632951ece968`, fdra `0cb9381fa231b4d26881779a80a5f0c78ec4c5ff`, sbt 1.8.2, and OpenJDK 11.0.27.
-- SRAM_MODE baseline elaborated successfully.
-- Pre-fix COND_LS_MODE failed at the real first user frame `tram.dsa.IOB.$anonfun$new$6(IOB.scala:132)` with `IndexOutOfBoundsException: 2`, exposing the three-to-two operand discontinuity.
+## Canonical generation provenance
 
-## Task 2 — truthful three-operand structure
+- Preserved clean bundle: `/tmp/vitra-task1-refresh.yjQCfO/fresh-bundle-clean`
+- Second matching generation: `/tmp/vitra-task1-refresh.yjQCfO/fresh-bundle`
+- Clean rebuild command:
 
-- Established real logical operands data 0, byte address 1, and enable/predicate 2 through independent muxes, three SharedDelayPipe lanes, controller inputs, interconnect, and generated ADG.
-- Conditional capability was narrowed to exactly `INPUT`, `OUTPUT`, `LOAD`, `STORE`, `CSTORE`; no CLOAD claim.
-- Predicate encoding was fixed by source and tests to uniform-width operand 2 word bit 0. Values 0 and 2 are false; value 1 is true.
+```bash
+env XDG_RUNTIME_DIR=/tmp/vitra-cstore-closeout-sbt/runtime TMPDIR=/tmp/vitra-cstore-closeout-sbt/runtime COURSIER_CACHE=/tmp/vitra-cstore-closeout-sbt/coursier JAVA_TOOL_OPTIONS='-Djava.io.tmpdir=/tmp/vitra-cstore-closeout-sbt/runtime -Dsbt.global.base=/tmp/vitra-cstore-closeout-sbt/global -Dsbt.boot.directory=/tmp/vitra-cstore-closeout-sbt/boot -Dsbt.ivy.home=/tmp/vitra-cstore-closeout-sbt/ivy -Dsbt.coursier.home=/tmp/vitra-cstore-closeout-sbt/coursier -Dsbt.server.autostart=false -Dsbt.server.forcestart=true' /home/jhlou/chipyard/.conda-env/bin/sbt -java-home /usr/lib/jvm/java-11-openjdk-amd64 -batch 'project fdra' clean 'runMain tram.vitra.CStoreVerilogGen -td /tmp/vitra-task1-refresh.yjQCfO/fresh-bundle-clean'
+```
 
-## Task 3 — write gating and cycle proof
+- Clean rebuild result: exit `0`, elapsed `153 s`, emitted the RTL/spec hashes captured by this fixture.
 
-- Added conditional-only static `UseEn` as config ID 19 at aggregate bit 127, without shifting legacy FIFO/SRAM fields.
-- Runtime write permission is `!UseEn || operand2(0)`. It gates the final conditional SRAM request enable and write mask, not `wValid`, FSM, II counter, cycle counter, address generation, or `done`.
-- Production timing uses `addRegSram=2`; gated valid/mask, address, and data remain aligned as one transaction.
-- True oracle: word address 3 changed from `OLD=0x0bad` to `NEW=0x55aa` via exactly one `en=1`, `we=0b11` request.
-- False oracle: OLD remained `0x0bad`, with zero write requests, `en=0`, `we=0`, and `done=1`.
-- Alternating II=1 trace:
+## Bounded 710c04 vs 3dfdfe RTL audit
 
-| iteration | data | byte address | predicate | observed result |
-| --- | --- | --- | --- | --- |
-| 0 | `0x1011` | 0 | 1 | `en=1`, `we=0x3`, word address 0, write |
-| 1 | `0x2022` | 2 | 0 | `en=0`, `we=0x0`, no write |
-| 2 | `0x3033` | 4 | 1 | `en=1`, `we=0x3`, word address 2, write |
-| 3 | `0x4044` | 6 | 0 | `en=0`, `we=0x0`, no write, `done=1` |
+- Compared files:
+  - old incoming RTL `710c04eb320a212479f6825a84c533919c9defd73fc8e7d74f44d02cfea445ec`
+  - canonical clean RTL `3dfdfe954ae2b6614d7e3a7e3b08c3feb9d899f0fef9d4f4e1eee230d24fbbc0`
+- Diff scope: one file, one hunk, 34 diff lines total.
+- Changed region: AXI-Lite readback mux around generated `_r_data_T_*` wires and `io_s_axilite_r_bits_data` in `CGRAWithAXI.v`.
+- No diff evidence in the CSTORE/STORE side-effect path, DelayPipe predicate path, or the loop-index ACC contract artifacts.
 
-- Normal STORE regression: `UseEn=0` with predicate 0 still created exactly one normal write. Normal LOAD remained independent of predicate.
+## Fresh final-source full-CGRA oracles
 
-## Task 4 — production artifacts and regression
+All cases use the clean-generated RTL hash shown above.
 
-- Added the separate production entrypoint `tram.vitra.CStoreVerilogGen`; default `tram.vitra.VerilogGen` remains SRAM_MODE.
-- Generator-owned CSTORE record is `OPC=4`, `numOperands=3`, `numRes=0`, `latency=1`.
-- Generated conditional IOB is mode 2, has three logical operands and six physical inputs, exposes `IsStore`/`UseAddr`/`UseEn`, and uses `cgra_iob_sram_add_reg=2`.
-- Generated operation catalog and ADG are mutually consistent and omit CLOAD.
-- Final full fdra regression: 35 tests, 5 suites, 35 succeeded, 0 failed, 233 seconds.
-- Existing ADORA schema parse smoke succeeded with 240 GPE, 48 IOB, and 8 tiles. It was a read-only compatibility check, not Mapper development.
+| Oracle | Config SHA256 | Predicate | Target writes | Final value | Done cycle | Result |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| CSTORE true | `dd1ce4f4244e81cfc0e7b76e3970e480ec4331ff6f540b00a4b1db2e6f1d44e9` | 1 | 1 | `0x1236` | 3 | PASS |
+| CSTORE false | `dd1ce4f4244e81cfc0e7b76e3970e480ec4331ff6f540b00a4b1db2e6f1d44e9` | 0 | 0 | `0xbeef` | 3 | PASS |
+| normal STORE | `1a85dc659a7d25c725639d9197c14e0470c5e87b8c579edbcb3534c8e82b2caf` | n/a | 1 | `0x4567` | 2 | PASS |
 
-## Final commit-bound generation
+Normal STORE decoded `IsStore=1`, `UseAddr=1`, `UseEn=0`; its sole target write was bank 42, byte address 0 / word address 0, mask 3, data `0x4567`.
 
-After the final code/documentation commit was pushed, commit `15e432f83427fc3121c50e2d4832a76b86d7a64f` was exported with `git archive` and freshly generated once into `/tmp/vitra-cstore-handoff-final.H1PHq5`. The command exited 0 in 90 seconds and the generator's complete artifact audit passed.
+CSTORE true decoded `IsStore=1`, `UseAddr=1`, `UseEn=1`; its sole target write was bank 33, byte address 12 / word address 6, mask 3, data `0x1236`.
 
-- `operations.json`: `0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d`
-- `adg.json`: `e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7`
-- resolved `vitra_spec.json`: `3155ec148eee0efd4dbe8cae0c58359bd4deba4a140c9a64ed2bf5d0490d832d`
-- generated RTL, retained by hash only: `96e709d80a6c8a007fd650af934ceab69df3d25fb99beb62315628993fc46752`
+CSTORE false reused the exact same compiler configuration, had predicate bit 0 equal to zero, issued zero target SRAM writes, preserved OLD `0xbeef`, and completed normally.
 
-The two delivered semantic JSON files and resolved generator input are raw byte copies from that same run.
-
-## Schema-correct redelivery
-
-ADORA Task 0 found that the first physical package represented the semantic
-contract as an object but omitted the required top-level identifier
-`contract="adora-cstore-v1"` and generation timestamp. The producer rebuilt
-the package instead of editing incoming payload in place. A fresh generation
-from the same clean, pushed commit completed at `2026-08-19T21:19:16Z` in 104
-seconds with exit 0 and a passing built-in artifact audit. Its RTL,
-operations, ADG, and resolved generator-input hashes are identical to the
-final-commit generation above. The replacement manifest uses the v1 schema,
-records the timestamp, structured hardware results, source blob provenance,
-and the retained RTL hash.
-
-## Scope boundary for ADORA Task 0
-
-CLOAD is out of scope, not implemented, and absent from both delivered capability artifacts. At the previously inspected ADORA reader, `mapper/src/ir/adg_ir.cpp:148-154` inferred CLOAD and CSTORE from conditional mode rather than trusting the artifact's exact operations list. ADORA Task 0 must validate and preserve the delivered contract instead of treating mode 2 as evidence of CLOAD. No ADORA tracked file was modified during this handoff.
+Machine-readable oracle hashes are recorded in `evidence/e2e-results.json` in the approved full package. This tracked fixture keeps only the summary required for ADORA regression provenance.

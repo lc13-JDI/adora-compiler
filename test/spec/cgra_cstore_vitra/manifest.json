@@ -6,21 +6,21 @@
   "source": {
     "repository": "https://github.com/MIONkb/VITRA-CGRA.git",
     "branch": "feature/cstore-hardware",
-    "commit": "15e432f83427fc3121c50e2d4832a76b86d7a64f",
+    "commit": "da03f4ab0cf696466147ac9210518e7ead6c9589",
     "remote_ref": "refs/heads/feature/cstore-hardware",
-    "remote_commit": "15e432f83427fc3121c50e2d4832a76b86d7a64f",
+    "remote_commit": "da03f4ab0cf696466147ac9210518e7ead6c9589",
     "working_tree_clean": true,
-    "source_snapshot": "git archive of the full commit synchronized into /tmp/vitra-task1-chipyard-isolated-20260819"
+    "source_snapshot": "final clean-source generation preserved at /tmp/vitra-task1-refresh.yjQCfO/fresh-bundle-clean with a second matching generation at /tmp/vitra-task1-refresh.yjQCfO/fresh-bundle"
   },
   "generation": {
     "entrypoint": "tram.vitra.CStoreVerilogGen",
-    "command": "env XDG_RUNTIME_DIR=/tmp/vitra-task1-sbt/runtime TMPDIR=/tmp/vitra-task1-sbt/runtime COURSIER_CACHE=/tmp/vitra-task1-sbt/coursier JAVA_TOOL_OPTIONS='-Djava.io.tmpdir=/tmp/vitra-task1-sbt/runtime -Dsbt.global.base=/tmp/vitra-task1-sbt/global -Dsbt.boot.directory=/tmp/vitra-task1-sbt/boot -Dsbt.ivy.home=/tmp/vitra-task1-sbt/ivy -Dsbt.coursier.home=/tmp/vitra-task1-sbt/coursier -Dsbt.server.autostart=false -Dsbt.server.forcestart=true' /home/jhlou/chipyard/.conda-env/bin/sbt -java-home /usr/lib/jvm/java-11-openjdk-amd64 -batch 'project fdra' 'runMain tram.vitra.CStoreVerilogGen -td /tmp/vitra-cstore-redelivery.xeNXdq'",
-    "generation_id": "vitra-cstore-redelivery.xeNXdq",
-    "timestamp_utc": "2026-08-19T21:19:16Z",
+    "command": "env XDG_RUNTIME_DIR=/tmp/vitra-cstore-closeout-sbt/runtime TMPDIR=/tmp/vitra-cstore-closeout-sbt/runtime COURSIER_CACHE=/tmp/vitra-cstore-closeout-sbt/coursier JAVA_TOOL_OPTIONS='-Djava.io.tmpdir=/tmp/vitra-cstore-closeout-sbt/runtime -Dsbt.global.base=/tmp/vitra-cstore-closeout-sbt/global -Dsbt.boot.directory=/tmp/vitra-cstore-closeout-sbt/boot -Dsbt.ivy.home=/tmp/vitra-cstore-closeout-sbt/ivy -Dsbt.coursier.home=/tmp/vitra-cstore-closeout-sbt/coursier -Dsbt.server.autostart=false -Dsbt.server.forcestart=true' /home/jhlou/chipyard/.conda-env/bin/sbt -java-home /usr/lib/jvm/java-11-openjdk-amd64 -batch 'project fdra' clean 'runMain tram.vitra.CStoreVerilogGen -td /tmp/vitra-task1-refresh.yjQCfO/fresh-bundle-clean'",
+    "generation_id": "da03f4a-cstore-generation-clean-20260823T064142Z",
+    "timestamp_utc": "2026-08-23T06:41:42Z",
     "exit_code": 0,
-    "elapsed_seconds": 104,
+    "elapsed_seconds": 153,
     "artifact_audit": "pass",
-    "rtl_sha256": "96e709d80a6c8a007fd650af934ceab69df3d25fb99beb62315628993fc46752",
+    "rtl_sha256": "3dfdfe954ae2b6614d7e3a7e3b08c3feb9d899f0fef9d4f4e1eee230d24fbbc0",
     "toolchain_versions": {
       "sbt": "1.8.2",
       "java": "11.0.27",
@@ -31,12 +31,12 @@
       {
         "role": "generator",
         "path": "cgra-mg/src/main/scala/vitra/VitraWithAxi.scala",
-        "blob": "fcb0452b544d4eea54e08be77953368359efef69"
+        "blob": "0e5766e6b7da7387796c1d1bd82e644c3514fa2d"
       },
       {
         "role": "generator",
         "path": "cgra-mg/src/main/scala/vitra/CStoreArtifactAudit.scala",
-        "blob": "70e4e1c5cb61e717e0f8a750d59006238d2a70ac"
+        "blob": "aa6f93132ddab6c3de5c92976140429996bd6f4e"
       },
       {
         "role": "hardware",
@@ -56,7 +56,7 @@
       {
         "role": "test",
         "path": "cgra-mg/src/test/scala/vitra/VitraTask4ArtifactSpec.scala",
-        "blob": "462c770dd620ca95db61c94bc722eb1cc5f3c79e"
+        "blob": "f9de5b1a86020427de82773a1b55d3718f80535e"
       }
     ],
     "resolved_input": {
@@ -69,7 +69,7 @@
   "delivery_target": {
     "repository": "https://github.com/lc13-JDI/adora-compiler.git",
     "branch": "scheduletasks-h",
-    "commit_before_delivery": "6dbce4ec32459a099b38294861344088cc3e5243"
+    "commit_before_delivery": "ab70915a039a36bf949e41e536d785508ba97fa9"
   },
   "artifacts": {
     "operations": {
@@ -83,6 +83,12 @@
       "sha256": "e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7",
       "raw_byte_copy": true,
       "generated_source_path": "spec/vitra_cgra_adg.json"
+    },
+    "loop_index_contract": {
+      "path": "artifacts/loop_index_contract.json",
+      "sha256": "c3d358639ef9470f5abb5c3a8146e75c6920c6055e28dfba780868073312489e",
+      "raw_byte_copy": true,
+      "generated_source_path": "spec/loop_index_contract.json"
     }
   },
   "cstore_contract": {
@@ -103,9 +109,9 @@
     "cload": "out_of_scope_and_not_advertised"
   },
   "validation": {
-    "fresh_generation": {"passed": true, "exit_code": 0, "elapsed_seconds": 104},
-    "true_write": {"passed": true, "old_value": "0x0bad", "new_value": "0x55aa", "write_count": 1},
-    "false_zero_write": {"passed": true, "old_value": "0x0bad", "final_value": "0x0bad", "write_count": 0, "done": true},
+    "fresh_generation": {"passed": true, "exit_code": 0, "elapsed_seconds": 153},
+    "true_write": {"passed": true, "old_value": "0xbeef", "new_value": "0x1236", "write_count": 1},
+    "false_zero_write": {"passed": true, "old_value": "0xbeef", "final_value": "0xbeef", "write_count": 0, "done": true},
     "alternating": {"passed": true, "predicates": [1, 0, 1, 0], "write_iterations": [0, 2], "writes": 2, "suppressions": 2, "done": true},
     "normal_store": {"passed": true, "use_en": 0, "predicate": 0, "write_count": 1},
     "full_regression": {"tests": 35, "suites": 5, "succeeded": 35, "failed": 0, "elapsed_seconds": 233}
