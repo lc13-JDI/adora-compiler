@@ -52,6 +52,8 @@ void Graphviz::drawDFG(){
         ofs << quoteName << "[label = \"\\N\\nlat=" << attr.lat;
         if(node->hasImm())
             ofs << "\\nimm=" << node->imm() << "\\nimmIdx=" << node->immIdx();
+        if(node->isLoopIndexAcc())
+            ofs << "\\nloop_index_acc=1";
         ofs << "\"];\n";
         // for(auto& input : node->inputs()){
         //     int srcNodeId = input.second.first;

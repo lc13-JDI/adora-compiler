@@ -351,6 +351,13 @@ DFG* DFGIR::parseDFGJson(std::string filename){
                         dfg_node->setIsAccFirst(false);
                     }
                 }
+                if(nodeJson.contains("loop_index_acc") &&
+                   ((nodeJson["loop_index_acc"].is_string() &&
+                     nodeJson["loop_index_acc"].get<std::string>() == "1") ||
+                    (nodeJson["loop_index_acc"].is_boolean() &&
+                     nodeJson["loop_index_acc"].get<bool>()))) {
+                    dfg_node->setLoopIndexAcc();
+                }
             }
             dfg_node->setId(id);
             dfg_node->setName(nodeName);
@@ -602,6 +609,9 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
                     }
                     else{
                         dfg_node->setIsAccFirst(true);
+                    }
+                    if(node->isLoopIndexAcc()){
+                        dfg_node->setLoopIndexAcc();
                     }
                         
                     if(!IsAccConstant(VarACC)){

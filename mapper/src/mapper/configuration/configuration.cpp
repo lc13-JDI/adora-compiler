@@ -239,7 +239,7 @@ std::map<int, CfgData> Configuration::getGpeCfgData(GPENode* node){
 
         /// II
         int II = _mapping->II();
-        int WI = dfgNode->interval() * II;
+        int WI = dfgNode->isLoopIndexAcc() ? 1 : dfgNode->interval() * II;
         int wiId = node->cfgIdMap["WI"];
         addCfgData(cfg, node->configInfo(wiId), (uint32_t)WI);
         // CfgDataLoc wiCfgLoc = node->configInfo(wiId);
@@ -249,11 +249,14 @@ std::map<int, CfgData> Configuration::getGpeCfgData(GPENode* node){
         // cfg[wiCfgLoc.low] = wiCfg;
 
         auto& dfgNodeAttr = _mapping->dfgNodeAttr(dfgNode->id());
-        int latency = dfgNodeAttr.lat - dfgNode->opLatency(); 
+        int latency = dfgNode->isLoopIndexAcc() ? 0 :
+            dfgNodeAttr.lat - dfgNode->opLatency();
         int latencyId = node->cfgIdMap["Latency"];
 
         //// @jhlou: for nodes following merge op, add additional latency(acr counting 3 more cycles) 
-        latency = addAdditionalLatencyForMERGEOp(dfgNode, latency);
+        if(!dfgNode->isLoopIndexAcc()){
+            latency = addAdditionalLatencyForMERGEOp(dfgNode, latency);
+        }
 
         addCfgData(cfg, node->configInfo(latencyId), (uint32_t)latency);
         // CfgDataLoc latencyCfgLoc = node->configInfo(latencyId);
@@ -277,7 +280,7 @@ std::map<int, CfgData> Configuration::getGpeCfgData(GPENode* node){
             varconfig->LSBToLenExpr[key] = value;
         }
 
-        int repeats = dfgNode->repeats();
+        int repeats = dfgNode->isLoopIndexAcc() ? 1 : dfgNode->repeats();
         int repeatsId = node->cfgIdMap["Repeats"];
         addCfgData(cfg, node->configInfo(repeatsId), (uint32_t)repeats);
         // CfgDataLoc repeatsCfgLoc = node->configInfo(repeatsId);
@@ -292,7 +295,7 @@ std::map<int, CfgData> Configuration::getGpeCfgData(GPENode* node){
             varconfig->LSBToLenExpr[key] = value;
         }
 
-        bool skipfisrt = !dfgNode->isAccFirst();
+        bool skipfisrt = dfgNode->isLoopIndexAcc() || !dfgNode->isAccFirst();
         int skipfisrtId = node->cfgIdMap["SkipFirst"];
         addCfgData(cfg, node->configInfo(skipfisrtId), (uint32_t)skipfisrt);
         // CfgDataLoc skipfisrtCfgLoc = node->configInfo(skipfisrtId);
