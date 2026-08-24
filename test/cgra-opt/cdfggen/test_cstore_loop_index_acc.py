@@ -2,6 +2,7 @@
 """Focused physical-CDFG contract checks for affine CSTORE loop indices."""
 
 import pathlib
+import json
 import re
 import subprocess
 import sys
@@ -55,6 +56,82 @@ def check_supported(dot, init, step, trips):
         raise AssertionError(f"{dot}: positive step is not ACC operand 0")
 
 
+def check_case_b_structure(dot):
+    nodes, edges = nodes_and_edges(dot)
+    acc = next(name for name, (op, _) in nodes.items() if op == "ACC")
+    cstore = next(name for name, (op, _) in nodes.items() if op == "CSTORE")
+    muls = [name for name, (op, _) in nodes.items() if op == "MUL"]
+    if len(muls) != 1:
+        raise AssertionError(f"{dot}: expected exactly one byte-scaling MUL")
+    mul = muls[0]
+    if (acc, mul, 0) not in edges or (mul, cstore, 1) not in edges:
+        raise AssertionError(f"{dot}: expected ACC -> MUL -> CSTORE address path")
+    if {port for _, dst, port in edges if dst == cstore} != {0, 1, 2}:
+        raise AssertionError(f"{dot}: CSTORE data/address/predicate ports changed")
+    if not any(op == "CONST" and (name, mul, 1) in edges and
+               'value="0x00000002"' in attrs
+               for name, (op, attrs) in nodes.items()):
+        raise AssertionError(f"{dot}: byte-scaling MUL no longer has constant 2 on operand 1")
+
+
+def check_mapped_step_route(mapped_dfg, mapped_adg, adg):
+    mapped_text = mapped_dfg.read_text()
+    acc_matches = [line.split('"')[1] for line in mapped_text.splitlines()
+                   if line.startswith('"ACC') and '\\nimm=2\\nimmIdx=0' in line]
+    if len(acc_matches) != 1:
+        raise AssertionError(
+            "Case B step was not folded into exactly one mapped ACC immediate on operand 0")
+    acc = acc_matches[0]
+    mapped_adg_text = mapped_adg.read_text()
+    match = re.search(r'GPE(\d+)\[label = "GPE\d+\\nDFG:' + re.escape(acc) +
+                      r'", color = red\];', mapped_adg_text)
+    if not match:
+        raise AssertionError("mapped ACC is not placed on a physical GPE")
+    physical_gpe = int(match.group(1))
+    design = json.loads(adg.read_text())
+    instance = next(item for item in design["instances"] if item["id"] == physical_gpe)
+    module = next(item for item in design["sub_modules"]
+                  if item["id"] == instance["module_id"] and item["type"] == "GPE")
+    connections = {tuple(connection) for connection in module["attributes"]["connections"].values()}
+    route = {
+        (1, "Const", 0, 5, "Muxn", 0),
+        (5, "Muxn", 0, 4, "DelayPipe", 0),
+        (4, "DelayPipe", 0, 2, "ALU", 0),
+    }
+    if not route.issubset(connections):
+        raise AssertionError("mapped ACC GPE lacks Const -> Muxn -> DelayPipe operand-0 -> ALU route")
+
+
+def check_composed_affine_apply(dot):
+    nodes, edges = nodes_and_edges(dot)
+    if any(op == "for" for op, _ in nodes.values()):
+        raise AssertionError(f"{dot}: supported composed affine address retained physical FOR")
+    acc = next((name for name, (op, _) in nodes.items() if op == "ACC"), None)
+    cstore = next((name for name, (op, _) in nodes.items() if op == "CSTORE"), None)
+    if not acc or not cstore:
+        raise AssertionError(f"{dot}: missing ACC or CSTORE for composed affine address")
+    if not any(op == "ADD" for op, _ in nodes.values()) or \
+       not any(op == "MUL" for op, _ in nodes.values()):
+        raise AssertionError(f"{dot}: composed affine ADD/MUL address chain disappeared")
+    successors = {}
+    for src, dst, port in edges:
+        successors.setdefault(src, []).append((dst, port))
+    pending = [acc]
+    visited = set()
+    reaches_address = False
+    while pending:
+        source = pending.pop()
+        if source in visited:
+            continue
+        visited.add(source)
+        for target, port in successors.get(source, []):
+            if target == cstore and port == 1:
+                reaches_address = True
+            pending.append(target)
+    if not reaches_address or {port for _, dst, port in edges if dst == cstore} != {0, 1, 2}:
+        raise AssertionError(f"{dot}: composed ACC path does not preserve CSTORE address/data/predicate ports")
+
+
 def main():
     cgra_opt = pathlib.Path(sys.argv[1]).resolve()
     mapper = pathlib.Path(sys.argv[2]).resolve()
@@ -63,8 +140,8 @@ def main():
     test_dir = pathlib.Path(sys.argv[5]).resolve()
     fixture = test_dir / "cstore_loop_index_acc.mlir"
     chunks = fixture.read_text().split("// -----\n")
-    if len(chunks) != 3:
-        raise AssertionError("expected three loop-index fixture chunks")
+    if len(chunks) != 8:
+        raise AssertionError("expected eight loop-index fixture chunks")
 
     with tempfile.TemporaryDirectory(prefix="adora-loop-index-acc-") as temp:
         workdir = pathlib.Path(temp)
@@ -76,6 +153,7 @@ def main():
 
         check_supported(workdir / "loop_index_a_CDFG.dot", 0, 1, 4)
         check_supported(workdir / "loop_index_b_CDFG.dot", 3, 2, 5)
+        check_case_b_structure(workdir / "loop_index_b_CDFG.dot")
 
         run([mapper, "--seed=7", f"--adg={adg}", f"--op-file={operations}",
              "--output-type=pytest", "--obj-opt=false", "--max-iters=30",
@@ -85,25 +163,49 @@ def main():
         mapped_text = mapped_dfg.read_text()
         if '"ACC' not in mapped_text or '"FOR' in mapped_text:
             raise AssertionError("mapper did not preserve the loop-index ACC")
+        check_mapped_step_route(mapped_dfg,
+                                workdir / "loop_index_b_map_result" / "mapped_adg.dot", adg)
 
-        unsupported = workdir / "unsupported.mlir"
-        unsupported.write_text(chunks[2])
-        output = run([cgra_opt, "--adora-kernel-dfg-gen", unsupported], workdir,
-                     expected=1)
-        if "unsupported loop-index CSTORE" not in output:
-            raise AssertionError(f"missing fail-closed diagnostic:\n{output}")
+        negatives = [
+            ("empty", chunks[2], "logical iteration space must be non-empty", True),
+            ("iter_arg", chunks[3], "loop-carried values are unsupported", True),
+            ("indirect", chunks[4], "indirect or non-address induction-value use is unsupported", True),
+            ("wrong_port", chunks[5], "indirect or non-address induction-value use is unsupported", True),
+            ("extreme", chunks[6], "trip count must be in the supported range", True),
+            ("negative_step", chunks[7], "positive signed integer", False),
+        ]
+        negative_errors = []
+        for name, chunk, expected_diagnostic, needs_loop_index_diagnostic in negatives:
+            unsupported = workdir / f"unsupported-{name}.mlir"
+            unsupported.write_text(chunk)
+            result = subprocess.run([cgra_opt, "--adora-kernel-dfg-gen", unsupported],
+                                    cwd=workdir, text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, check=False)
+            output = result.stdout
+            if result.returncode != 1 or expected_diagnostic not in output or \
+               (needs_loop_index_diagnostic and "unsupported loop-index CSTORE" not in output):
+                negative_errors.append(
+                    f"missing fail-closed diagnostic for {name} "
+                    f"(rc={result.returncode}):\n{output}")
+        if negative_errors:
+            raise AssertionError("\n".join(negative_errors))
 
         run([cgra_opt, "--adora-kernel-dfg-gen",
              test_dir / "mmul_relu/mmul_relu_opt.mlir"], workdir)
         generic_dot = workdir / "mmul_relu_CDFG.dot"
-        if 'opcode = "ACC"' not in generic_dot.read_text() or \
-           'loop_index_acc="1"' in generic_dot.read_text():
+        generic_text = generic_dot.read_text()
+        if 'opcode = "ACC"' not in generic_text or \
+           'loop_index_acc="1"' in generic_text or 'acc_first=1' not in generic_text:
             raise AssertionError("ordinary ACC behavior was changed")
 
         run([cgra_opt, "--adora-kernel-dfg-gen",
              test_dir / "control_flow_paths/conditional_store.mlir"], workdir)
         if 'opcode = "CSTORE"' not in (workdir / "cf_direct_i8_CDFG.dot").read_text():
             raise AssertionError("existing loop-free CSTORE no longer lowers")
+
+        run([cgra_opt, "--adora-kernel-dfg-gen",
+             test_dir / "control_flow_paths/conditional_store_memory_ordering.mlir"], workdir)
+        check_composed_affine_apply(workdir / "cf_affine_apply_CDFG.dot")
 
         run([cgra_opt, "--adora-kernel-dfg-gen",
              test_dir.parent.parent / "cgra-mapper/cstore_contract/normal_store.mlir.in"],

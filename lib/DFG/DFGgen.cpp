@@ -2612,6 +2612,126 @@ static void InsertMemrefByteOffsetMul(LLVMCDFG *CDFG, bool verbose = false) {
   }
 }
 
+static bool ValueReachesCStore(mlir::Value value,
+                               llvm::DenseSet<mlir::Value> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+  for (mlir::OpOperand &use : value.getUses()) {
+    mlir::Operation *owner = use.getOwner();
+    if (isa<ADORA::CondStoreOp>(owner))
+      return true;
+    // Follow all result types here so that an IV converted to CSTORE data is
+    // rejected too. Uses that never reach CSTORE remain outside this lowering.
+    for (mlir::Value result : owner->getResults())
+      if (ValueReachesCStore(result, visited))
+        return true;
+  }
+  return false;
+}
+
+enum class CStoreIVUseKind { NoCStore, Supported, Mixed, Unsupported };
+
+static bool IsStaticIndexValue(mlir::Value value) {
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  return constant && value.getType().isIndex();
+}
+
+static bool IsSupportedIndexTransform(mlir::Operation *owner,
+                                      mlir::Value source) {
+  if (auto apply = dyn_cast<affine::AffineApplyOp>(owner)) {
+    if (apply->getNumResults() != 1 || !apply.getResult().getType().isIndex())
+      return false;
+    for (mlir::Value operand : apply.getOperands())
+      if (operand != source && !IsStaticIndexValue(operand))
+        return false;
+    return true;
+  }
+
+  if (auto add = dyn_cast<arith::AddIOp>(owner))
+    return add.getType().isIndex() &&
+        ((add.getLhs() == source && IsStaticIndexValue(add.getRhs())) ||
+         (add.getRhs() == source && IsStaticIndexValue(add.getLhs())));
+  if (auto mul = dyn_cast<arith::MulIOp>(owner))
+    return mul.getType().isIndex() &&
+        ((mul.getLhs() == source && IsStaticIndexValue(mul.getRhs())) ||
+         (mul.getRhs() == source && IsStaticIndexValue(mul.getLhs())));
+  return false;
+}
+
+static CStoreIVUseKind ClassifyCStoreIVUses(
+    mlir::Value value, llvm::DenseSet<mlir::Value> &visiting) {
+  if (!visiting.insert(value).second)
+    return CStoreIVUseKind::Unsupported;
+
+  bool reachesCStore = false;
+  bool hasOtherUse = false;
+  for (mlir::OpOperand &use : value.getUses()) {
+    mlir::Operation *owner = use.getOwner();
+    if (auto store = dyn_cast<ADORA::CondStoreOp>(owner)) {
+      reachesCStore = true;
+      if (store.getIndices().size() != 1 || use.getOperandNumber() != 2)
+        return CStoreIVUseKind::Unsupported;
+      continue;
+    }
+
+    if (!IsSupportedIndexTransform(owner, value)) {
+      llvm::DenseSet<mlir::Value> reachable;
+      for (mlir::Value result : owner->getResults())
+        if (ValueReachesCStore(result, reachable))
+          return CStoreIVUseKind::Unsupported;
+      hasOtherUse = true;
+      continue;
+    }
+
+    CStoreIVUseKind child = ClassifyCStoreIVUses(owner->getResult(0), visiting);
+    if (child == CStoreIVUseKind::Unsupported)
+      return child;
+    reachesCStore |= child == CStoreIVUseKind::Supported ||
+        child == CStoreIVUseKind::Mixed;
+    // Dead, pure address expressions are removable compiler artifacts and do
+    // not add a physical IV consumer. A live non-CSTORE path remains mixed.
+    hasOtherUse |= child == CStoreIVUseKind::Mixed;
+  }
+  return !reachesCStore ? CStoreIVUseKind::NoCStore
+                         : (hasOtherUse ? CStoreIVUseKind::Mixed
+                                        : CStoreIVUseKind::Supported);
+}
+
+// Inspect actual affine IV uses before CDFG construction loses indirect-use
+// information. The v1 subset accepts direct CSTORE addresses and pure,
+// statically parameterized affine/arithmetic address chains ending there.
+static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
+  bool invalid = false;
+  kernel.walk([&](affine::AffineForOp forOp) {
+    if (invalid)
+      return;
+
+    llvm::DenseSet<mlir::Value> visiting;
+    CStoreIVUseKind useKind =
+        ClassifyCStoreIVUses(forOp.getInductionVar(), visiting);
+    if (useKind == CStoreIVUseKind::NoCStore ||
+        useKind == CStoreIVUseKind::Mixed)
+      return;
+    auto reject = [&](llvm::StringRef reason) {
+      forOp.emitError("unsupported loop-index CSTORE: ") << reason;
+      invalid = true;
+    };
+
+    if (useKind == CStoreIVUseKind::Unsupported)
+      return reject("indirect or non-address induction-value use is unsupported");
+    if (!forOp.getInits().empty() || forOp.getNumResults() != 0) {
+      reject("loop-carried values are unsupported");
+      return;
+    }
+    auto yield = dyn_cast<affine::AffineYieldOp>(forOp.getBody()->getTerminator());
+    if (!yield || !yield.getOperands().empty()) {
+      reject("non-empty affine.yield is unsupported");
+      return;
+    }
+  });
+  return invalid ? failure() : success();
+}
+
 // Lower only the narrow CSTORE loop-index subset described by the VITRA
 // contract. The affine.for remains an MLIR control construct; this replaces
 // its physical CDFG producer with an ACC and a real static step operand.
@@ -2628,24 +2748,20 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     if (!forOp)
       continue;
 
-    bool feedsCStoreAddress = false;
-    bool onlyFeedsCStoreAddresses = !node->outputNodes().empty();
-    for (LLVMCDFGNode *consumer : node->outputNodes()) {
-      const std::vector<int> ports = consumer->getInputIndices(node);
-      const bool isCStoreAddress = consumer->getTypeName() == "CSTORE" &&
-          std::find(ports.begin(), ports.end(), 1) != ports.end();
-      feedsCStoreAddress |= isCStoreAddress;
-      onlyFeedsCStoreAddresses &= isCStoreAddress;
-    }
-    if (!feedsCStoreAddress)
+    llvm::DenseSet<mlir::Value> visiting;
+    if (ClassifyCStoreIVUses(forOp.getInductionVar(), visiting) !=
+        CStoreIVUseKind::Supported)
       continue;
 
     auto reject = [&](llvm::StringRef reason) -> LogicalResult {
       forOp.emitError("unsupported loop-index CSTORE: ") << reason;
       return failure();
     };
-    if (!onlyFeedsCStoreAddresses)
-      return reject("induction value has non-CSTORE-address users");
+    if (!forOp.getInits().empty() || forOp.getNumResults() != 0)
+      return reject("loop-carried values are unsupported");
+    auto yield = dyn_cast<affine::AffineYieldOp>(forOp.getBody()->getTerminator());
+    if (!yield || !yield.getOperands().empty())
+      return reject("non-empty affine.yield is unsupported");
     if (!forOp.hasConstantLowerBound() || !forOp.hasConstantUpperBound())
       return reject("requires constant lower and upper bounds");
 
@@ -2660,7 +2776,8 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
       return reject("logical iteration space must be non-empty");
 
     const int64_t distance = upperBound - lowerBound;
-    const int64_t tripCount = (distance + step - 1) / step;
+    // Avoid signed overflow in the usual (distance + step - 1) round-up.
+    const int64_t tripCount = distance / step + (distance % step != 0);
     if (tripCount <= 0 || tripCount > kMaxTripCount)
       return reject("trip count must be in the supported range [1, 4095]");
     const int64_t finalValue = lowerBound + (tripCount - 1) * step;
@@ -3079,6 +3196,9 @@ static void fixSELOperandIndices(LLVMCDFG *CDFG, bool verbose) {
 bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp kernel, bool verbose){
   if(verbose) {kernel.dump();}
   _kernel_toDFG = &kernel;
+
+  if (failed(PreflightCStoreLoopIndexUses(kernel)))
+    return false;
 
   int level = 0, level_total;
   std::map<mlir::Operation*, int> For_loop_level;
