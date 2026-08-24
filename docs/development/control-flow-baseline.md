@@ -13,10 +13,13 @@
 
 The fixed MLIR path is authoritative for this baseline. C sources record the intended source semantics and can be compared with frontend output when `cgeist` becomes available.
 
-This document preserves the original control-flow baseline at commit `4ef8fc6`. The current
-branch has since completed the compiler/CDFG Stage A for conditional stores;
-the updated status is summarized below and the hardware boundary is documented
-in [`cstore-backend-audit.md`](cstore-backend-audit.md).
+This document preserves the original control-flow baseline at commit `4ef8fc6`.
+Stage A subsequently established the compiler/CDFG conditional-store contract.
+The branch has now completed the executable CSTORE backend, loop-index ACC
+lowering, and package-only full-CGRA validation. The final current state is in
+[`cstore-loop-index-e2e.md`](cstore-loop-index-e2e.md); the backend contract and
+its historical Stage A boundary remain in
+[`cstore-backend-audit.md`](cstore-backend-audit.md).
 
 ## Implementation at the original control-flow baseline
 
@@ -83,9 +86,9 @@ The nesting expresses which value commits on each path; it does not make pure ca
 - One-sided and different-address conditional writes now lower to
   `ADORA.cond_store` and CDFG `CSTORE`; same-address two-sided writes retain
   `SELECT + STORE`.
-- Stage A CSTORE targets are statically shaped, identity-layout rank-one
-  memrefs; layouts that need an extra offset or stride fail closed rather than
-  being serialized with an incorrect byte address.
+- The supported v1 CSTORE targets are statically shaped, identity-layout
+  rank-one memrefs; layouts that need an extra offset or stride fail closed
+  rather than being serialized with an incorrect byte address.
 - CSTORE uses explicit `data=0`, `address=1`, and `enable=2` ports, complete I/O
   metadata, byte-scaled addresses, structured path predicates, conservative
   memory ordering, and transactional fail-closed generation.
@@ -93,37 +96,33 @@ The nesting expresses which value commits on each path; it does not make pure ca
   descriptions still lack a three-input I/O block with `UseEn`; those defaults
   remain unchanged. The ingestion phase adds an opt-in, tracked VITRA fixture at
   [`test/spec/cgra_cstore_vitra/`](../../test/spec/cgra_cstore_vitra/) from
-  `MIONkb/VITRA-CGRA@15e432f83427fc3121c50e2d4832a76b86d7a64f` (operations
-  SHA-256 `0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d`,
-  ADG SHA-256 `e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7`).
+  `MIONkb/VITRA-CGRA@da03f4ab0cf696466147ac9210518e7ead6c9589`.
+  Its canonical clean RTL SHA-256 is
+  `3dfdfe954ae2b6614d7e3a7e3b08c3feb9d899f0fef9d4f4e1eee230d24fbbc0`.
 - The fixture's explicit IOB operations are authoritative and exactly
   `INPUT`, `OUTPUT`, `LOAD`, `STORE`, `CSTORE`; `CLOAD` is deliberately absent.
   Legacy mode-derived capabilities are used only when that field is absent, so
   the opt-in contract does not alter legacy defaults.
-- With this fixture a direct loop-free CSTORE maps successfully with seeds 7,
-  19, and 101 using fixed mapper parameters. Its dynamic data, byte-address,
-  and enable chains have different producer depths. The pre-map CDFG has one
-  CSTORE with logical inputs 0, 1, and 2; each route manifest has three CSTORE
-  rows on disjoint physical input sets `{0,1}`, `{2,3}`, and `{4,5}`. Every
-  input arrives at its target latency, at least one uses nonzero RDU delay, and
-  repeating seed 7 produces a byte-identical manifest.
-- A loop-free normal STORE maps with the same VITRA fixture without logical
-  operand 2. A temporary ADG copy with CSTORE capability removed still maps
-  normal STORE even when its legacy-style IOB also lacks the `UseEn` field and
-  bit range; the same copy rejects CSTORE.
-- The real `if_store` workload is distinct from the direct loop-free
-  regression: it continues to fail in the stable, controlled way at `FOR is
-  not supported!`. No FOR support is implied by the successful direct case.
-- These mapper regressions prove placement, routing, input-latency alignment,
-  and emitted configuration packet values. ADG-derived decoding checks
-  CSTORE=`IsStore/UseAddr/UseEn=1/1/1`, normal
-  STORE=`1/1/0`, INPUT=`0/0/0`, each selected physical input, and the packed
-  DelayPipe lane delays against `mapped_routes.tsv`. `config.bit` and the
-  generated `cfgbit_<kernel>` array agree exactly, including repeated seed 7.
-  The current single-phase path is covered; runtime ping-pong switching and
-  hardware execution are not. CLOAD remains absent and unsupported;
-  conditional-store suppression on ADORA-generated hardware remains outside
-  the validated scope.
+- Supported `affine.for` induction values are compiler constructs, not physical
+  FOR operations. The physical mapper-visible path is `ACC -> explicit
+  MUL(elementBytes) -> CSTORE address port 1`; physical FOR remains
+  intentionally unsupported by VITRA.
+- The emitted loop-index ACC configuration is decoded from the actual mapper
+  output. It uses `InitVal=lower_bound`, routed operand 0=`positive_step`,
+  `WI=1`, `Latency=0`, `Cycles=trip_count`, `Repeats=1`, and `SkipFirst=1`.
+  Generic ACC configuration retains its existing behavior.
+- Direct loop-free mapping, normal STORE compatibility, loop-bearing Case A
+  and Case B, alternating predicates, and the original real `if_store` path
+  are permanent lit regressions. The real case no longer reaches the mapper
+  diagnostic `FOR is not supported!`.
+- The final immutable VITRA package executed the compiler-generated Case A,
+  Case B, and real `if_store` configurations on the full CGRA. True writes,
+  false suppression, alternating predicate behavior, completion, and final
+  SRAM state all passed. CLOAD remains absent and unsupported, and runtime
+  ping-pong switching is not claimed.
+- The final suite result is 64 discovered, 56 passed, 8 unsupported, and 0
+  failed. See [`cstore-loop-index-e2e.md`](cstore-loop-index-e2e.md) for the
+  exact configuration and execution evidence.
 
 ### Mapper/spec limitations
 

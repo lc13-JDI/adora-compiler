@@ -1,11 +1,12 @@
 # CSTORE backend contract audit
 
 **Scope.** This is a source, fixture, and regression audit of the conditional
-store (`CSTORE`) backend contract. It records the direct loop-free placement,
-routing, and input-alignment behavior that is reproducible today, together
-with the boundary beyond which no ADORA claim is made. It does not change the
-hardware interface or establish hardware-execution semantics. It does validate
-the emitted I/O-controller, input-mux, and DelayPipe configuration packets.
+store (`CSTORE`) backend contract. Its detailed direct loop-free placement,
+routing, and input-alignment results preserve the historical Stage A baseline.
+The branch has since completed loop-index ACC lowering and package-only
+full-CGRA execution; the authoritative current status and final acceptance
+evidence are recorded in
+[`cstore-loop-index-e2e.md`](cstore-loop-index-e2e.md).
 
 ## Mapper contract
 
@@ -123,15 +124,17 @@ the existing fp32/bf16 flows.
 
 The ingestion phase additionally introduced an opt-in, tracked regression fixture at
 [`test/spec/cgra_cstore_vitra/`](../../test/spec/cgra_cstore_vitra/). It is a
-byte-for-byte copy of the accepted VITRA handoff generated at
-`MIONkb/VITRA-CGRA@15e432f83427fc3121c50e2d4832a76b86d7a64f`, not a replacement
-for any legacy catalog. Its pinned payload hashes are:
+minimal regression subset of the final VITRA handoff generated from clean
+`MIONkb/VITRA-CGRA@da03f4ab0cf696466147ac9210518e7ead6c9589`, not a replacement
+for any legacy catalog. Its canonical clean RTL SHA-256 is
+`3dfdfe954ae2b6614d7e3a7e3b08c3feb9d899f0fef9d4f4e1eee230d24fbbc0`.
+The tracked semantic payload hashes are:
 
 | Payload | SHA-256 |
 | --- | --- |
-| `manifest.json` | `ca4b352640fd789a8013fd9c8f0734484a0385624911252a60db29ce4e63190f` |
 | `artifacts/operations.json` | `0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d` |
 | `artifacts/adg.json` | `e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7` |
+| `artifacts/loop_index_contract.json` | `c3d358639ef9470f5abb5c3a8146e75c6920c6055e28dfba780868073312489e` |
 
 The fixture advertises exactly `INPUT`, `OUTPUT`, `LOAD`, `STORE`, and
 `CSTORE`; it deliberately does not advertise `CLOAD`. When an IOB JSON object
@@ -157,21 +160,20 @@ hardware/fixture artifacts:
 
 All four searches returned no result at that point. The repository now contains
 the opt-in tracked VITRA fixture above, alongside the compiler/CDFG MLIR
-fixtures for Stage A; the legacy catalogs remain unchanged. The fixture makes
-the input contract reproducible. A direct loop-free CSTORE regression now
-establishes successful ADORA placement, three-port routing, and input alignment
-against it. The separate real `if_store` workload still reaches the stable,
-controlled first failure `FOR is not supported!` after accepting the CSTORE
-operation and explicit IOB capabilities. The direct regression also decodes
-the emitted configuration packets, but neither result executes them on
-hardware.
+fixtures introduced during Stage A; the legacy catalogs remain unchanged. The
+direct loop-free regression established placement, three-port routing, input
+alignment, and configuration decoding. Subsequent work lowered supported
+`affine.for` induction values to physical ACCs, so the original real
+`if_store` workload no longer presents a physical FOR to the mapper. The final
+compiler-generated configurations have also executed successfully on the full
+CGRA through the immutable package replay.
 
-## Delivery boundary
+## Historical Stage A delivery boundary
 
-**Stage A is delivered** with ADORA IR support, control-flow lowering,
-normalized CDFG ports and metadata, and regression tests. These are frontend
-and mapper-contract checks that do not claim an enabled hardware store. The
-current lowering deliberately fails closed at these boundaries:
+Stage A delivered ADORA IR support, control-flow lowering, normalized CDFG
+ports and metadata, and mapper-contract regressions. At that checkpoint the
+evidence did not yet claim enabled hardware execution. Several safety
+boundaries established there still apply:
 
 - branch-local loads are unsupported because conditional loads are outside
   Stage A; a read is not speculatively moved across a write;
@@ -180,8 +182,9 @@ current lowering deliberately fails closed at these boundaries:
   are rejected before any `scf.if` rewrite;
 - store-bearing `scf.if` and pre-authored `ADORA.cond_store` under `scf.for`
   are rejected before lowering because their execution/address contract cannot
-  be represented safely by this CDFG path; `affine.for` remains supported;
-- Stage A CSTORE targets must be statically shaped, identity-layout rank-one
+  be represented safely by this CDFG path; the supported subset uses
+  `affine.for`;
+- CSTORE targets must be statically shaped, identity-layout rank-one
   memrefs. Dynamic rank-one, non-identity-layout, and all higher-rank targets
   are rejected rather than serialized with incomplete size/address metadata;
 - nested `affine.apply` address expressions are fully composed before
@@ -203,7 +206,7 @@ current lowering deliberately fails closed at these boundaries:
   and lowering plus both optimized/fallback CDFG attempts run on temporary
   kernels, so a failure leaves the original kernel unchanged.
 
-## Validated direct mapping boundary
+## Historical direct mapping evidence
 
 The focused mapper regression uses a direct loop-free CSTORE whose data,
 byte-address, and enable values are all dynamic. Their CDFG producer depths are
@@ -224,11 +227,28 @@ operand 2 route. Removing CSTORE from a temporary ADG copy still permits that
 STORE while rejecting the CSTORE with the explicit required/available
 capability diagnostic. The hash-pinned fixture itself is never modified.
 
-This evidence proves direct placement, routing, and mapper-level latency
-alignment, plus the emitted controller, mux, and DelayPipe packet values
-described above. It does not prove hardware execution, false-enable write
-suppression, runtime ping-pong phase switching, CLOAD support, or FOR support.
-The real loop-bearing `if_store` case remains intentionally at the `FOR is not
-supported!` operation-load/catalog boundary. The VITRA handoff's hardware
-evidence is fixture provenance, not an ADORA compiler-to-hardware execution
-result.
+This direct-case evidence proves placement, routing, mapper-level latency
+alignment, and the emitted controller, mux, and DelayPipe packet values. It was
+the Stage A mapper boundary, not the final project boundary.
+
+## Current executable boundary
+
+The supported loop-bearing path now lowers a logical `affine.for` induction
+value to a mapper-visible physical ACC, routes its positive step as operand 0,
+and inserts explicit element-byte multiplication before CSTORE address port 1.
+Physical FOR remains intentionally unsupported as a hardware operation; it is
+absent from the supported mapper-visible DFG.
+
+The mapper decodes the loop-index ACC independently of generic accumulation and
+emits `InitVal=lower_bound`, `WI=1`, `Latency=0`,
+`Cycles=trip_count`, `Repeats=1`, and `SkipFirst=1`. The CSTORE controller
+remains `IsStore/UseAddr/UseEn=1/1/1`; normal STORE remains `1/1/0`.
+
+Compiler-generated configurations for canonical and nontrivial loop bounds,
+alternating predicates, and the original real `if_store` workload passed
+package-only execution on the final full-CGRA RTL. This proves true writes,
+false suppression, completion, and final SRAM side effects for the supported
+v1 subset. It does not add physical FOR, CLOAD, negative-step, dynamic-bound,
+or generalized nested-loop support, and it does not claim runtime ping-pong
+phase switching. The exact final evidence is in
+[`cstore-loop-index-e2e.md`](cstore-loop-index-e2e.md).
