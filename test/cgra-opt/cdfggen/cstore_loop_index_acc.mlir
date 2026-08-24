@@ -131,3 +131,105 @@ module {
     return
   }
 }
+
+// -----
+
+// Direct affine.apply has no physical CDFG materialization path. It must
+// fail closed instead of losing CSTORE address connectivity.
+module {
+  func.func @loop_index_static_apply(%value: i16, %enable: i1, %output: memref<16xi16>) {
+    ADORA.kernel {
+      affine.for %i = 0 to 4 {
+        %address = affine.apply affine_map<(d0) -> (d0 * 2 + 1)>(%i)
+        ADORA.cond_store %value, %output[%address] if %enable : memref<16xi16>
+      }
+      ADORA.terminator
+    } {KernelName = "loop_index_static_apply"}
+    return
+  }
+}
+
+// -----
+
+// A CSTORE-related nested loop would lose the outer execution count if only
+// the inner IV were changed to ACC. v1 must reject before mutation.
+module {
+  func.func @loop_index_nested(%value: i16, %enable: i1, %output: memref<16xi16>) {
+    ADORA.kernel {
+      affine.for %outer = 0 to 2 {
+        affine.for %inner = 0 to 4 {
+          ADORA.cond_store %value, %output[%inner] if %enable : memref<16xi16>
+        }
+      }
+      ADORA.terminator
+    } {KernelName = "loop_index_nested"}
+    return
+  }
+}
+
+// -----
+
+// A direct live affine.store address is an additional physical IV consumer.
+module {
+  func.func @loop_index_direct_extra(%value: i16, %enable: i1,
+                                     %output: memref<4xi16>, %other: memref<4xi16>) {
+    ADORA.kernel {
+      affine.for %i = 0 to 4 {
+        ADORA.cond_store %value, %output[%i] if %enable : memref<4xi16>
+        affine.store %value, %other[%i] : memref<4xi16>
+      }
+      ADORA.terminator
+    } {KernelName = "loop_index_direct_extra"}
+    return
+  }
+}
+
+// -----
+
+// The same additional live use one arithmetic transform away is unsupported.
+module {
+  func.func @loop_index_transformed_extra(%value: i16, %enable: i1,
+                                          %output: memref<4xi16>, %other: memref<8xi16>) {
+    %one = arith.constant 1 : index
+    ADORA.kernel {
+      affine.for %i = 0 to 4 {
+        %other_address = arith.addi %i, %one : index
+        ADORA.cond_store %value, %output[%i] if %enable : memref<4xi16>
+        memref.store %value, %other[%other_address] : memref<8xi16>
+      }
+      ADORA.terminator
+    } {KernelName = "loop_index_transformed_extra"}
+    return
+  }
+}
+
+// -----
+
+// Division/modulo affine expressions are not v1 materialization inputs.
+module {
+  func.func @loop_index_division(%value: i16, %enable: i1, %output: memref<4xi16>) {
+    ADORA.kernel {
+      affine.for %i = 0 to 4 {
+        %address = affine.apply affine_map<(d0) -> (d0 floordiv 2)>(%i)
+        ADORA.cond_store %value, %output[%address] if %enable : memref<4xi16>
+      }
+      ADORA.terminator
+    } {KernelName = "loop_index_division"}
+    return
+  }
+}
+
+// -----
+
+module {
+  func.func @loop_index_modulo(%value: i16, %enable: i1, %output: memref<4xi16>) {
+    ADORA.kernel {
+      affine.for %i = 0 to 4 {
+        %address = affine.apply affine_map<(d0) -> (d0 mod 2)>(%i)
+        ADORA.cond_store %value, %output[%address] if %enable : memref<4xi16>
+      }
+      ADORA.terminator
+    } {KernelName = "loop_index_modulo"}
+    return
+  }
+}

@@ -2612,41 +2612,33 @@ static void InsertMemrefByteOffsetMul(LLVMCDFG *CDFG, bool verbose = false) {
   }
 }
 
-static bool ValueReachesCStore(mlir::Value value,
-                               llvm::DenseSet<mlir::Value> &visited) {
-  if (!visited.insert(value).second)
-    return false;
-  for (mlir::OpOperand &use : value.getUses()) {
-    mlir::Operation *owner = use.getOwner();
-    if (isa<ADORA::CondStoreOp>(owner))
-      return true;
-    // Follow all result types here so that an IV converted to CSTORE data is
-    // rejected too. Uses that never reach CSTORE remain outside this lowering.
-    for (mlir::Value result : owner->getResults())
-      if (ValueReachesCStore(result, visited))
-        return true;
-  }
-  return false;
-}
-
-enum class CStoreIVUseKind { NoCStore, Supported, Mixed, Unsupported };
-
 static bool IsStaticIndexValue(mlir::Value value) {
   auto constant = value.getDefiningOp<arith::ConstantOp>();
   return constant && value.getType().isIndex();
 }
 
-static bool IsSupportedIndexTransform(mlir::Operation *owner,
-                                      mlir::Value source) {
-  if (auto apply = dyn_cast<affine::AffineApplyOp>(owner)) {
-    if (apply->getNumResults() != 1 || !apply.getResult().getType().isIndex())
-      return false;
-    for (mlir::Value operand : apply.getOperands())
-      if (operand != source && !IsStaticIndexValue(operand))
-        return false;
-    return true;
+// These facts are deliberately independent: a value can reach a CSTORE and
+// also have another live physical leaf. Folding that into a single enum loses
+// the fact that makes an otherwise valid address path unsafe to lower.
+struct CStoreIVUseFacts {
+  bool reachesCStore = false;
+  bool hasOtherLiveLeaf = false;
+  bool unsupported = false;
+
+  void merge(const CStoreIVUseFacts &other) {
+    reachesCStore |= other.reachesCStore;
+    hasOtherLiveLeaf |= other.hasOtherLiveLeaf;
+    unsupported |= other.unsupported;
   }
 
+};
+
+static bool IsSupportedIndexTransform(mlir::Operation *owner,
+                                      mlir::Value source) {
+  // affine.apply is intentionally excluded. Direct affine.apply CSTORE
+  // addresses have no CDFG node/edge materialization path: ADDNodes skips the
+  // op and operand wiring skips it again. The existing scf.if lowering expands
+  // supported affine store maps into ordinary arith ADD/MUL before this point.
   if (auto add = dyn_cast<arith::AddIOp>(owner))
     return add.getType().isIndex() &&
         ((add.getLhs() == source && IsStaticIndexValue(add.getRhs())) ||
@@ -2658,43 +2650,75 @@ static bool IsSupportedIndexTransform(mlir::Operation *owner,
   return false;
 }
 
-static CStoreIVUseKind ClassifyCStoreIVUses(
-    mlir::Value value, llvm::DenseSet<mlir::Value> &visiting) {
-  if (!visiting.insert(value).second)
-    return CStoreIVUseKind::Unsupported;
+static bool IsPhysicalMemoryLeaf(mlir::Operation *owner) {
+  return isa<affine::AffineLoadOp, affine::AffineStoreOp, memref::LoadOp,
+             memref::StoreOp>(owner);
+}
 
-  bool reachesCStore = false;
-  bool hasOtherUse = false;
+static CStoreIVUseFacts ClassifyCStoreIVUses(
+    mlir::Value value, llvm::DenseSet<mlir::Value> &visiting) {
+  CStoreIVUseFacts facts;
+  if (!visiting.insert(value).second) {
+    facts.unsupported = true;
+    return facts;
+  }
+
   for (mlir::OpOperand &use : value.getUses()) {
     mlir::Operation *owner = use.getOwner();
     if (auto store = dyn_cast<ADORA::CondStoreOp>(owner)) {
-      reachesCStore = true;
+      facts.reachesCStore = true;
       if (store.getIndices().size() != 1 || use.getOperandNumber() != 2)
-        return CStoreIVUseKind::Unsupported;
+        facts.unsupported = true;
       continue;
     }
 
-    if (!IsSupportedIndexTransform(owner, value)) {
-      llvm::DenseSet<mlir::Value> reachable;
-      for (mlir::Value result : owner->getResults())
-        if (ValueReachesCStore(result, reachable))
-          return CStoreIVUseKind::Unsupported;
-      hasOtherUse = true;
+    // Load/store index operands are physical CDFG leaves, not merely access
+    // metadata. Keep this fact distinct from a CSTORE-related unsupported
+    // transformation so a CSTORE address plus another live leaf fails closed.
+    if (IsPhysicalMemoryLeaf(owner)) {
+      facts.hasOtherLiveLeaf = true;
       continue;
     }
 
-    CStoreIVUseKind child = ClassifyCStoreIVUses(owner->getResult(0), visiting);
-    if (child == CStoreIVUseKind::Unsupported)
-      return child;
-    reachesCStore |= child == CStoreIVUseKind::Supported ||
-        child == CStoreIVUseKind::Mixed;
-    // Dead, pure address expressions are removable compiler artifacts and do
-    // not add a physical IV consumer. A live non-CSTORE path remains mixed.
-    hasOtherUse |= child == CStoreIVUseKind::Mixed;
+    CStoreIVUseFacts children;
+    for (mlir::Value result : owner->getResults())
+      children.merge(ClassifyCStoreIVUses(result, visiting));
+    facts.merge(children);
+
+    // A supported arith ADD/MUL is safe only when every live leaf beneath it
+    // remains an exact CSTORE address. Any other producer on a CSTORE path,
+    // including affine.apply, must fail before CDFG construction.
+    if (!IsSupportedIndexTransform(owner, value) && children.reachesCStore)
+      facts.unsupported = true;
+
+    // A result-less non-memory user is an observable leaf too. Dead pure
+    // transforms remain ignorable only when they neither reach CSTORE nor a
+    // physical leaf.
+    if (owner->getNumResults() == 0 && !owner->hasTrait<OpTrait::IsTerminator>())
+      facts.hasOtherLiveLeaf = true;
   }
-  return !reachesCStore ? CStoreIVUseKind::NoCStore
-                         : (hasOtherUse ? CStoreIVUseKind::Mixed
-                                        : CStoreIVUseKind::Supported);
+  return facts;
+}
+
+static bool IsNestedCStoreExecutionLoop(affine::AffineForOp forOp) {
+  bool nestedCStore = false;
+  forOp.walk([&](ADORA::CondStoreOp store) {
+    auto innermost = store->getParentOfType<affine::AffineForOp>();
+    if (innermost && innermost != forOp) {
+      nestedCStore = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return nestedCStore;
+}
+
+static bool IsCStoreLoopNestedInAffineFor(affine::AffineForOp forOp) {
+  for (mlir::Operation *parent = forOp->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (isa<affine::AffineForOp>(parent))
+      return true;
+  return false;
 }
 
 // Inspect actual affine IV uses before CDFG construction loses indirect-use
@@ -2707,18 +2731,23 @@ static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
       return;
 
     llvm::DenseSet<mlir::Value> visiting;
-    CStoreIVUseKind useKind =
+    CStoreIVUseFacts facts =
         ClassifyCStoreIVUses(forOp.getInductionVar(), visiting);
-    if (useKind == CStoreIVUseKind::NoCStore ||
-        useKind == CStoreIVUseKind::Mixed)
-      return;
     auto reject = [&](llvm::StringRef reason) {
       forOp.emitError("unsupported loop-index CSTORE: ") << reason;
       invalid = true;
     };
 
-    if (useKind == CStoreIVUseKind::Unsupported)
-      return reject("indirect or non-address induction-value use is unsupported");
+    if (!facts.reachesCStore)
+      return;
+    // An outer loop with an inner CSTORE loop affects the same CSTORE's
+    // execution count even when the outer IV is not its address. Reject it
+    // before either CSTORE-related loop can be rewritten to ACC. A loop whose
+    // IV never reaches CSTORE is outside this lowering and remains generic.
+    if (IsNestedCStoreExecutionLoop(forOp))
+      return reject("nested affine.for affecting CSTORE execution is unsupported");
+    if (IsCStoreLoopNestedInAffineFor(forOp))
+      return reject("CSTORE-related loop nested in affine.for is unsupported");
     if (!forOp.getInits().empty() || forOp.getNumResults() != 0) {
       reject("loop-carried values are unsupported");
       return;
@@ -2728,6 +2757,12 @@ static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
       reject("non-empty affine.yield is unsupported");
       return;
     }
+    if (facts.unsupported) {
+      reject("indirect or non-address induction-value use is unsupported");
+      return;
+    }
+    if (facts.hasOtherLiveLeaf)
+      reject("additional live physical induction-value use is unsupported");
   });
   return invalid ? failure() : success();
 }
@@ -2749,8 +2784,9 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
       continue;
 
     llvm::DenseSet<mlir::Value> visiting;
-    if (ClassifyCStoreIVUses(forOp.getInductionVar(), visiting) !=
-        CStoreIVUseKind::Supported)
+    CStoreIVUseFacts facts =
+        ClassifyCStoreIVUses(forOp.getInductionVar(), visiting);
+    if (!facts.reachesCStore)
       continue;
 
     auto reject = [&](llvm::StringRef reason) -> LogicalResult {
@@ -2762,6 +2798,13 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     auto yield = dyn_cast<affine::AffineYieldOp>(forOp.getBody()->getTerminator());
     if (!yield || !yield.getOperands().empty())
       return reject("non-empty affine.yield is unsupported");
+    if (IsNestedCStoreExecutionLoop(forOp) ||
+        IsCStoreLoopNestedInAffineFor(forOp))
+      return reject("nested affine.for affecting CSTORE execution is unsupported");
+    if (facts.unsupported)
+      return reject("indirect or non-address induction-value use is unsupported");
+    if (facts.hasOtherLiveLeaf)
+      return reject("additional live physical induction-value use is unsupported");
     if (!forOp.hasConstantLowerBound() || !forOp.hasConstantUpperBound())
       return reject("requires constant lower and upper bounds");
 

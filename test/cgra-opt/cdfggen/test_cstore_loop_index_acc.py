@@ -110,26 +110,28 @@ def check_composed_affine_apply(dot):
     cstore = next((name for name, (op, _) in nodes.items() if op == "CSTORE"), None)
     if not acc or not cstore:
         raise AssertionError(f"{dot}: missing ACC or CSTORE for composed affine address")
-    if not any(op == "ADD" for op, _ in nodes.values()) or \
-       not any(op == "MUL" for op, _ in nodes.values()):
-        raise AssertionError(f"{dot}: composed affine ADD/MUL address chain disappeared")
     successors = {}
     for src, dst, port in edges:
         successors.setdefault(src, []).append((dst, port))
-    pending = [acc]
-    visited = set()
-    reaches_address = False
+    expected_ops = ["ACC", "MUL", "ADD", "MUL", "CSTORE"]
+    expected_ports = [0, 0, 0, 1]
+    pending = [(acc, [acc], [])]
     while pending:
-        source = pending.pop()
-        if source in visited:
+        source, path, ports = pending.pop()
+        if len(path) > len(expected_ops):
             continue
-        visited.add(source)
+        if source == cstore:
+            if ([nodes[name][0] for name in path] == expected_ops and
+                    ports == expected_ports and
+                    {port for _, dst, port in edges if dst == cstore} == {0, 1, 2}):
+                return
+            continue
         for target, port in successors.get(source, []):
-            if target == cstore and port == 1:
-                reaches_address = True
-            pending.append(target)
-    if not reaches_address or {port for _, dst, port in edges if dst == cstore} != {0, 1, 2}:
-        raise AssertionError(f"{dot}: composed ACC path does not preserve CSTORE address/data/predicate ports")
+            if target not in path:
+                pending.append((target, path + [target], ports + [port]))
+    raise AssertionError(
+        f"{dot}: no single ACC -> MUL -> ADD -> MUL -> CSTORE-address path "
+        "with the expected operand ports")
 
 
 def main():
@@ -140,8 +142,8 @@ def main():
     test_dir = pathlib.Path(sys.argv[5]).resolve()
     fixture = test_dir / "cstore_loop_index_acc.mlir"
     chunks = fixture.read_text().split("// -----\n")
-    if len(chunks) != 8:
-        raise AssertionError("expected eight loop-index fixture chunks")
+    if len(chunks) != 14:
+        raise AssertionError("expected fourteen loop-index fixture chunks")
 
     with tempfile.TemporaryDirectory(prefix="adora-loop-index-acc-") as temp:
         workdir = pathlib.Path(temp)
@@ -173,6 +175,12 @@ def main():
             ("wrong_port", chunks[5], "indirect or non-address induction-value use is unsupported", True),
             ("extreme", chunks[6], "trip count must be in the supported range", True),
             ("negative_step", chunks[7], "positive signed integer", False),
+            ("static_apply", chunks[8], "unsupported loop-index CSTORE", True),
+            ("nested", chunks[9], "unsupported loop-index CSTORE", True),
+            ("direct_extra", chunks[10], "unsupported loop-index CSTORE", True),
+            ("transformed_extra", chunks[11], "unsupported loop-index CSTORE", True),
+            ("division", chunks[12], "unsupported loop-index CSTORE", True),
+            ("modulo", chunks[13], "unsupported loop-index CSTORE", True),
         ]
         negative_errors = []
         for name, chunk, expected_diagnostic, needs_loop_index_diagnostic in negatives:
