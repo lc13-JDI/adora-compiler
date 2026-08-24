@@ -597,7 +597,7 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
                     }
                     ///// acc first
 
-                    if(opName == "ISEL"){
+                    if(opName == "ISEL" || node->isLoopIndexAcc()){
                         dfg_node->setIsAccFirst(false);
                     }
                     else{

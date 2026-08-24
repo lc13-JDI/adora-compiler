@@ -8,4 +8,4 @@
 
 // IOB: operations: CSTORE, INPUT, LOAD, OUTPUT, STORE,{{[[:blank:]]*}}{{$}}
 // IOB-NOT: CLOAD
-// SUMMARY: if_store{{[[:space:]]+}}SKIP(cgeist unavailable){{[[:space:]]+}}PASS{{[[:space:]]+}}PASS{{[[:space:]]+}}PASS{{[[:space:]]+}}FAIL(mapper,rc=1,FOR is not supported!){{[[:space:]]+}}FAIL(mapper,rc=1,FOR is not supported!)
+// SUMMARY: if_store{{[[:space:]]+}}SKIP(cgeist unavailable){{[[:space:]]+}}PASS{{[[:space:]]+}}PASS{{[[:space:]]+}}PASS{{[[:space:]]+}}PASS{{[[:space:]]+}}PASS

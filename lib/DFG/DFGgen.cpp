@@ -2612,6 +2612,82 @@ static void InsertMemrefByteOffsetMul(LLVMCDFG *CDFG, bool verbose = false) {
   }
 }
 
+// Lower only the narrow CSTORE loop-index subset described by the VITRA
+// contract. The affine.for remains an MLIR control construct; this replaces
+// its physical CDFG producer with an ACC and a real static step operand.
+static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
+  constexpr int64_t kMaxUnsigned16 = 0xffff;
+  constexpr int64_t kMaxTripCount = 4095;
+
+  for (const auto &nodePair : CDFG->nodes()) {
+    LLVMCDFGNode *node = nodePair.second;
+    if (node->getTypeName() != "for")
+      continue;
+
+    auto forOp = dyn_cast_or_null<affine::AffineForOp>(node->operation());
+    if (!forOp)
+      continue;
+
+    bool feedsCStoreAddress = false;
+    bool onlyFeedsCStoreAddresses = !node->outputNodes().empty();
+    for (LLVMCDFGNode *consumer : node->outputNodes()) {
+      const std::vector<int> ports = consumer->getInputIndices(node);
+      const bool isCStoreAddress = consumer->getTypeName() == "CSTORE" &&
+          std::find(ports.begin(), ports.end(), 1) != ports.end();
+      feedsCStoreAddress |= isCStoreAddress;
+      onlyFeedsCStoreAddresses &= isCStoreAddress;
+    }
+    if (!feedsCStoreAddress)
+      continue;
+
+    auto reject = [&](llvm::StringRef reason) -> LogicalResult {
+      forOp.emitError("unsupported loop-index CSTORE: ") << reason;
+      return failure();
+    };
+    if (!onlyFeedsCStoreAddresses)
+      return reject("induction value has non-CSTORE-address users");
+    if (!forOp.hasConstantLowerBound() || !forOp.hasConstantUpperBound())
+      return reject("requires constant lower and upper bounds");
+
+    const int64_t lowerBound = forOp.getConstantLowerBound();
+    const int64_t upperBound = forOp.getConstantUpperBound();
+    const int64_t step = forOp.getStep().getSExtValue();
+    if (lowerBound < 0 || lowerBound > kMaxUnsigned16)
+      return reject("lower bound must fit unsigned 16 bits");
+    if (step <= 0 || step > kMaxUnsigned16)
+      return reject("step must be a positive unsigned 16-bit value");
+    if (upperBound <= lowerBound)
+      return reject("logical iteration space must be non-empty");
+
+    const int64_t distance = upperBound - lowerBound;
+    const int64_t tripCount = (distance + step - 1) / step;
+    if (tripCount <= 0 || tripCount > kMaxTripCount)
+      return reject("trip count must be in the supported range [1, 4095]");
+    const int64_t finalValue = lowerBound + (tripCount - 1) * step;
+    if (finalValue > kMaxUnsigned16)
+      return reject("logical induction sequence wraps unsigned 16-bit state");
+
+    node->setTypeName("ACC");
+    node->setAcc();
+    node->setLoopIndexAcc();
+    node->clearAccFirst();
+    node->setACCinit(std::to_string(lowerBound));
+    node->setACCcount(std::to_string(tripCount));
+    node->setACCinterval("1");
+    node->setACCrepeat("1");
+
+    LLVMCDFGNode *stepNode = CDFG->addNode("CONST");
+    stepNode->setTypeName("CONST");
+    stepNode->setLoopLevel(node->getLoopLevel());
+    stepNode->setConstValHex(DataBitCastToHex(static_cast<int32_t>(step)));
+    stepNode->setDataBits(32);
+    stepNode->addOutputNode(node, false);
+    node->addInputNode(stepNode, 0, false);
+    CDFG->addEdge(stepNode, node);
+  }
+  return success();
+}
+
 
 static bool HandleCompareNode(LLVMCDFG* CDFG, bool verbose = true){
   auto nodes = CDFG->nodes();
@@ -3871,6 +3947,9 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
   if (invalidMemoryOrder)
     return false;
   if(verbose) { CDFG->CDFGtoDOT(CDFG->name_str()+"_0_CDFG.dot");}
+
+  if (failed(LowerCStoreLoopIndexToAcc(CDFG)))
+    return false;
 
   ////////////////////////
   /// Convert memref element indices to byte offsets
