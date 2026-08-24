@@ -26,4 +26,13 @@ module {
     } {KernelName = "store_index_cast"}
     return
   }
+
+  func.func @store_constant_data(%index: index, %output: memref<16xi32>) {
+    %value = arith.constant 7 : i32
+    ADORA.kernel {
+      memref.store %value, %output[%index] : memref<16xi32>
+      ADORA.terminator
+    } {KernelName = "store_constant_data"}
+    return
+  }
 }

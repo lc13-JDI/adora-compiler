@@ -47,7 +47,7 @@
 
 // APPLY-DOT: Digraph G {
 // APPLY-DOT: ADD[[COMPOSED:[0-9]+]][opcode = "ADD"
-// APPLY-DOT: CSTORE[[STORE:[0-9]+]][opcode = "CSTORE", ref_name="cf_affine_apply:arg2", size="128", offset="0,0", pattern="0,1"
+// APPLY-DOT: CSTORE[[STORE:[0-9]+]][opcode = "CSTORE", ref_name="cf_affine_apply:arg2", size="128", offset="0,0", pattern="0,8"
 // APPLY-DOT: CONST[[FOUR:[0-9]+]][opcode = "CONST", value="0x00000004"
 // APPLY-DOT-NEXT: MUL[[BYTE_ADDRESS:[0-9]+]][opcode = "MUL"
 // APPLY-DOT-DAG: {{.*}} -> CSTORE[[STORE]]{{.*}}operand = 0, label = "Op=0"

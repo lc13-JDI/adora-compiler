@@ -44,8 +44,10 @@ def run(command, cwd, environment):
 
 
 def mapper_command(mapper, seed, adg, operations, source, output):
+    op_name_file = operations.parents[4] / "lib/DFG/Documents/GeneralOpName.txt"
     return (mapper, f"--seed={seed}", f"--adg={adg}",
             f"--op-file={operations}", "--output-type=pytest",
+            f"--op-name-file={op_name_file}",
             "--obj-opt=false", "--max-iters=30", "--timeout=30000",
             source, f"--output={output}")
 
@@ -300,7 +302,7 @@ def assert_acc_route(helpers, adg, packet_map, mapped_adg, nodes, step,
 
 
 def assert_cstore_routes(helpers, adg, packet_map, output, result_dir, kernel,
-                         nodes, edges, exact_mul):
+                         nodes, edges, exact_mul, expected_cycles):
     rows = [row for row in read_rows(result_dir / "mapped_routes.tsv")
             if row["dst_operation"] == "CSTORE"]
     if len(rows) != 3:
@@ -335,6 +337,19 @@ def assert_cstore_routes(helpers, adg, packet_map, output, result_dir, kernel,
             f"{kernel}: CSTORE address port is {incoming[1]}, not byte MUL {exact_mul}")
     helpers.validate_emitted_configuration(
         adg, result_dir / "mapped_routes.tsv", output, kernel, "CSTORE", rows)
+    with adg.open() as stream:
+        adg_data = json.load(stream)
+    target_ids = {int(row["dst_adg"]) for row in rows}
+    if len(target_ids) != 1:
+        raise AssertionError(
+            f"{kernel}: expected one mapped CSTORE IOB, got {target_ids}")
+    instance, attributes = helpers.find_iob(adg_data, target_ids.pop())
+    actual_cycles = helpers.decode_controller_field(
+        packet_map, instance, attributes, adg_data, "Cycles0")
+    if actual_cycles != expected_cycles:
+        raise AssertionError(
+            f"{kernel}: CSTORE Cycles0 expected {expected_cycles}, "
+            f"got {actual_cycles}")
     return rows
 
 
@@ -423,7 +438,7 @@ def check_case(helpers, workdir, mapper, adg, operations, source, kernel,
         edges, result_dir, acc, opcodes, element_bytes=2)
     rows = assert_cstore_routes(
         helpers, adg, packet_map, output, result_dir, kernel, nodes, edges,
-        exact_mul)
+        exact_mul, expected_cycles=trips)
     return (result_dir / "mapped_routes.tsv").read_bytes(), \
         (result_dir / "config.bit").read_bytes(), rows
 

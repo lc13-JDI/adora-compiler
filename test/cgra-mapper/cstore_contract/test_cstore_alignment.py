@@ -469,6 +469,28 @@ def main():
         validate_emitted_configuration(
             adg, manifest, store_output, kernel_name, "STORE", rows)
 
+    constant_dir = normal_store_dir / "store_constant_data_map_result"
+    constant_manifest = constant_dir / "mapped_routes.tsv"
+    constant_rows = validate_store_manifest(constant_manifest, {0, 1})
+    validate_emitted_configuration(
+        adg, constant_manifest, store_output, "store_constant_data", "STORE",
+        constant_rows)
+    constant_dfg = (constant_dir / "mapped_dfg.dot").read_text()
+    pass_match = re.search(
+        r'"(PASS\d+)"\[label = ".*\\nimm=7\\nimmIdx=0"\];',
+        constant_dfg)
+    store_match = re.search(r'"(store\d+)"\[label = "([^"]*)"\];',
+                            constant_dfg)
+    if not pass_match or not store_match or "immIdx=" in store_match.group(2):
+        raise AssertionError(
+            "constant STORE data was not materialized outside the IOB")
+    routed_data = re.search(
+        rf'"{pass_match.group(1)}"->"{store_match.group(1)}"'
+        r'\[label = "lat=\d+\\nop=0', constant_dfg)
+    if not routed_data:
+        raise AssertionError(
+            "materialized constant STORE data is not routed to operand 0")
+
     no_cstore_adg = workdir / "no-cstore-adg.json"
     make_no_cstore_adg(adg, no_cstore_adg)
     rejection, _, _ = run_mapping(

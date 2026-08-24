@@ -54,6 +54,10 @@ def check_supported(dot, init, step, trips):
         raise AssertionError(f"{dot}: expected a routed step CONST {step}")
     if not any((step_node, acc, 0) in edges for step_node in step_nodes):
         raise AssertionError(f"{dot}: positive step is not ACC operand 0")
+    cstores = [attrs for _, (op, attrs) in nodes.items() if op == "CSTORE"]
+    if len(cstores) != 1 or f'pattern="0,{trips}"' not in cstores[0]:
+        raise AssertionError(
+            f"{dot}: CSTORE execution count does not match trip count {trips}")
 
 
 def check_case_b_structure(dot):
@@ -157,6 +161,14 @@ def main():
         check_supported(workdir / "loop_index_b_CDFG.dot", 3, 2, 5)
         check_case_b_structure(workdir / "loop_index_b_CDFG.dot")
 
+        static_apply = workdir / "supported-static-apply.mlir"
+        static_apply.write_text(chunks[8])
+        run([cgra_opt, "--adora-kernel-dfg-gen", static_apply], workdir)
+        check_supported(
+            workdir / "loop_index_static_apply_CDFG.dot", 1, 2, 4)
+        check_case_b_structure(
+            workdir / "loop_index_static_apply_CDFG.dot")
+
         run([mapper, "--seed=7", f"--adg={adg}", f"--op-file={operations}",
              "--output-type=pytest", "--obj-opt=false", "--max-iters=30",
              "--timeout=30000", workdir / "supported-1.mlir",
@@ -175,7 +187,6 @@ def main():
             ("wrong_port", chunks[5], "indirect or non-address induction-value use is unsupported", True),
             ("extreme", chunks[6], "trip count must be in the supported range", True),
             ("negative_step", chunks[7], "positive signed integer", False),
-            ("static_apply", chunks[8], "unsupported loop-index CSTORE", True),
             ("nested", chunks[9], "unsupported loop-index CSTORE", True),
             ("direct_extra", chunks[10], "unsupported loop-index CSTORE", True),
             ("transformed_extra", chunks[11], "unsupported loop-index CSTORE", True),

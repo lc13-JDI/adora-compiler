@@ -2617,6 +2617,83 @@ static bool IsStaticIndexValue(mlir::Value value) {
   return constant && value.getType().isIndex();
 }
 
+// Recognize only the canonical affine-loop-normalize residue needed by the
+// loop-index CSTORE contract: one dimension, no symbols, and a linear
+// scale/offset expression.  Keep all arithmetic checked because these values
+// later become finite-width hardware configuration fields.
+static bool GetLinearAffineExpr(AffineExpr expr, int64_t &scale,
+                                int64_t &offset) {
+  if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
+    if (dim.getPosition() != 0)
+      return false;
+    scale = 1;
+    offset = 0;
+    return true;
+  }
+  if (auto constant = dyn_cast<AffineConstantExpr>(expr)) {
+    scale = 0;
+    offset = constant.getValue();
+    return true;
+  }
+
+  auto binary = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binary)
+    return false;
+  if (binary.getKind() == AffineExprKind::Add) {
+    int64_t lhsScale, lhsOffset, rhsScale, rhsOffset;
+    if (!GetLinearAffineExpr(binary.getLHS(), lhsScale, lhsOffset) ||
+        !GetLinearAffineExpr(binary.getRHS(), rhsScale, rhsOffset) ||
+        __builtin_add_overflow(lhsScale, rhsScale, &scale) ||
+        __builtin_add_overflow(lhsOffset, rhsOffset, &offset))
+      return false;
+    return true;
+  }
+  if (binary.getKind() != AffineExprKind::Mul)
+    return false;
+
+  auto lhsConstant = dyn_cast<AffineConstantExpr>(binary.getLHS());
+  auto rhsConstant = dyn_cast<AffineConstantExpr>(binary.getRHS());
+  AffineExpr linearExpr;
+  int64_t multiplier;
+  if (lhsConstant) {
+    multiplier = lhsConstant.getValue();
+    linearExpr = binary.getRHS();
+  } else if (rhsConstant) {
+    multiplier = rhsConstant.getValue();
+    linearExpr = binary.getLHS();
+  } else {
+    return false;
+  }
+  int64_t innerScale, innerOffset;
+  if (!GetLinearAffineExpr(linearExpr, innerScale, innerOffset) ||
+      __builtin_mul_overflow(innerScale, multiplier, &scale) ||
+      __builtin_mul_overflow(innerOffset, multiplier, &offset))
+    return false;
+  return true;
+}
+
+static bool IsDirectRankOneCStoreAddress(mlir::Value value) {
+  if (!value.hasOneUse())
+    return false;
+  mlir::OpOperand &use = *value.use_begin();
+  auto store = dyn_cast<ADORA::CondStoreOp>(use.getOwner());
+  return store && store.getIndices().size() == 1 &&
+         use.getOperandNumber() == 2;
+}
+
+static bool GetCanonicalCStoreAffineApply(affine::AffineApplyOp apply,
+                                          mlir::Value source,
+                                          int64_t &scale,
+                                          int64_t &offset) {
+  AffineMap map = apply.getAffineMap();
+  return source.isa<BlockArgument>() && map.getNumDims() == 1 &&
+         map.getNumSymbols() == 0 && map.getNumResults() == 1 &&
+         apply.getMapOperands().size() == 1 &&
+         apply.getMapOperands().front() == source &&
+         GetLinearAffineExpr(map.getResult(0), scale, offset) && scale > 0 &&
+         IsDirectRankOneCStoreAddress(apply.getResult());
+}
+
 // These facts are deliberately independent: a value can reach a CSTORE and
 // also have another live physical leaf. Folding that into a single enum loses
 // the fact that makes an otherwise valid address path unsafe to lower.
@@ -2635,10 +2712,13 @@ struct CStoreIVUseFacts {
 
 static bool IsSupportedIndexTransform(mlir::Operation *owner,
                                       mlir::Value source) {
-  // affine.apply is intentionally excluded. Direct affine.apply CSTORE
-  // addresses have no CDFG node/edge materialization path: ADDNodes skips the
-  // op and operand wiring skips it again. The existing scf.if lowering expands
-  // supported affine store maps into ordinary arith ADD/MUL before this point.
+  // The only skipped affine.apply that can be represented without inventing a
+  // physical node is the canonical normalized-IV form whose sole result is the
+  // rank-one CSTORE address. Its scale/offset are folded into the ACC below.
+  if (auto apply = dyn_cast<affine::AffineApplyOp>(owner)) {
+    int64_t scale, offset;
+    return GetCanonicalCStoreAffineApply(apply, source, scale, offset);
+  }
   if (auto add = dyn_cast<arith::AddIOp>(owner))
     return add.getType().isIndex() &&
         ((add.getLhs() == source && IsStaticIndexValue(add.getRhs())) ||
@@ -2648,6 +2728,81 @@ static bool IsSupportedIndexTransform(mlir::Operation *owner,
         ((mul.getLhs() == source && IsStaticIndexValue(mul.getRhs())) ||
          (mul.getRhs() == source && IsStaticIndexValue(mul.getLhs())));
   return false;
+}
+
+// Return the one optional affine.apply folded into this loop's ACC. Existing
+// direct and explicit arith ADD/MUL address paths retain identity here. Mixing
+// the skipped apply with another CSTORE address path would require two logical
+// induction sequences from one ACC and therefore fails closed.
+static bool GetLoopIndexAddressTransform(affine::AffineForOp forOp,
+                                         int64_t &scale, int64_t &offset) {
+  scale = 1;
+  offset = 0;
+  affine::AffineApplyOp foldedApply;
+  bool hasDirectCStoreAddress = false;
+  for (mlir::OpOperand &use : forOp.getInductionVar().getUses()) {
+    if (auto store = dyn_cast<ADORA::CondStoreOp>(use.getOwner())) {
+      if (store.getIndices().size() == 1 && use.getOperandNumber() == 2)
+        hasDirectCStoreAddress = true;
+      continue;
+    }
+    auto apply = dyn_cast<affine::AffineApplyOp>(use.getOwner());
+    int64_t applyScale, applyOffset;
+    if (!apply || !GetCanonicalCStoreAffineApply(
+                      apply, forOp.getInductionVar(), applyScale, applyOffset))
+      continue;
+    if (foldedApply)
+      return false;
+    foldedApply = apply;
+    scale = applyScale;
+    offset = applyOffset;
+  }
+  return !foldedApply || !hasDirectCStoreAddress;
+}
+
+static bool DependsOnValue(mlir::Value value, mlir::Value source,
+                           llvm::DenseSet<mlir::Value> &visiting) {
+  if (value == source)
+    return true;
+  if (!visiting.insert(value).second)
+    return false;
+  mlir::Operation *producer = value.getDefiningOp();
+  if (!producer)
+    return false;
+  return llvm::any_of(producer->getOperands(), [&](mlir::Value operand) {
+    return DependsOnValue(operand, source, visiting);
+  });
+}
+
+// Permit one narrowly defined second IV use needed by the final hardware
+// oracle: a normal rank-one affine.load whose value is compared directly and
+// used exclusively as the predicate of the same loop's CSTORE. The LOAD keeps
+// its established affine IOB access pattern; it is not a second routed copy of
+// the loop-index ACC and it does not broaden v1 to arbitrary IV consumers.
+static bool IsExclusiveLoopCStorePredicateLoad(mlir::Operation *owner,
+                                               mlir::Value source) {
+  auto load = dyn_cast<affine::AffineLoadOp>(owner);
+  if (!load || load.getIndices().size() != 1 ||
+      load.getIndices().front() != source || !load.getResult().hasOneUse())
+    return false;
+
+  auto compare = dyn_cast<arith::CmpIOp>(*load.getResult().getUsers().begin());
+  if (!compare || !compare.getResult().hasOneUse())
+    return false;
+  auto store = dyn_cast<ADORA::CondStoreOp>(
+      *compare.getResult().getUsers().begin());
+  if (!store || store.getCondition() != compare.getResult() ||
+      store.getIndices().size() != 1)
+    return false;
+
+  auto forOp = source.getParentBlock()
+                   ? dyn_cast<affine::AffineForOp>(
+                         source.getParentBlock()->getParentOp())
+                   : affine::AffineForOp();
+  if (!forOp || store->getParentOfType<affine::AffineForOp>() != forOp)
+    return false;
+  llvm::DenseSet<mlir::Value> visitingAddress;
+  return DependsOnValue(store.getIndices().front(), source, visitingAddress);
 }
 
 static bool IsPhysicalMemoryLeaf(mlir::Operation *owner) {
@@ -2676,6 +2831,8 @@ static CStoreIVUseFacts ClassifyCStoreIVUses(
     // metadata. Keep this fact distinct from a CSTORE-related unsupported
     // transformation so a CSTORE address plus another live leaf fails closed.
     if (IsPhysicalMemoryLeaf(owner)) {
+      if (IsExclusiveLoopCStorePredicateLoad(owner, value))
+        continue;
       facts.hasOtherLiveLeaf = true;
       continue;
     }
@@ -2761,6 +2918,12 @@ static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
       reject("indirect or non-address induction-value use is unsupported");
       return;
     }
+    int64_t addressScale, addressOffset;
+    if (!GetLoopIndexAddressTransform(forOp, addressScale, addressOffset)) {
+      reject("canonical affine.apply cannot be mixed with another CSTORE "
+             "induction-value address path");
+      return;
+    }
     if (facts.hasOtherLiveLeaf)
       reject("additional live physical induction-value use is unsupported");
   });
@@ -2823,7 +2986,29 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     const int64_t tripCount = distance / step + (distance % step != 0);
     if (tripCount <= 0 || tripCount > kMaxTripCount)
       return reject("trip count must be in the supported range [1, 4095]");
-    const int64_t finalValue = lowerBound + (tripCount - 1) * step;
+
+    int64_t addressScale, addressOffset;
+    if (!GetLoopIndexAddressTransform(forOp, addressScale, addressOffset))
+      return reject("canonical affine.apply cannot be mixed with another "
+                    "CSTORE induction-value address path");
+    int64_t effectiveLowerBound, effectiveStep;
+    if (__builtin_mul_overflow(lowerBound, addressScale,
+                               &effectiveLowerBound) ||
+        __builtin_add_overflow(effectiveLowerBound, addressOffset,
+                               &effectiveLowerBound) ||
+        __builtin_mul_overflow(step, addressScale, &effectiveStep))
+      return reject("canonical affine.apply scale/offset overflows signed "
+                    "loop-index arithmetic");
+    if (effectiveLowerBound < 0 || effectiveLowerBound > kMaxUnsigned16)
+      return reject("effective lower bound must fit unsigned 16 bits");
+    if (effectiveStep <= 0 || effectiveStep > kMaxUnsigned16)
+      return reject("effective step must be a positive unsigned 16-bit value");
+    int64_t finalIncrement, finalValue;
+    if (__builtin_mul_overflow(tripCount - 1, effectiveStep,
+                               &finalIncrement) ||
+        __builtin_add_overflow(effectiveLowerBound, finalIncrement,
+                               &finalValue))
+      return reject("logical induction sequence overflows signed arithmetic");
     if (finalValue > kMaxUnsigned16)
       return reject("logical induction sequence wraps unsigned 16-bit state");
 
@@ -2831,15 +3016,30 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     node->setAcc();
     node->setLoopIndexAcc();
     node->clearAccFirst();
-    node->setACCinit(std::to_string(lowerBound));
+    node->setACCinit(std::to_string(effectiveLowerBound));
     node->setACCcount(std::to_string(tripCount));
     node->setACCinterval("1");
     node->setACCrepeat("1");
 
+    // The explicit address and predicate are consumed once per logical
+    // iteration. Preserve that execution count in the CSTORE IOB pattern; a
+    // loop-free CSTORE remains at the established single access (0,1).
+    forOp.walk([&](ADORA::CondStoreOp store) {
+      if (store.getIndices().size() != 1)
+        return;
+      llvm::DenseSet<mlir::Value> visitingAddress;
+      if (!DependsOnValue(store.getIndices().front(), forOp.getInductionVar(),
+                          visitingAddress))
+        return;
+      if (LLVMCDFGNode *storeNode = CDFG->node(store.getOperation()))
+        storeNode->setLinearAccess("0," + std::to_string(tripCount));
+    });
+
     LLVMCDFGNode *stepNode = CDFG->addNode("CONST");
     stepNode->setTypeName("CONST");
     stepNode->setLoopLevel(node->getLoopLevel());
-    stepNode->setConstValHex(DataBitCastToHex(static_cast<int32_t>(step)));
+    stepNode->setConstValHex(
+        DataBitCastToHex(static_cast<int32_t>(effectiveStep)));
     stepNode->setDataBits(32);
     stepNode->addOutputNode(node, false);
     node->addInputNode(stepNode, 0, false);
@@ -3975,7 +4175,29 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
             continue;
           }
           else if(ance_op->getName().getStringRef() == "affine.apply"){
-            continue;
+            // affine.apply has no physical CDFG node. For the one canonical
+            // normalized loop-index form accepted by preflight, bypass it and
+            // connect the loop producer whose scale/offset will be folded into
+            // the ACC configuration.
+            auto apply = dyn_cast<affine::AffineApplyOp>(ance_op);
+            int64_t addressScale, addressOffset;
+            if (SuccNode->getTypeName() != "CSTORE" || edgeidx != 1 ||
+                apply.getMapOperands().size() != 1 ||
+                !apply.getMapOperands().front().isa<BlockArgument>() ||
+                !GetCanonicalCStoreAffineApply(
+                    apply, apply.getMapOperands().front(), addressScale,
+                    addressOffset))
+              continue;
+            auto inductionVar =
+                apply.getMapOperands().front().cast<BlockArgument>();
+            auto parentFor = dyn_cast<affine::AffineForOp>(
+                inductionVar.getOwner()->getParentOp());
+            if (!parentFor || inductionVar != parentFor.getInductionVar())
+              continue;
+            AnceNode = CDFG->node(parentFor.getOperation());
+            if (!AnceNode)
+              continue;
+            isBackEdge = false;
           }
           else if(ance_op->getName().getStringRef() == "ADORA.BlockLoad"
                 ||ance_op->getName().getStringRef() == "ADORA.LocalMemAlloc"){
@@ -4082,6 +4304,12 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
       LLVMCDFGNode *sourceNode = CDFG->node(previous);
       LLVMCDFGNode *targetNode = CDFG->node(current);
       if (!CDFG->edge(sourceNode, targetNode)) {
+        // A real data path already orders the memory effects and gives the
+        // mapper routable non-negative operands. Do not add a redundant
+        // memory-only operand -1 edge (for example LOAD -> predicate ->
+        // CSTORE), which is not a physical CSTORE port.
+        if (hasGraphPath(sourceNode, targetNode))
+          continue;
         if (hasGraphPath(targetNode, sourceNode)) {
           current->emitError(
               "cannot preserve CSTORE memory source order without creating "
@@ -4239,6 +4467,25 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
   if(verbose) { CDFG->CDFGtoDOT(CDFG->name_str()+"_3_CDFG.dot");}
   FuseOperators(CDFG, verbose);
 
+  auto findLoopIndexAddressAcc = [](LLVMCDFGNode *addressNode) {
+    llvm::SmallVector<LLVMCDFGNode *, 8> worklist;
+    llvm::DenseSet<LLVMCDFGNode *> visited;
+    llvm::SmallVector<LLVMCDFGNode *, 2> accs;
+    if (addressNode)
+      worklist.push_back(addressNode);
+    while (!worklist.empty()) {
+      LLVMCDFGNode *current = worklist.pop_back_val();
+      if (!visited.insert(current).second)
+        continue;
+      if (current->isLoopIndexAcc()) {
+        accs.push_back(current);
+        continue;
+      }
+      llvm::append_range(worklist, current->inputNodes());
+    }
+    return accs.size() == 1 ? accs.front() : nullptr;
+  };
+
   // Fail closed rather than serializing a CSTORE whose required value,
   // explicit byte address, enable, or memory identity was lost while building
   // and simplifying the graph.
@@ -4254,10 +4501,16 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
         }
       }
     }
+    LLVMCDFGNode *loopIndexAcc = node
+        ? findLoopIndexAddressAcc(node->getInputPort(1))
+        : nullptr;
+    const std::string expectedPattern = loopIndexAcc
+        ? "0," + loopIndexAcc->getACCcount()
+        : "0,1";
     if (!node || portCounts[0] != 1 || portCounts[1] != 1 ||
         portCounts[2] != 1 || node->getMemrefName().empty() ||
         node->getMemrefSize() <= 0 || node->getInitAddr() != "0" ||
-        node->getLinearAccess() != "0,1") {
+        node->getLinearAccess() != expectedPattern) {
       store.emitError(
           "malformed CSTORE CDFG node: requires exactly connected ports 0, "
           "1, and 2 and valid memory metadata");

@@ -2,6 +2,33 @@
 #include "ir/dfg_ir.h"
 #include "ir/cstore_contract.h"
 
+namespace {
+
+bool requiresRoutedConstant(DFGNode *destination, int logicalPort) {
+    if(!destination)
+        return false;
+    const std::string &operation = destination->operation();
+    // CSTORE consumes all three values on physical IOB lanes. Ordinary STORE
+    // retains its static address in the IOB access pattern, but its data port
+    // is likewise a physical lane and cannot consume a node-local immediate.
+    return (operation == "CSTORE" && logicalPort >= 0 && logicalPort < 3) ||
+           (operation == "STORE" && logicalPort == 0);
+}
+
+DFGNode *materializeRoutedConstant(DFG *dfg, int &nextNodeId,
+                                   uint64_t value) {
+    DFGNode *node = new DFGNode();
+    node->setId(++nextNodeId);
+    node->setName("PASS" + std::to_string(node->id()));
+    node->setOperation("PASS");
+    node->setImm(value);
+    node->setImmIdx(0);
+    dfg->addNode(node);
+    return node;
+}
+
+} // namespace
+
 
 DFGIR::DFGIR(std::string filename)
 {
@@ -275,12 +302,14 @@ DFG* DFGIR::parseDFGJson(std::string filename){
     ifs >> dfgJson;
     DFG* dfg = new DFG();
     dfg->setId(0); // DFG id = 0, node id = 1,...,n
+    int nextMaterializedNodeId = 0;
     // parse nodes
     for(auto& nodeJson : dfgJson["objects"]){
         std::string nodeName = nodeJson["name"].get<std::string>();
         std::string opName = nodeJson["opcode"].get<std::string>();
         std::transform(opName.begin(), opName.end(), opName.begin(), toupper);
         int id = nodeJson["_gvid"].get<int>() + 1; // start from 1
+        nextMaterializedNodeId = std::max(nextMaterializedNodeId, id);
         // if(opName == "INPUT"){
         //     int idx = _inputId2idx.size();
         //     setInputIdx(id, idx);
@@ -377,6 +406,7 @@ DFG* DFGIR::parseDFGJson(std::string filename){
         }
     }
     // parse edges
+    std::map<int, int> immediateCount;
     for(auto& edgeJson : dfgJson["edges"]){
         int srcId = edgeJson["tail"].get<int>() + 1;
         int dstId = edgeJson["head"].get<int>() + 1;
@@ -399,8 +429,24 @@ DFG* DFGIR::parseDFGJson(std::string filename){
         }
         if(isConst(srcId)){ // merge const node into the node connected to it
             DFGNode* node = dfg->node(dstId);
-            node->setImm(constValue(srcId));
-            node->setImmIdx(dstPort);
+            if(node && (node->operation() == "STORE" ||
+                        node->operation() == "CSTORE"))
+                ++immediateCount[dstId];
+            if(requiresRoutedConstant(node, dstPort)){
+                // VITRA IOBs do not have an operation-local immediate input.
+                // Materialize the one accepted STORE/CSTORE constant in a GPE
+                // PASS so it becomes a real routed operand at the exact logical
+                // port instead of silently reading zero at the IOB boundary.
+                DFGNode *constant = materializeRoutedConstant(
+                    dfg, nextMaterializedNodeId, constValue(srcId));
+                int edgeId = edgeJson["_gvid"].get<int>();
+                DFGEdge* edge = new DFGEdge(edgeId);
+                edge->setEdge(constant->id(), 0, dstId, dstPort);
+                dfg->addEdge(edge);
+            }else{
+                node->setImm(constValue(srcId));
+                node->setImmIdx(dstPort);
+            }
         } else{
             int edgeId = edgeJson["_gvid"].get<int>();
             DFGEdge* edge = new DFGEdge(edgeId);
@@ -413,6 +459,18 @@ DFG* DFGIR::parseDFGJson(std::string filename){
             // }
             dfg->addEdge(edge);
         }         
+    }
+    for(auto &elem : dfg->nodes()){
+        DFGNode *node = elem.second;
+        if(node->operation() != "STORE" && node->operation() != "CSTORE")
+            continue;
+        const std::string violation =
+            CStoreContract::immediateViolation(immediateCount[node->id()]);
+        if(!violation.empty()){
+            std::cout << "Invalid " << node->operation() << " DFG node "
+                      << node->id() << ": " << violation << std::endl;
+            exit(1);
+        }
     }
     // // add const operand for nodes with only one operand, should be avoid
     // for(auto &elem : dfg->nodes()){
@@ -451,6 +509,7 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
     dfg->setId(0); // DFG id = 0, node id = 1,...,n
     // parse nodes
     const std::map<int, LLVMCDFGNode*> nodes = CDFG->nodes();
+    int nextMaterializedNodeId = nodes.empty() ? 0 : nodes.rbegin()->first + 1;
     for(auto &elem : nodes){
         int id = elem.first + 1;
         LLVMCDFGNode* node = elem.second;
@@ -705,6 +764,9 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
             CStoreContract::recordNonMemoryLogicalPort(logicalPortUse[dstId],
                                                        dstPort,
                                                        edge->type() == EDGE_TYPE_MEM);
+            // Count source-level constants before materialization. The v1 DFG
+            // contract intentionally accepts at most one even though that one
+            // is subsequently represented by a routed PASS for an IOB.
             if(edge->type() != EDGE_TYPE_MEM && isConst(srcId))
                 ++immediateCount[dstId];
         }
@@ -726,8 +788,21 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         // }
         if(isConst(srcId)){ // merge const node into the node connected to it
             DFGNode* node = dfg->node(dstId);
-            node->setImm(constValue(srcId));
-            node->setImmIdx(dstPort);
+            if(requiresRoutedConstant(node, dstPort)){
+                DFGNode *constant = materializeRoutedConstant(
+                    dfg, nextMaterializedNodeId, constValue(srcId));
+                DFGEdge* DFGedge = new DFGEdge(edge_id);
+                DFGedge->setEdge(constant->id(), 0, dstId, dstPort);
+                DFGedge->setType(edge->type());
+                dfg->addEdge(DFGedge);
+                if(isBackEdge){
+                    DFGedge->setBackEdge(true);
+                    DFGedge->setIterDist(edge->IterDist());
+                }
+            }else{
+                node->setImm(constValue(srcId));
+                node->setImmIdx(dstPort);
+            }
         } else{
             // int edgeId = edgeJson["_gvid"].get<int>();
             DFGEdge* DFGedge = new DFGEdge(edge_id);

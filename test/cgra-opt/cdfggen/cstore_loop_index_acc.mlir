@@ -134,8 +134,9 @@ module {
 
 // -----
 
-// Direct affine.apply has no physical CDFG materialization path. It must
-// fail closed instead of losing CSTORE address connectivity.
+// affine-loop-normalize emits this canonical one-dimensional linear apply.
+// Its scale/offset must be folded into the physical ACC rather than silently
+// losing CSTORE address connectivity.
 module {
   func.func @loop_index_static_apply(%value: i16, %enable: i1, %output: memref<16xi16>) {
     ADORA.kernel {
