@@ -16,6 +16,17 @@ include "mlir/Dialect/Affine/IR/AffineOps.td"
 //===----------------------------------------------------------------------===//
 // CDFGgen for ADORA
 //===----------------------------------------------------------------------===//
+def LowerCEntry : Pass<"adora-lower-c-entry", "ModuleOp"> {
+  let summary = "Validate and lower a contracted static C stream entry";
+  let constructor = "mlir::ADORA::createLowerCEntryPass()";
+  let dependentDialects = ["arith::ArithDialect", "::mlir::ADORA::ADORADialect",
+                          "::mlir::affine::AffineDialect", "::mlir::memref::MemRefDialect"];
+  let options = [
+    Option<"contract", "contract", "std::string", "\"\"", "Static object JSON contract">,
+    Option<"bankBytes", "bank-bytes", "int64_t", "8192", "Target scratchpad bank capacity in bytes">
+  ];
+}
+
 def ADORALoopCdfgGen : Pass<"adora-kernel-dfg-gen", "ModuleOp"> {
   let summary = "Generate cdfg of ADORA from a kernel loop";
   let constructor = "mlir::ADORA::createADORALoopCdfgGenPass()";

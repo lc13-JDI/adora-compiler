@@ -371,6 +371,8 @@ def run_case(root, tools, work, case, seed=7, nested=True, manual=False):
         proc = invoke([tools/'cgra-mapper',mapper_source,'--adg='+str(adg_path),'--op-file='+str(ops),'--output-type=pytest','--output='+str(output),'--seed='+str(seed),'--max-iters=30','--timeout=30000','--obj-opt=false'],'mapper.log')
         result['L2'] = dict(status='passed' if proc.returncode == 0 else 'failed', reason=None if proc.returncode == 0 else 'see mapper.log; mapping/config failure is not proof of impossibility')
         if proc.returncode == 0:
+            import_check = invoke(['python3', Path(__file__).with_name('check_numpy_only_import.py'), output], 'numpy_only_import.log')
+            assert import_check.returncode == 0, import_check.stdout + import_check.stderr
             mapped_nodes,mapped_edges = read_graph(run/(kernel+'_map_result')/('before_map_'+kernel+'_CDFG.dot'))
             mapped_values, mapped_accesses = model(mapped_nodes,mapped_edges,arrays,case['M'])
             assert mapped_values == expected

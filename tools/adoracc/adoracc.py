@@ -339,6 +339,13 @@ def parse_args() -> argparse.Namespace:
         description="Compile C/MLIR to CDFG using cgeist/mlir-opt/cgra-opt."
     )
     parser.add_argument("input", type=Path, help="Input .C or .MLIR file")
+    parser.add_argument("--profile", choices=["guarded-stream"], default=None,
+                        help="Opt in to checked ordinary-C compilation through mapper.")
+    parser.add_argument("--contract", type=Path, help="Fixed object/host ABI JSON for guarded-stream.")
+    parser.add_argument("--op-file", type=Path, help="Hardware operations JSON for guarded-stream.")
+    parser.add_argument("--seed", type=int, default=7, help="Guarded-stream mapper random seed.")
+    parser.add_argument("--max-iters", type=int, default=1000, help="Guarded-stream mapper iteration budget.")
+    parser.add_argument("--timeout", type=int, default=120000, help="Guarded-stream mapper timeout in milliseconds.")
     parser.add_argument(
         "--work-dir",
         type=Path,
@@ -353,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adg-path",
         type=Path,
-        help="Path to the CGRA .adg file used for unroll.",
+        help="CGRA ADG JSON for unroll or guarded-stream hardware selection.",
     )
 
     parser.add_argument(
@@ -361,8 +368,8 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Write the optimized kernel MLIR (after kernel optimization) to this file. "
-             "If not provided, print to stdout.",
+        help="Write optimized kernel MLIR, or checked Python with --profile guarded-stream. "
+             "The default profile prints MLIR to stdout when omitted.",
     )
     parser.add_argument(
         "--disable-schedule-tasks",
@@ -376,6 +383,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.profile == "guarded-stream":
+        from c_entry import run_profile
+        try:
+            if args.max_iters <= 0 or args.timeout <= 0:
+                raise ValueError("mapper iteration and timeout budgets must be positive")
+            return run_profile(args, require_tool, require_tool_prefer_local, strip_module_attrs)
+        except (OSError, ValueError) as exc:
+            print(f"[adoracc] guarded-stream failed: {exc}", file=sys.stderr)
+            return 1
+    if args.contract or args.op_file:
+        print("--contract and --op-file require --profile guarded-stream", file=sys.stderr)
+        return 1
     input_path = args.input.resolve()
 
     if not input_path.exists():

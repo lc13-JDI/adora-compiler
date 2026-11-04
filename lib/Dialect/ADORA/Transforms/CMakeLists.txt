@@ -2,6 +2,7 @@ add_mlir_dialect_library(MLIRADORATransforms
   BufferReuse.cpp
   DFGgenPass.cpp
   SimplifyLoadStore.cpp
+  LowerCEntry.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJ_INCLUDE_DIR}/ADORA/Dialect/ADORA/IR

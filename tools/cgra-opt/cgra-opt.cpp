@@ -113,6 +113,7 @@ int main(int argc, char **argv) {
                   mlir::ADORA::ADORATensor::ADORATensorDialect>();
 
   // ----- My Dialect -----
+  mlir::ADORA::registerLowerCEntry();
   mlir::ADORA::registerADORALoopCdfgGenPass();
   mlir::ADORA::registerExtractAffineForToKernelPass();
   mlir::ADORA::registerAdjustKernelMemoryFootprintPass();

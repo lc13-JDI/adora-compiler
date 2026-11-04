@@ -1866,8 +1866,6 @@ from test_runif import DeviceData, DeviceConfig, DeviceStream, DeviceRuntime
 from typing import List
 from numpy import ndarray
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 def safe_slice_1d(arr, flat_offset, result_shape, *args, **kwargs):
     if not hasattr(safe_slice_1d, "cache"):
@@ -1878,6 +1876,8 @@ def safe_slice_1d(arr, flat_offset, result_shape, *args, **kwargs):
     arr_id = id(arr)
 
     if arr.ndim == 4 and len(result_shape) == 2:
+        import torch
+        import torch.nn.functional as F
         dim0, dim1, dim2, dim3 = arr.shape
         if dim2 <= 11 and dim3 <= 11 and dim2 == dim3:
             K_out, C, R, S = arr.shape
