@@ -1741,6 +1741,44 @@ void PytestEmitter::emitFunctionHead(func::FuncOp &funcop, llvm::raw_ostream &os
   }
   ostr << "):\n";
 
+  bool boundedLoads = false;
+  funcop.walk([&](memref::LoadOp load) {
+    if (load->getParentOfType<ADORA::KernelOp>() &&
+        load.getMemref().getDefiningOp<ADORA::DataBlockLoadOp>())
+      boundedLoads = true;
+  });
+  if (boundedLoads) {
+    // Check the declared input domain before creating a stream or issuing DMA.
+    // These are runtime checks, deliberately not Python asserts (-O must not
+    // remove the safety boundary).
+    std::vector<unsigned> buffers;
+    for (unsigned i = 0; i < argTypes.size(); ++i) {
+      auto type = dyn_cast<MemRefType>(argTypes[i]);
+      if (!type) continue;
+      buffers.push_back(i);
+      ostr << "    if not isinstance(arg_" << i << ", np.ndarray) or arg_" << i
+           << ".dtype != np.dtype('int16') or arg_" << i << ".shape != ("
+           << type.getNumElements() << ",) or not arg_" << i << ".flags.c_contiguous:\n"
+           << "        raise ValueError('bounded dynamic LOAD: invalid buffer shape, dtype or layout')\n";
+    }
+    for (unsigned i = 0; i < buffers.size(); ++i)
+      for (unsigned j = i + 1; j < buffers.size(); ++j)
+        ostr << "    if np.shares_memory(arg_" << buffers[i] << ", arg_" << buffers[j] << "):\n"
+             << "        raise ValueError('bounded dynamic LOAD: buffers must not alias')\n";
+    funcop.walk([&](ADORA::DataBlockLoadOp load) {
+      auto range = load->getAttrOfType<ArrayAttr>("adora.value_range");
+      if (!range) return;
+      std::string name = lookupName(load.getOriginalMemref());
+      ostr << "    if np.any(" << name << " < " << cast<IntegerAttr>(range[0]).getInt()
+           << ") or np.any(" << name << " > " << cast<IntegerAttr>(range[1]).getInt() << "):\n"
+           << "        raise ValueError('bounded dynamic LOAD: index outside declared range')\n";
+    });
+    funcop.walk([&](ADORA::DataBlockStoreOp store) {
+      ostr << "    if not " << lookupName(store.getTargetMemref()) << ".flags.writeable:\n"
+           << "        raise ValueError('bounded dynamic LOAD: output must be writable')\n";
+    });
+  }
+
   ostr << "    # runtime.log.info(\"[ADORA] Starting CGRA call ("
        << funcop.getSymName().str() << ")\")\n";
 
@@ -2172,7 +2210,7 @@ std::string PytestEmitter::GenerateCGRAConfig(
   std::stringstream CFGdata, pingCFG, pongCFG;
 
   // cfg.dumpCfgData(std::cout);
-  std::map<int, dfgIoInfo> dfg_io_infos = std::move(_kernel_to_dfg_io_infos[kernel]);
+  const auto &dfg_io_infos = _kernel_to_dfg_io_infos[kernel];
   for (auto &elem : dfg_io_infos)
   {
     cfg.setDfgIoSpadAddr(elem.first, elem.second.iobAddr);

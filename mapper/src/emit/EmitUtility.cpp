@@ -432,7 +432,7 @@ void BaseEmitter::setTileEnsForEachKernel(){
 ///        This information is store in _LoadToDfgIoInfos/_StoreToDfgIoInfo
 /// @param kernel Kernel which has been translated to CDFG
 /// @param mapper The SA mapper which has completed mapping
-void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperSA* mapper){
+mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperSA* mapper){
   // mapper._sched->ioSchedule(mapper._mapping);
   DFG* dfg = mapper->getDFG();
   ADG* adg = mapper->getADG();
@@ -444,7 +444,95 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
   bank_status.assign(adg->numIobNodes(), {0, 0, 0, 0}); /*{iob, used, start, end}*/
 
   std::map<int, dfgIoInfo> dfg_io_infos;
-  BYTES_LIST iob_ens(adg->numIobNodes()/8);
+  BYTES_LIST iob_ens((adg->numIobNodes()+7)/8);
+  const bool boundedLoads = std::any_of(dfg->ioNodes().begin(), dfg->ioNodes().end(),
+      [&](int id) { return dfg->node(id)->operation() == "LOAD"; });
+  bool invalid = false;
+  auto reject = [&](int id, const std::string &reason) {
+    kernel.emitError("incomplete I/O execution contract: node ") << id << ": " << reason;
+    invalid = true;
+  };
+  auto fitsField = [&](FUNode *iob, const std::string &name, int64_t value) {
+    if (!iob) return false;
+    auto field = iob->cfgIdMap.find(name);
+    if (field == iob->cfgIdMap.end() || value < 0) return false;
+    auto loc = iob->configInfo(field->second);
+    int width = loc.high - loc.low + 1;
+    return width > 0 && (width >= 63 || value < (int64_t(1) << width));
+  };
+  // A reduction produces its first partial sum at the ordinary routed latency.
+  // Its scalar OUTPUT must sample the last sum, (L-1)*II cycles later. The
+  // route stays live throughout; only the OUTPUT controller's start is delayed.
+  int reductionCycles = 0, reductionCount = 0;
+  if (boundedLoads) {
+    for (auto entry : dfg->nodes()) {
+      auto *node = entry.second;
+      if (!node->accumulative()) continue;
+      ++reductionCount;
+      auto *pe = dynamic_cast<FUNode *>(mapper->_mapping->dfgNodeAttr(entry.first).adgNode);
+      int64_t wi = int64_t(node->interval()) * mapper->_mapping->II();
+      int64_t lat = mapper->_mapping->dfgNodeAttr(entry.first).lat - node->opLatency();
+      if (node->operation() != "ACC" || node->initVal() != 0 ||
+          node->interval() != 1 || node->repeats() != 1 ||
+          !node->isAccFirst() || node->cycles() <= 0 ||
+          (reductionCycles && reductionCycles != node->cycles()) ||
+          !fitsField(pe, "WI", wi) || !fitsField(pe, "Cycles", node->cycles()) ||
+          !fitsField(pe, "Latency", lat) || !fitsField(pe, "Repeats", 1) ||
+          !fitsField(pe, "InitVal", 0) || !fitsField(pe, "SkipFirst", 0))
+        reject(entry.first, "bounded loop requires representable independent zero-initialized ACC timing");
+      reductionCycles = node->cycles();
+    }
+    if (reductionCount && (reductionCount != 2 || dfg->ioNodes().size() != 5))
+      reject(0, "bounded loop requires two ACCs and five fixed I/O roles");
+  }
+  // Validate before indexing topology or allocating any SRAM objects.
+  for (int id : dfg->ioNodes()) {
+    auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
+    auto *iob = dynamic_cast<IOBNode *>(mapper->_mapping->dfgNodeAttr(id).adgNode);
+    if (!io || io->memRefName().empty() || io->memSize() <= 0 ||
+        sizeofBank <= 0 || dataByte <= 0 || io->memSize() > sizeofBank ||
+        io->reducedMemOffset() < 0 || io->reducedMemOffset() >= io->memSize() ||
+        io->reducedMemOffset() % dataByte != 0 || !iob) {
+      reject(id, "missing object, size, legal offset or physical IOB binding");
+      continue;
+    }
+    const auto banks = adg->iobToSpadBanks(iob->index());
+    if (banks.empty() || std::any_of(banks.begin(), banks.end(), [&](int bank) {
+          return bank < 0 || bank >= static_cast<int>(bank_status.size());
+        }))
+      reject(id, "no valid reachable SRAM bank");
+    if (boundedLoads) {
+      if (reductionCount && io->operation() == "OUTPUT") {
+        if (io->inputEdges().size() != 1) {
+          reject(id, "final output requires one direct ACC result");
+        } else {
+          auto *source = dfg->node(dfg->edge(io->inputEdges().begin()->second)->srcId());
+          int64_t delay = int64_t(reductionCycles - 1) * mapper->_mapping->II();
+          if (source->operation() != "ACC" || source->cycles() != reductionCycles ||
+              delay < 0 || delay > std::numeric_limits<int>::max())
+            reject(id, "final output must consume the matching reduction result");
+          else
+            io->setAdditionalStartDelay(static_cast<int>(delay));
+        }
+      }
+      int latency = mapper->_mapping->dfgNodeAttr(id).lat - io->opLatency() +
+                    io->additionalStartDelay();
+      if (dataByte != 2 || !fitsField(iob, "UseAddr", 1) ||
+          !fitsField(iob, "Latency", latency) ||
+          mapper->_mapping->II() <= 0 ||
+          !fitsField(iob, "II", mapper->_mapping->II()))
+        reject(id, "dynamic LOAD requires i16 hardware and representable address/timing fields");
+      std::pair<int, int> expected(0, 1);
+      if (reductionCount && io->operation() != "OUTPUT")
+        expected = {io->operation() == "INPUT" ? 2 : 0, reductionCycles};
+      if (io->pattern().size() != 1 || io->pattern()[0] != expected ||
+          !fitsField(iob, "Cycles0", expected.second) ||
+          !fitsField(iob, "Stride0", expected.first / 2))
+        reject(id, "bounded dynamic LOAD requires matching fixed-role I/O patterns and representable cycle fields");
+    }
+  }
+  if (invalid)
+    return mlir::failure();
 
   /// set occupied banks
   //// TODO: what about _LoadToSPMInfos ??
@@ -467,10 +555,6 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
           int iobIdx = dynamic_cast<IOBNode*>(adg->node(iobId))->index();
           iob_ens.setBitTo(iobIdx, 1);    // iob_ens |= 1 << iobIdx; 
 
-          // int selStart = bankStatus[0].second;
-          // int selBank = availBanks[0];
-          // dfgIoInfo ioInfo = = getSPMInfosFromLocalAlloc(alloc).second;   
-
           // bank_status[selBank].used = ioInfo.isStore ? 2 : 1; /// Load : 1, Store : 2
           bank_status[selBank].used = 1; /// Load : 1, Store : 2
           bank_status[selBank].iob = iobIdx;
@@ -486,7 +570,12 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
 
   /// Get io information of every block load ops, including Addr(Spad), iobAddr, LorS
   _moduleop.walk([&](ADORA::DataBlockLoadOp blockload) {  
+    if (invalid) return;
     if(findElement(blockload.getKernelNameAsStrVector(), kernel.getKernelName()) != -1){
+      if (blockload->hasAttr("EmitSkip")) {
+        reject(-1, "BlockLoad marked EmitSkip cannot initialize mapped I/O");
+        return;
+      }
       //// this block load belongs to this kernels 
       std::string BlockLoadName = kernel.getKernelName() + ":" + blockload.getId().str();
       blockload.dump();
@@ -515,6 +604,10 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
             }        
 
             /// dfg io information 
+            if (availBanks.empty() || memSize > sizeofBank) {
+              reject(id, "no free reachable SRAM bank with sufficient capacity");
+              return;
+            }
             int selBank = availBanks[0];
             // int selStart = bankStatus[0].second;
 
@@ -541,7 +634,12 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
 
   /// Get io information of every block store ops, including Addr(Spad), iobAddr, LorS
   _moduleop.walk([&](ADORA::DataBlockStoreOp blockstore) {  
+    if (invalid) return;
     if(blockstore.getKernelName() == kernel.getKernelName()){
+      if (blockstore->hasAttr("EmitSkip")) {
+        reject(-1, "BlockStore marked EmitSkip cannot read back mapped output");
+        return;
+      }
       std::string BlockStoreName = blockstore.getKernelName().str() + ":" + blockstore.getId().str();
 
       //// set allocation's info
@@ -568,7 +666,11 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
           }        
 
           /// dfg io information 
-          int selBank = availBanks[0];
+          if (availBanks.empty() || memSize > sizeofBank) {
+              reject(id, "no free reachable SRAM bank with sufficient capacity");
+              return;
+            }
+            int selBank = availBanks[0];
           // int selStart = bankStatus[0].second;
 
           dfgIoInfo ioInfo;   
@@ -583,7 +685,10 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
 
           dfg_io_infos[id] = ioInfo;
 
-          assert(_StoreToDfgIoInfo.count(blockstore) == 0 && "One output operation should only be count once.");
+          if (_StoreToDfgIoInfo.count(blockstore) != 0) {
+            reject(id, "multiple output nodes for one BlockStore are unsupported");
+            return;
+          }
           _StoreToDfgIoInfo[blockstore] = ioInfo; 
 
           if(isa<ADORA::LocalMemAllocOp>(srcOfblockstore) && 
@@ -602,46 +707,35 @@ void BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& kernel, MapperS
       llvm::errs() << e.addr << ", " << e.iobAddr << "\n";        
     } 
   }  
-  // /// Get io information of every local allocation ops, including Addr(Spad), iobAddr, LorS
-  // _moduleop.walk([&](ADORA::LocalMemAllocOp alloc) {  
-  //   if(findElement(alloc.getKernelNameAsStrVector(), kernel.getKernelName()) != -1){
-  //     std::string AllocName = kernel.getKernelName() + ":" + alloc.getId().str();
-
-  //     if(_LocalAllocToSPMInfo.count(alloc) != 0){
-  //       std::set<int> IONodes = dfg->ioNodes();
-  //       for(auto& id : IONodes){
-  //         DFGIONode* IoNode = dynamic_cast<DFGIONode*>(dfg->node(id));
-  //         if(IoNode->memRefName() == AllocName){
-  //           int memSize = dynamic_cast<DFGIONode*>(dfg->node(id))->memSize();
-  //           int spadDataByte = adg->cfgSpadDataWidth() / 8; // dual ports of cfg-spad have the same width 
-  //           memSize = (memSize + spadDataByte - 1) / spadDataByte * spadDataByte; // align to spadDataByte
-  //           auto& attr =  mapper->_mapping->dfgNodeAttr(id);
-  //           int iobId = attr.adgNode->id();
-  //           int iobIdx = dynamic_cast<IOBNode*>(adg->node(iobId))->index();
-  //           iob_ens |= 1 << iobIdx; 
-
-  //           /// dfg io information 
-  //           int selBank = getSPMInfosFromLocalAlloc(alloc).first;
-  //           // int selStart = bankStatus[0].second;
-
-  //           dfgIoInfo ioInfo = = getSPMInfosFromLocalAlloc(alloc).second;   
-
-  //           bank_status[selBank].used = ioInfo.isStore ? 2 : 1; /// Load : 1, Store : 2
-  //           bank_status[selBank].iob = iobIdx;
-  //           bank_status[selBank].start = 0;
-  //           bank_status[selBank].end = memSize;  
-
-  //           dfg_io_infos[id] = ioInfo;
-
-  //           assert(_StoreToDfgIoInfo.count(blockstore) == 0 && "One output operation should only be count once.");
-  //           _StoreToDfgIoInfo[blockstore] = ioInfo; 
-  //         }
-  //       }
-  //     }
-  //   }
-  // });
-
+  if (invalid)
+    return mlir::failure();
+  for (int id : dfg->ioNodes()) {
+    auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
+    auto *iob = dynamic_cast<IOBNode *>(mapper->_mapping->dfgNodeAttr(id).adgNode);
+    auto found = dfg_io_infos.find(id);
+    if (found == dfg_io_infos.end() || !iob_ens.getBit(iob->index())) {
+      // Ordinary LOAD kernels require a complete executable invocation. Keep
+      // legacy graph-only CSTORE/scalar and cross-kernel emission contracts
+      // separate: they do not acquire this new bounded-LOAD certification.
+      if (boundedLoads)
+        reject(id, "object " + io->memRefName() + " has no initialization/output or startup coverage");
+      continue;
+    }
+    const auto &info = found->second;
+    const auto banks = adg->iobToSpadBanks(iob->index());
+    const int bank = info.addr / sizeofBank;
+    const int offset = info.addr % sizeofBank;
+    if (info.addr < 0 || std::find(banks.begin(), banks.end(), bank) == banks.end() ||
+        offset + io->memSize() > sizeofBank || offset % dataByte ||
+        info.iobAddr != ((bank - *std::min_element(banks.begin(), banks.end())) * sizeofBank + offset) / dataByte)
+      reject(id, "final bank/base/offset is inconsistent with physical IOB reachability");
+    if (!fitsField(iob, "BaseAddr", info.iobAddr + io->reducedMemOffset() / dataByte))
+      reject(id, "final base address overflows IOB configuration field");
+  }
+  if (invalid)
+    return mlir::failure();
 
   _kernel_to_dfg_io_infos[kernel] = dfg_io_infos;
   _kernel_to_iob_ens[kernel] = iob_ens;
+  return mlir::success();
 }

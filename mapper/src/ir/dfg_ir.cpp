@@ -517,6 +517,32 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         std::string opName = node->getTypeName();
         std::cout << NodeName << "\n";
         std::transform(opName.begin(), opName.end(), opName.begin(), toupper);
+        int64_t loadCycles = 0;
+        const std::string loadPatternStorage = node->getLinearAccess();
+        llvm::StringRef loadPattern(loadPatternStorage);
+        bool validLoadPattern = loadPattern.consume_front("0,") &&
+            !loadPattern.getAsInteger(10, loadCycles) && loadCycles > 0 &&
+            loadCycles <= std::numeric_limits<int>::max();
+        if (opName == "LOAD" &&
+            (node->getMemrefName().empty() || node->getMemrefSize() <= 0 ||
+             node->getInitAddr() != "0" || !validLoadPattern)) {
+            std::cerr << "Invalid LOAD DFG node " << id << " in "
+                      << CDFG->name_str()
+                      << ": missing object/size or unsupported explicit-address range/pattern\n";
+            exit(1);
+        }
+        if (opName == "LOAD") {
+            std::map<int, int> ports;
+            for (const auto &input : node->inputInfoMap())
+                for (const auto &info : input.second)
+                    ++ports[info.idx];
+            auto violation = CStoreContract::logicalPortViolation(ports, 1);
+            if (!violation.empty()) {
+                std::cerr << "Invalid LOAD DFG node " << id << " in "
+                          << CDFG->name_str() << ": " << violation << '\n';
+                exit(1);
+            }
+        }
         // int id = nodeJson["_gvid"].get<int>() + 1; // start from 1
         // if(opName == "INPUT"){
         //     int idx = _inputId2idx.size();
@@ -723,8 +749,9 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         const std::string destinationType = edge->dst()->getTypeName();
         const bool isCStoreDestination = destinationType == "CSTORE";
         const bool isStoreDestination = destinationType == "store";
+        const bool isLoadDestination = destinationType == "load";
         const bool hasExactIOContract =
-            isCStoreDestination || isStoreDestination;
+            isCStoreDestination || isStoreDestination || isLoadDestination;
         if(hasExactIOContract){
             auto inputInfo = edge->dst()->inputInfoMap().find(edge->src());
             auto edgePair = std::make_pair(edge->src(), edge->dst());
@@ -732,7 +759,7 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
             if(inputInfo == edge->dst()->inputInfoMap().end() ||
                portIdx >= inputInfo->second.size()){
                 std::cout << "Invalid "
-                          << (isCStoreDestination ? "CSTORE" : "STORE")
+                          << (isCStoreDestination ? "CSTORE" : isLoadDestination ? "LOAD" : "STORE")
                           << " DFG node " << dstId
                           << ": missing logical operand path for raw edge "
                           << edge_id << std::endl;
@@ -834,17 +861,18 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         DFGNode* node = elem.second;
         const bool isCStore = node->operation() == "CSTORE";
         const bool isStore = node->operation() == "STORE";
-        if(!isCStore && !isStore){
+        const bool isLoad = node->operation() == "LOAD";
+        if(!isCStore && !isStore && !isLoad){
             continue;
         }
-        const std::string operation = isCStore ? "CSTORE" : "STORE";
-        const int expectedOperands = isCStore ? 3 : 2;
+        const std::string operation = node->operation();
+        const int expectedOperands = isCStore ? 3 : isLoad ? 1 : 2;
         const std::string prefix = "Invalid " + operation + " DFG node " +
                                    std::to_string(node->id()) + ": ";
         if(Operations::numOperands(operation) != expectedOperands ||
-           Operations::numRes(operation) != 0){
+           Operations::numRes(operation) != (isLoad ? 1 : 0)){
             std::cout << prefix << "operation spec must have "
-                      << expectedOperands << " operands and 0 results"
+                      << expectedOperands << " operands and " << (isLoad ? 1 : 0) << " results"
                       << std::endl;
             exit(1);
         }

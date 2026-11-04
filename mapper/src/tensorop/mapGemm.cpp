@@ -138,7 +138,16 @@ LogicalResult TensorDataflowGen::MapNestedForOrKernel(
       // Mapping is successful, get all blockload and blockstore op and corresponding spad memory addresses.
       // if(_emit_type == "pytest"){
         pyEmitter->setMapResult(kernel, mapper);
-        pyEmitter->DataBlockOperationsToSPADInfo(kernel, mapper);
+        if (failed(pyEmitter->DataBlockOperationsToSPADInfo(kernel, mapper))) {
+          delete mapper;
+          delete dfg_ir;
+          delete CDFG;
+          if (createdResultDir) {
+            std::error_code cleanupError;
+            std::filesystem::remove_all(resultDir, cleanupError);
+          }
+          return failure();
+        }
         pyEmitter->setTileEnsForKernel(kernel);
         pyEmitter->GenerateCGRAConfig(kernel, mapper);
 

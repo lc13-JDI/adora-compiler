@@ -5,6 +5,7 @@
 // RUN: %FileCheck %s --check-prefix=CHECK-PY --input-file=%t/gemm_funccall.py
 // RUN: not %cgra-mapper --adg=%S/../../../spec/cgra_bf16/vitra_cgra_adg.json --op-file=%S/../../../spec/cgra_bf16/operations.json --output-type=pytest --obj-opt=false --tile=1 %t/opt.mlir --output=%t/map_fail.py 2>&1 | %FileCheck %s --check-prefix=CHECK-MAP-FAIL
 // RUN: test ! -s %t/map_fail.py
+// RUN: python3 %S/test_gemm_io_contract.py %cgra-mapper %S/../../../spec/cgra_bf16/vitra_cgra_adg.json %S/../../../spec/cgra_bf16/operations.json %t/opt.mlir %t/io_contract
 //
 // Verify cgra-mapper flow with function call around ADORATensor.Gemm.
 //

@@ -34,6 +34,29 @@ int main(int argc, char **argv) {
   }
 
   const std::string testCase = argv[1];
+  if (testCase.rfind("load-", 0) == 0) {
+    Operations::Instance(argv[2]);
+    mlir::MLIRContext context;
+    context.allowUnregisteredDialects();
+    LLVMCDFG cdfg("load-contract-unit");
+    auto *load = addNode(cdfg, context, "load");
+    load->setMemrefName(testCase == "load-no-object" ? "" : "kernel:w");
+    load->setMemrefSize(testCase == "load-no-size" ? 0 : 16);
+    load->setInitAddr("0");
+    load->setLinearAccess("0,1");
+    if (testCase == "load-loop") load->setLinearAccess("0,4");
+    if (testCase == "load-empty") load->setLinearAccess("0,0");
+    if (testCase == "load-negative") load->setLinearAccess("0,-1");
+    if (testCase == "load-nonzero-stride") load->setLinearAccess("2,4");
+    if (testCase == "load-overflow") load->setLinearAccess("0,2147483648");
+    if (testCase != "load-missing-port")
+      addEdge(cdfg, addNode(cdfg, context, "Input"), load,
+              testCase == "load-wrong-port" ? 1 : 0);
+    if (testCase == "load-duplicate-port")
+      addEdge(cdfg, addNode(cdfg, context, "Input"), load, 0);
+    DFGIR dfg(&cdfg);
+    return dfg.getDFG() ? 0 : 2;
+  }
   const bool isStore = testCase.rfind("store-", 0) == 0;
   const std::string shape = isStore ? testCase.substr(6) : testCase;
   if (shape != "zero-immediate" && shape != "one-immediate" &&

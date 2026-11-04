@@ -1,41 +1,8 @@
-// RUN: rm -f kernel_0_CDFG.dot
-// RUN: %cgra-opt --adora-kernel-dfg-gen %s | %FileCheck %s
-// RUN: test -s kernel_0_CDFG.dot
-// RUN: %FileCheck %s --check-prefix=DOT0 --input-file=kernel_0_CDFG.dot
-//
-// DOT0: Digraph G {
-// DOT0-DAG: Input{{[0-9]+}}[opcode = "Input"
-// DOT0-DAG: load[[LOAD:[0-9]+]][opcode = "load"
-// DOT0-DAG: store[[STORE:[0-9]+]][opcode = "store"
-// DOT0-DAG: Output{{[0-9]+}}[opcode = "Output"
-// DOT0-DAG: CONST[[LOAD_CONST:[0-9]+]][opcode = "CONST", value="0x00000004"
-// DOT0-DAG: CONST[[STORE_CONST:[0-9]+]][opcode = "CONST", value="0x00000004"
-// DOT0-DAG: MUL[[LOAD_MUL:[0-9]+]][opcode = "MUL"
-// DOT0-DAG: MUL[[STORE_MUL:[0-9]+]][opcode = "MUL"
-// DOT0-DAG: Input{{[0-9]+}} -> MUL[[LOAD_MUL]]
-// DOT0-DAG: Input{{[0-9]+}} -> MUL[[STORE_MUL]]
-// DOT0-DAG: CONST[[LOAD_CONST]] -> MUL[[LOAD_MUL]]
-// DOT0-DAG: CONST[[STORE_CONST]] -> MUL[[STORE_MUL]]
-// DOT0-DAG: MUL[[LOAD_MUL]] -> load[[LOAD]]{{.*}}operand = 0, label = "Op=0"
-// DOT0-DAG: MUL[[STORE_MUL]] -> store[[STORE]]{{.*}}operand = 2, label = "Op=2"
-// DOT0-DAG: load[[LOAD]] -> store[[STORE]]{{.*}}operand = 0, label = "Op=0"
-// DOT0-DAG: load[[LOAD]] -> Output
-// DOT0: }
-//
-// CHECK: module {
-// CHECK: func.func @merge(%arg0: memref<?xi32>) attributes {llvm.linkage = #llvm.linkage<external>} {
-// CHECK: ADORA.BlockLoad
-// CHECK: ADORA.LocalMemAlloc
-// CHECK: ADORA.kernel {
-// CHECK: affine.for %arg1 = 0 to 1025 {
-// CHECK: affine.load
-// CHECK: memref.load
-// CHECK: memref.store
-// CHECK: affine.store
-// CHECK: ADORA.terminator
-// CHECK: ADORA.BlockStore
-// CHECK: return
-// CHECK: }
+// RUN: not %cgra-opt --adora-kernel-dfg-gen %s 2>&1 | %FileCheck %s --check-prefix=REJECT
+// REJECT: bounded dynamic LOAD:
+// This legacy i32 mixed read/write example previously emitted a graph without
+// complete dynamic object metadata. It is outside the bounded i16 read-only
+// contract and must now fail explicitly.
 
 module {
   func.func @merge(%arg0: memref<?xi32>) attributes {llvm.linkage = #llvm.linkage<external>} {

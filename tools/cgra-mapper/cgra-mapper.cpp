@@ -475,6 +475,13 @@ int main(int argc, char **argv) {
     }
 
     DFG* dfg = dfg_ir->getDFG();
+    for (int id : dfg->ioNodes()) {
+      if (dfg->node(id)->operation() == "LOAD" && emit_type != "pytest") {
+        kernel.emitError("bounded dynamic LOAD currently requires pytest output for checked host input domains");
+        generation_failed.store(true);
+        return;
+      }
+    }
     int numNodes = dfg->nodes().size();
     int numOpNodes = numNodes - dfg->ioNodes().size();
     std::cout << "numOpNodes: " << numOpNodes << ", numDfgNodes(Op+IO): "  << numNodes << std::endl;
@@ -484,6 +491,22 @@ int main(int argc, char **argv) {
     // dfg->print();
     // map DFG to ADG
     mapper->setDFG(dfg);
+
+    // Reject malformed SRAM topology before the mapping objective or emitter
+    // can index an empty/out-of-range candidate bank list.
+    for (const auto &entry : subadg->nodes()) {
+      auto *iob = dynamic_cast<IOBNode *>(entry.second);
+      if (!iob) continue;
+      const auto banks = subadg->iobToSpadBanks(iob->index());
+      if (banks.empty() || std::any_of(banks.begin(), banks.end(), [&](int bank) {
+            return bank < 0 || bank >= subadg->numIobNodes();
+          })) {
+        kernel.emitError("incomplete I/O execution contract: no valid reachable SRAM bank for IOB ")
+            << iob->index();
+        generation_failed.store(true);
+        return;
+      }
+    }
 
     // some io nodes must be placed at some place
     {
@@ -510,19 +533,28 @@ int main(int argc, char **argv) {
       std::scoped_lock lock(mlir_mutex, emitter_mutex);
       if(emit_type == "pytest"){
         PyEmitter.setMapResult(kernel, mapper);
-        PyEmitter.DataBlockOperationsToSPADInfo(kernel, mapper);
+        if (failed(PyEmitter.DataBlockOperationsToSPADInfo(kernel, mapper))) {
+          generation_failed.store(true);
+          return;
+        }
         PyEmitter.setTileEnsForKernel(kernel);
         PyEmitter.GenerateCGRAConfig(kernel, mapper);
       }
       else if(emit_type == "sdk"){
         SDKEmitter.setMapResult(kernel, mapper);
-        SDKEmitter.DataBlockOperationsToSPADInfo(kernel, mapper);
+        if (failed(SDKEmitter.DataBlockOperationsToSPADInfo(kernel, mapper))) {
+          generation_failed.store(true);
+          return;
+        }
         SDKEmitter.setTileEnsForKernel(kernel);
         SDKEmitter.GenerateCGRAConfig(kernel, mapper);
       }
       else{ /// default to be C
         CEmitter.setMapResult(kernel, mapper);
-        CEmitter.DataBlockOperationsToSPADInfo(kernel, mapper);
+        if (failed(CEmitter.DataBlockOperationsToSPADInfo(kernel, mapper))) {
+          generation_failed.store(true);
+          return;
+        }
         CEmitter.setTileEnsForKernel(kernel);
         CEmitter.GenerateCGRAConfig(kernel, mapper);
       }

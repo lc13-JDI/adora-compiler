@@ -158,7 +158,7 @@ public:
   ///        This information is store in _LoadToDfgIoInfos/_StoreToDfgIoInfo
   /// @param kernel Kernel which has been translated to CDFG
   /// @param mapper The SA mapper which has completed mapping 
-  void DataBlockOperationsToSPADInfo(mlir::ADORA::KernelOp& kernel, MapperSA* mapper);
+  mlir::LogicalResult DataBlockOperationsToSPADInfo(mlir::ADORA::KernelOp& kernel, MapperSA* mapper);
 //   llvm::SmallDenseMap<ADORA::KernelOp, std::pair<std::string, int>> KnToCfgArrayInfo;   // map : kernelop -> (cfg array's name, cfgnum)
 //   llvm::SmallDenseMap<ADORA::KernelOp, std::string> KnToCfgData; // map : kernelop -> total cfg array declaration
 //   llvm::SmallDenseMap<ADORA::KernelOp, std::string> KnToCfgExe;
