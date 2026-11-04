@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/OperationSupport.h"
 // #include "mlir/IR/OpDefinition.h"
@@ -4539,9 +4540,213 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
 }
 
 
+// The memref builder materializes the default nontemporal=false property.
+// Accept that default, while rejecting unmodeled memory-access requirements.
+static bool hasUnsupportedStreamLoadAttributes(memref::LoadOp load) {
+  for (auto attr : load->getAttrs()) {
+    auto flag = dyn_cast<BoolAttr>(attr.getValue());
+    if (attr.getName().strref() == "nontemporal" && flag && !flag.getValue()) continue;
+    return true;
+  }
+  return false;
+}
+
+// Infer a signed-i16 leaf interval from the actual conjunction selecting it.
+// No annotation can certify a select: both its selected SSA leaf and predicate
+// must match this proof. Unrelated conjuncts only make the path more restrictive.
+static void refineGuardedRange(mlir::Value guard, mlir::Value leaf,
+                               std::pair<int64_t, int64_t> &bounds,
+                               unsigned depth = 0) {
+  if (depth > 32) return;
+  if (auto both = guard.getDefiningOp<arith::AndIOp>()) {
+    refineGuardedRange(both.getLhs(), leaf, bounds, depth + 1);
+    refineGuardedRange(both.getRhs(), leaf, bounds, depth + 1);
+    return;
+  }
+  bool inverted = false;
+  if (auto negate = guard.getDefiningOp<arith::XOrIOp>()) {
+    auto one = negate.getRhs().getDefiningOp<arith::ConstantOp>();
+    auto value = one ? dyn_cast<IntegerAttr>(one.getValue()) : IntegerAttr();
+    if (value && value.getType().isInteger(1) && value.getValue().isOne()) {
+      guard = negate.getLhs();
+      inverted = !inverted;
+    }
+  }
+  if (auto complement = guard.getDefiningOp<arith::SubIOp>()) {
+    auto one = complement.getLhs().getDefiningOp<arith::ConstantOp>();
+    auto value = one ? dyn_cast<IntegerAttr>(one.getValue()) : IntegerAttr();
+    if (value && value.getType().isInteger(1) && value.getValue().isOne()) {
+      guard = complement.getRhs();
+      inverted = !inverted;
+    }
+  }
+  auto cmp = guard.getDefiningOp<arith::CmpIOp>();
+  if (!cmp || !leaf.getType().isSignlessInteger(16)) return;
+  bool leafOnLeft = cmp.getLhs() == leaf;
+  if (!leafOnLeft && cmp.getRhs() != leaf) return;
+  auto constant = (leafOnLeft ? cmp.getRhs() : cmp.getLhs()).getDefiningOp<arith::ConstantOp>();
+  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+  if (!integer) return;
+  int64_t v = integer.getInt();
+  auto predicate = cmp.getPredicate();
+  if (leafOnLeft) {
+    if ((!inverted && predicate == arith::CmpIPredicate::sge) ||
+        (inverted && predicate == arith::CmpIPredicate::slt))
+      bounds.first = std::max(bounds.first, v);
+    if (!inverted && predicate == arith::CmpIPredicate::slt)
+      bounds.second = std::min(bounds.second, v - 1);
+    if (!inverted && predicate == arith::CmpIPredicate::sle)
+      bounds.second = std::min(bounds.second, v);
+  } else if (predicate == arith::CmpIPredicate::sle) {
+    if (inverted) bounds.second = std::min(bounds.second, v - 1);
+    else bounds.first = std::max(bounds.first, v);
+  }
+}
+
+// Only the disposable copy is changed. Reads are moved out of branches only
+// after replacing every coordinate leaf BEFORE address multiplication/addition.
+// The subsequent bounded-object/stream preflight certifies the resulting reads.
+static LogicalResult legalizeGuardedStreamLoads(ADORA::KernelOp kernel) {
+  bool guarded = false, dynamic = false, candidate = false;
+  kernel.walk([&](memref::LoadOp load) {
+    dynamic = true;
+    if (!load->getParentOfType<scf::IfOp>()) return;
+    guarded = true;
+    auto loop = load->getParentOfType<affine::AffineForOp>();
+    if (load.getType().isSignlessInteger(16) && loop &&
+        loop->getParentOp() == kernel.getOperation())
+      candidate = true;
+  });
+  if (!dynamic) return success();
+  // Preserve the old strict branch-effect preflight for non-stream kernels,
+  // including its diagnostics and transactional behavior. Object identity,
+  // bounds and carried state are intentionally NOT candidate filters: an i16
+  // affine-stream request with those defects must still fail our contract.
+  if (guarded && !candidate) return success();
+  bool invalid = false;
+  auto reject = [&](Operation *op, StringRef why) {
+    op->emitError("guarded stream LOAD: ") << why;
+    invalid = true;
+  };
+  kernel.walk([&](Operation *op) {
+    if (op->hasAttr("adora.no_access") || op->hasAttr("adora.require_no_access"))
+      reject(op, "physical no-access is unsupported by safe-address ordinary LOAD");
+    if (!op->getParentOfType<scf::IfOp>()) return;
+    if (auto add = dyn_cast<arith::AddIOp>(op))
+      if (add.getOverflowFlags() != arith::IntegerOverflowFlags::none)
+        reject(op, "branch arithmetic overflow flags can create poison and are unsupported");
+    if (auto mul = dyn_cast<arith::MulIOp>(op))
+      if (mul.getOverflowFlags() != arith::IntegerOverflowFlags::none)
+        reject(op, "branch arithmetic overflow flags can create poison and are unsupported");
+    if (!isa<scf::IfOp, scf::YieldOp, memref::LoadOp, arith::ConstantOp,
+             arith::CmpIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+             arith::SelectOp, arith::IndexCastOp, arith::AddIOp, arith::MulIOp>(op))
+      reject(op, "unsupported branch effect or address operation");
+    if (auto load = dyn_cast<memref::LoadOp>(op))
+      if (hasUnsupportedStreamLoadAttributes(load))
+        reject(op, "load attributes including volatile/no-access are unsupported");
+  });
+  if (invalid) return failure();
+  if (!guarded) return success();
+  SmallVector<scf::IfOp> roots;
+  kernel.walk([&](scf::IfOp op) {
+    if (!op->getParentOfType<scf::IfOp>()) roots.push_back(op);
+  });
+  for (scf::IfOp root : roots) {
+    auto loop = dyn_cast<affine::AffineForOp>(root->getParentOp());
+    if (!loop || loop->getParentOp() != kernel.getOperation() || loop.getNumResults()) {
+      reject(root, "requires one direct affine stream loop without carried state");
+      return failure();
+    }
+    OpBuilder builder(root);
+    IRMapping mapping;
+    std::function<mlir::Value(mlir::Value, mlir::Value, unsigned)> safeAddress;
+    safeAddress = [&](mlir::Value value, mlir::Value guard, unsigned depth) -> mlir::Value {
+      if (depth > 32) return {};
+      value = mapping.lookupOrDefault(value);
+      auto *op = value.getDefiningOp();
+      if (!op) return {};
+      if (isa<arith::ConstantOp>(op)) return value;
+      if (auto castOp = dyn_cast<arith::IndexCastOp>(op)) {
+        auto leaf = castOp.getIn();
+        auto input = leaf.getDefiningOp<affine::AffineLoadOp>();
+        if (!input || input->getParentOp() != loop.getOperation() ||
+            !leaf.getType().isSignlessInteger(16) || !castOp.getType().isIndex()) return {};
+        std::pair<int64_t, int64_t> bounds{-32768, 32767};
+        refineGuardedRange(guard, leaf, bounds);
+        if (bounds.first < 0 || bounds.first > bounds.second) return {};
+        auto zero = builder.create<arith::ConstantIntOp>(root.getLoc(), 0, 16);
+        auto safe = builder.create<arith::SelectOp>(root.getLoc(), guard, leaf, zero);
+        return builder.create<arith::IndexCastOp>(root.getLoc(), builder.getIndexType(), safe);
+      }
+      if (!isa<arith::AddIOp, arith::MulIOp>(op) || !value.getType().isIndex()) return {};
+      auto lhs = safeAddress(op->getOperand(0), guard, depth + 1);
+      auto rhs = safeAddress(op->getOperand(1), guard, depth + 1);
+      if (!lhs || !rhs) return {};
+      if (isa<arith::AddIOp>(op))
+        return builder.create<arith::AddIOp>(root.getLoc(), lhs, rhs);
+      return builder.create<arith::MulIOp>(root.getLoc(), lhs, rhs);
+    };
+    std::function<SmallVector<mlir::Value>(Block &, mlir::Value)> flatten;
+    flatten = [&](Block &block, mlir::Value path) -> SmallVector<mlir::Value> {
+      for (Operation &op : block) {
+        if (auto yield = dyn_cast<scf::YieldOp>(op)) {
+          SmallVector<mlir::Value> values;
+          for (auto value : yield.getOperands()) values.push_back(mapping.lookupOrDefault(value));
+          return values;
+        }
+        if (auto branch = dyn_cast<scf::IfOp>(op)) {
+          auto cond = mapping.lookupOrDefault(branch.getCondition());
+          auto yes = path ? builder.create<arith::AndIOp>(op.getLoc(), path, cond).getResult() : cond;
+          auto truth = builder.create<arith::ConstantIntOp>(op.getLoc(), 1, 1);
+          auto inverse = builder.create<arith::XOrIOp>(op.getLoc(), cond, truth);
+          auto no = path ? builder.create<arith::AndIOp>(op.getLoc(), path, inverse).getResult() : inverse.getResult();
+          auto thenValues = flatten(branch.getThenRegion().front(), yes);
+          SmallVector<mlir::Value> elseValues;
+          if (!branch.getElseRegion().empty()) elseValues = flatten(branch.getElseRegion().front(), no);
+          if (invalid) return {};
+          for (unsigned i = 0; i < branch.getNumResults(); ++i)
+            mapping.map(branch.getResult(i), builder.create<arith::SelectOp>(op.getLoc(), cond, thenValues[i], elseValues[i]).getResult());
+        } else if (auto load = dyn_cast<memref::LoadOp>(op)) {
+          auto address = load.getIndices().size() == 1 ? safeAddress(load.getIndices()[0], path, 0) : mlir::Value();
+          if (!address) { reject(load, "address slice requires guard-proven nonnegative coordinate leaves; dependent loads are unsupported"); return {}; }
+          auto copy = builder.create<memref::LoadOp>(op.getLoc(), load.getMemref(), ValueRange{address});
+          mapping.map(load.getResult(), copy.getResult());
+        } else {
+          builder.clone(op, mapping);
+        }
+      }
+      return {};
+    };
+    // Flatten the root regions explicitly without moving the original if.
+    auto cond = root.getCondition();
+    auto thenValues = flatten(root.getThenRegion().front(), cond);
+    auto truth = builder.create<arith::ConstantIntOp>(root.getLoc(), 1, 1);
+    auto inverse = builder.create<arith::XOrIOp>(root.getLoc(), cond, truth);
+    SmallVector<mlir::Value> elseValues;
+    if (!root.getElseRegion().empty()) elseValues = flatten(root.getElseRegion().front(), inverse);
+    if (invalid) return failure();
+    for (unsigned i = 0; i < root.getNumResults(); ++i)
+      root.getResult(i).replaceAllUsesWith(builder.create<arith::SelectOp>(root.getLoc(), cond, thenValues[i], elseValues[i]));
+    root.erase();
+    // Remove the original, now unused address arithmetic, including any raw
+    // coordinate casts. Only the safe address graph reaches later lowering.
+    bool changed;
+    do {
+      changed = false;
+      for (auto &op : llvm::make_early_inc_range(*loop.getBody()))
+        if (op.getNumRegions() == 0 && !op.hasTrait<OpTrait::IsTerminator>() && op.use_empty() &&
+            isMemoryEffectFree(&op)) { op.erase(); changed = true; }
+    } while (changed);
+  }
+  return success();
+}
+
 // Ordinary dynamic LOAD currently has a deliberately narrow execution contract.
-// Validate before cloning/normalization, so legacy fallback cannot bypass it.
-static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
+// Validate the disposable candidate before optimization, so fallback cannot
+// bypass the contract. The original kernel is still present only for rollback.
+static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
+                                                   ADORA::KernelOp original = {}) {
   bool invalid = false;
   auto reject = [&](Operation *op, StringRef why) {
     op->emitError("bounded dynamic LOAD: ") << why;
@@ -4578,8 +4783,13 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     reject(kernel, "requires one function block with a direct kernel and no host control flow");
     return failure();
   }
+  if (function->hasAttr("adora.no_access") || function->hasAttr("adora.require_no_access")) {
+    reject(function, "physical no-access is unsupported by ordinary LOAD");
+    return failure();
+  }
   bool seenKernel = false;
   for (Operation &op : function.getBody().front()) {
+    if (original && &op == original.getOperation()) continue;
     if (&op == kernel.getOperation()) { seenKernel = true; continue; }
     if (!seenKernel && isa<arith::ConstantOp, ADORA::DataBlockLoadOp,
                            ADORA::LocalMemAllocOp>(op)) continue;
@@ -4595,6 +4805,8 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     return argument && argument.getOwner() == &function.getBody().front();
   };
   function.walk([&](ADORA::DataBlockLoadOp block) {
+    if (block->hasAttr("adora.no_access") || block->hasAttr("adora.require_no_access"))
+      reject(block, "physical no-access is unsupported by ordinary LOAD");
     if (!isHostArgument(block.getOriginalMemref()))
       reject(block, "BlockLoad source must be a function argument");
     if (block->hasAttr("adora.value_range")) {
@@ -4640,11 +4852,11 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     function.walk([&](ADORA::DataBlockLoadOp other) {
       if (other.getId() == block.getId()) ++names;
     });
-    function.walk([&](ADORA::KernelOp) { ++kernels; });
+    function.walk([&](ADORA::KernelOp other) { if (other != original) ++kernels; });
     if (names != 1 || kernels != 1) return {};
     for (Operation *user : value.getUsers()) {
       if (!isa<memref::LoadOp, affine::AffineLoadOp>(user) ||
-          !kernel->isAncestor(user)) return {};
+          !(kernel->isAncestor(user) || (original && original->isAncestor(user)))) return {};
     }
     return block;
   };
@@ -4658,6 +4870,19 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
   // still require one invocation and stores inside that invocation.
   auto reductionLoop = dyn_cast_or_null<affine::AffineForOp>(invocationLoop);
   bool reduction = reductionLoop && reductionLoop.getNumResults() == 2;
+  bool stream = false;
+  if (reductionLoop && reductionLoop.getNumResults() == 0)
+    reductionLoop.walk([&](affine::AffineLoadOp load) {
+      if (llvm::is_contained(load.getMapOperands(), reductionLoop.getInductionVar())) stream = true;
+    });
+  int64_t streamCount = 1;
+  if (stream) {
+    if (!reductionLoop.hasConstantLowerBound() || !reductionLoop.hasConstantUpperBound() ||
+        reductionLoop.getConstantLowerBound() != 0 || reductionLoop.getStep().getSExtValue() != 1 ||
+        reductionLoop.getConstantUpperBound() <= 0 || reductionLoop.getConstantUpperBound() > 4095)
+      reject(reductionLoop, "stream requires lower zero, unit step and positive bounded constant length");
+    else streamCount = reductionLoop.getConstantUpperBound();
+  }
   int64_t reductionCount = 1;
   affine::AffineLoadOp sequentialInput;
   if (reduction) {
@@ -4693,12 +4918,36 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
   }
   auto sequentialRead = [&](affine::AffineLoadOp load) {
     auto map = load.getAffineMap();
-    return reduction && load == sequentialInput && map.getNumDims() == 1 &&
+    return (stream || (reduction && load == sequentialInput)) && map.getNumDims() == 1 &&
         map.getNumSymbols() == 0 && map.getNumResults() == 1 &&
         map.getResult(0) == getAffineDimExpr(0, kernel.getContext()) &&
         load.getMapOperands().size() == 1 && load.getMapOperands()[0] == reductionLoop.getInductionVar() &&
-        reductionCount <= load.getMemRefType().getNumElements();
+        (stream ? streamCount : reductionCount) <= load.getMemRefType().getNumElements();
   };
+  auto sequentialStore = [&](affine::AffineStoreOp store) {
+    auto map = store.getAffineMap();
+    return stream && map.getNumDims() == 1 && map.getNumSymbols() == 0 &&
+        map.getNumResults() == 1 && map.getResult(0) == getAffineDimExpr(0, kernel.getContext()) &&
+        store.getMapOperands().size() == 1 && store.getMapOperands()[0] == reductionLoop.getInductionVar();
+  };
+  if (stream) {
+    // All run-time values enter through certified sequential I/O. Host scalar
+    // arguments and other block arguments have no stream transport contract.
+    kernel.walk([&](Operation *op) {
+      for (auto operand : op->getOperands())
+        if (isa<BlockArgument>(operand) && operand != reductionLoop.getInductionVar())
+          reject(op, "stream run-time values must come from certified INPUT roles");
+    });
+    for (Operation *user : reductionLoop.getInductionVar().getUsers()) {
+      if (auto load = dyn_cast<affine::AffineLoadOp>(user)) {
+        if (sequentialRead(load)) continue;
+      }
+      if (auto store = dyn_cast<affine::AffineStoreOp>(user)) {
+        if (sequentialStore(store)) continue;
+      }
+      reject(user, "stream induction variable may only index sequential INPUT/OUTPUT roles");
+    }
+  }
   if (reduction) {
     if (!sequentialInput || !sequentialRead(sequentialInput))
       reject(reductionLoop, "reduction index input must read exactly ids[iv] within the bounded object");
@@ -4730,7 +4979,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
       if (op != invocationLoop || op->getParentOp() != kernel.getOperation() ||
           !loop.hasConstantLowerBound() || !loop.hasConstantUpperBound() ||
           loop.getConstantUpperBound() <= loop.getConstantLowerBound() ||
-          (!reduction && (__int128)loop.getConstantUpperBound() - loop.getConstantLowerBound() > loop.getStep().getSExtValue()))
+          (!reduction && !stream && (__int128)loop.getConstantUpperBound() - loop.getConstantLowerBound() > loop.getStep().getSExtValue()))
         reject(op, "kernel permits only its one single-invocation affine loop");
       return;
     }
@@ -4741,9 +4990,21 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     }
     if (auto compare = dyn_cast<arith::CmpIOp>(op)) {
       if (!compare.getLhs().getType().isSignlessInteger(16) ||
-          compare.getPredicate() != arith::CmpIPredicate::slt)
-        reject(op, "bounded padding comparison supports only signed less-than");
+          (compare.getPredicate() != arith::CmpIPredicate::slt &&
+           !(stream && (compare.getPredicate() == arith::CmpIPredicate::sge ||
+                         compare.getPredicate() == arith::CmpIPredicate::ne ||
+                         compare.getPredicate() == arith::CmpIPredicate::eq ||
+                         compare.getPredicate() == arith::CmpIPredicate::sle))))
+        reject(op, "comparison must match the bounded reduction or signed stream predicate contract");
       return;
+    }
+    if (stream) {
+      if (auto add = dyn_cast<arith::AddIOp>(op))
+        if (add.getOverflowFlags() != arith::IntegerOverflowFlags::none)
+          reject(op, "stream arithmetic overflow flags are unsupported");
+      if (auto mul = dyn_cast<arith::MulIOp>(op))
+        if (mul.getOverflowFlags() != arith::IntegerOverflowFlags::none)
+          reject(op, "stream arithmetic overflow flags are unsupported");
     }
     if (isa<arith::AddIOp, arith::MulIOp>(op) &&
         !op->getResult(0).getType().isIndex() &&
@@ -4759,6 +5020,22 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
       if (!constant.getType().isIndex() && !constant.getType().isSignlessInteger(16) &&
           !constant.getType().isSignlessInteger(1))
         reject(op, "bounded constants support only index, signless i16 and predicates");
+    if (stream && isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp, arith::SubIOp>(op)) {
+      if (!op->getResult(0).getType().isSignlessInteger(1))
+        reject(op, "stream boolean arithmetic must operate on predicates");
+      if (auto sub = dyn_cast<arith::SubIOp>(op)) {
+        if (sub.getOverflowFlags() != arith::IntegerOverflowFlags::none)
+          reject(op, "stream arithmetic overflow flags are unsupported");
+        auto constant = sub.getLhs().getDefiningOp<arith::ConstantOp>();
+        auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+        auto either = sub.getLhs().getDefiningOp<arith::OrIOp>();
+        auto both = sub.getRhs().getDefiningOp<arith::AndIOp>();
+        if (!(integer && integer.getType().isInteger(1) && integer.getValue().isOne()) &&
+            !(either && both && either.getLhs() == both.getLhs() && either.getRhs() == both.getRhs()))
+          reject(op, "boolean SUB must be complement or OR-minus-AND to preserve 0/1 encoding");
+      }
+      return;
+    }
     if (!isa<affine::AffineYieldOp, arith::ConstantOp, arith::AddIOp,
              arith::MulIOp, arith::IndexCastOp, arith::SelectOp,
              memref::LoadOp, affine::AffineLoadOp, affine::AffineStoreOp>(op))
@@ -4781,7 +5058,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
   kernel.walk([&](affine::AffineLoadOp load) {
     int64_t index;
     if (!validObject(load.getMemref()) || load->getParentOp() != invocationLoop ||
-        (!sequentialRead(load) && (!constantIndex(load.getAffineMap(), index) || index < 0 ||
+        (!sequentialRead(load) && (stream || !constantIndex(load.getAffineMap(), index) || index < 0 ||
         index >= load.getMemRefType().getNumElements())))
       reject(load, "affine reads must be constant in-object reads in the invocation loop");
   });
@@ -4794,18 +5071,19 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     int64_t index;
     if (!allocation || !sourceType || !sourceType.hasStaticShape() ||
         sourceType.getRank() != 1 || sourceType.getMemorySpace() || !sourceType.getLayout().isIdentity() ||
-        !sourceType.getElementType().isSignlessInteger(16) || sourceType.getNumElements() != 1 ||
+        !sourceType.getElementType().isSignlessInteger(16) || sourceType.getNumElements() != (stream ? streamCount : 1) ||
         !target || !isHostArgument(target) || inputs.contains(target) || !targetType ||
         !targetType.hasStaticShape() || targetType.getRank() != 1 ||
         targetType.getMemorySpace() || !targetType.getLayout().isIdentity() || !targetType.getElementType().isSignlessInteger(16) ||
         !map || !constantIndex(map.getValue(), index) || index < 0 ||
-        index >= targetType.getNumElements() || block->hasAttr("strides") ||
+        index >= targetType.getNumElements() ||
+        (stream && (index != 0 || targetType.getNumElements() != streamCount)) || block->hasAttr("strides") ||
         block->hasAttr("EmitSkip") || allocation->hasAttr("EmitSkip") ||
         block.getKernelName() != kernel.getKernelName() ||
         allocation.getKernelName() != kernel.getKernelName() ||
         block.getId().empty() || block.getId() != allocation.getId() ||
         !outputObjects.insert(block.getSourceMemref()).second) {
-      reject(block, "output requires a unique scalar LocalMemAlloc with matching identity and constant in-bounds host target");
+      reject(block, "output requires a complete unique LocalMemAlloc with matching identity and constant in-bounds host target");
       return;
     }
     unsigned identities = 0;
@@ -4817,17 +5095,22 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     });
     if (identities != 1 || !writtenElements[target.getArgNumber()].insert(index).second)
       reject(block, "output identity or target offset overlaps");
+    if (stream)
+      for (int64_t element = 1; element < streamCount; ++element)
+        if (!writtenElements[target.getArgNumber()].insert(element).second)
+          reject(block, "stream output target overlaps");
     unsigned stores = 0;
     for (Operation *user : block.getSourceMemref().getUsers()) {
+      if (original && original->isAncestor(user)) continue;
       if (user == block.getOperation()) continue;
       auto store = dyn_cast<affine::AffineStoreOp>(user);
       int64_t offset;
       if (!store || store->getParentOp() != (reduction ? kernel.getOperation() : invocationLoop) ||
-          !constantIndex(store.getAffineMap(), offset) || offset != 0)
-        reject(user, "output requires exactly one direct affine scalar store at offset zero");
+          !(stream ? sequentialStore(store) : (constantIndex(store.getAffineMap(), offset) && offset == 0)))
+        reject(user, "output requires exactly one direct affine store matching the scalar or stream traversal");
       else ++stores;
     }
-    if (stores != 1) reject(block, "output requires exactly one scalar kernel write");
+    if (stores != 1) reject(block, "output requires exactly one kernel write role");
   });
   for (BlockArgument argument : function.getArguments()) {
     auto type = dyn_cast<MemRefType>(argument.getType());
@@ -4840,7 +5123,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
   kernel.walk([&](Operation *op) {
     if (auto store = dyn_cast<affine::AffineStoreOp>(op)) {
       if (!outputObjects.contains(store.getMemref()))
-        reject(op, "store is not part of a validated scalar output");
+        reject(op, "store is not part of a validated output");
     } else if (isa<memref::StoreOp, ADORA::CondStoreOp, affine::AffineVectorStoreOp,
                    mlir::vector::StoreOp, mlir::vector::TransferWriteOp, memref::CopyOp>(op)) {
       reject(op, "unsupported store in bounded dynamic LOAD kernel");
@@ -4874,6 +5157,19 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
           lo.getInt() < -32768 || hi.getInt() > 32767 || lo.getInt() > hi.getInt()) return false;
       out = {lo.getInt(), hi.getInt()}; return true;
     }
+    if (auto select = dyn_cast<arith::SelectOp>(op)) {
+      if (!stream || !select.getType().isSignlessInteger(16)) return false;
+      auto leaf = select.getTrueValue();
+      auto load = leaf.getDefiningOp<affine::AffineLoadOp>();
+      Range fallback;
+      if (!load || !validObject(load.getMemref()) || !sequentialRead(load) ||
+          !range(select.getFalseValue(), fallback, depth + 1)) return false;
+      Range selected{-32768, 32767};
+      refineGuardedRange(select.getCondition(), leaf, selected);
+      if (selected.first > selected.second) return false;
+      out = {std::min(selected.first, fallback.first), std::max(selected.second, fallback.second)};
+      return true;
+    }
     if (auto castOp = dyn_cast<arith::IndexCastOp>(op)) {
       if (!castOp.getIn().getType().isSignlessInteger(16) || !castOp.getOut().getType().isIndex()) return false;
       return range(castOp.getIn(), out, depth + 1);
@@ -4891,11 +5187,13 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
     out = {(int64_t)*limits.first, (int64_t)*limits.second}; return true;
   };
   kernel.walk([&](memref::LoadOp load) {
+    if (stream && hasUnsupportedStreamLoadAttributes(load))
+      reject(load, "stream LOAD attributes including volatile are unsupported");
     auto loop = dyn_cast<affine::AffineForOp>(load->getParentOp());
     if (!loop || loop->getParentOp() != kernel.getOperation() ||
         !loop.hasConstantLowerBound() || !loop.hasConstantUpperBound() ||
         loop.getConstantUpperBound() <= loop.getConstantLowerBound() ||
-        (!reduction && (__int128)loop.getConstantUpperBound() - loop.getConstantLowerBound() > loop.getStep().getSExtValue())) {
+        (!reduction && !stream && (__int128)loop.getConstantUpperBound() - loop.getConstantLowerBound() > loop.getStep().getSExtValue())) {
       reject(load, "requires one direct single-invocation affine loop"); return;
     }
     auto block = validObject(load.getMemref());
@@ -4912,16 +5210,20 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel) {
 LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
                                                   ADORA::KernelOp kernel,
                                                   bool verbose){
-  // Validate the original operation before any normalization or if-conversion.
-  // All subsequent mutations happen on detached copies which replace the
-  // original only after a complete CDFG has been generated successfully.
-  if (failed(preflightSCFIfToSelect(kernel)) ||
-      failed(preflightBoundedDynamicLoads(kernel)))
-    return failure();
-
+  // Legalize guarded reads on a detached copy, then run strict preflights.
+  // The original is replaced only after complete CDFG generation succeeds.
   ADORA::KernelOp fallbackKernel = kernel.clone();
+  if (failed(legalizeGuardedStreamLoads(fallbackKernel))) {
+    fallbackKernel.erase();
+    return failure();
+  }
   kernel.getOperation()->getBlock()->push_back(fallbackKernel);
   fallbackKernel->moveBefore(kernel);
+  if (failed(preflightSCFIfToSelect(fallbackKernel)) ||
+      failed(preflightBoundedDynamicLoads(fallbackKernel, kernel))) {
+    fallbackKernel.erase();
+    return failure();
+  }
 
   // Mark final stores on the validated detached copy before legacy hoisting
   // moves them into the loop. They execute once, after the final ACC sample.
@@ -4937,6 +5239,51 @@ LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
       store->setAttr("adora.final_dynamic_reduction", UnitAttr::get(kernel.getContext()));
   });
 
+  if (hasBoundedReads) {
+    // Use the paired target's SLE/SLT/AND/OR/SUB operations. It does not
+    // provide native NE/EQ/XOR. Run this only after the semantic range proof.
+    SmallVector<arith::CmpIOp> comparisons;
+    fallbackKernel.walk([&](arith::CmpIOp cmp) {
+      if (cmp.getPredicate() == arith::CmpIPredicate::sge ||
+          cmp.getPredicate() == arith::CmpIPredicate::ne ||
+          cmp.getPredicate() == arith::CmpIPredicate::eq) comparisons.push_back(cmp);
+    });
+    for (auto cmp : comparisons) {
+      OpBuilder builder(cmp);
+      mlir::Value replacement;
+      if (cmp.getPredicate() == arith::CmpIPredicate::sge) {
+        replacement = builder.create<arith::CmpIOp>(cmp.getLoc(), arith::CmpIPredicate::sle,
+                                                   cmp.getRhs(), cmp.getLhs());
+      } else {
+        auto predicate = cmp.getPredicate() == arith::CmpIPredicate::ne
+            ? arith::CmpIPredicate::slt : arith::CmpIPredicate::sle;
+        auto lhs = builder.create<arith::CmpIOp>(cmp.getLoc(), predicate, cmp.getLhs(), cmp.getRhs());
+        auto rhs = builder.create<arith::CmpIOp>(cmp.getLoc(), predicate, cmp.getRhs(), cmp.getLhs());
+        if (cmp.getPredicate() == arith::CmpIPredicate::ne)
+          replacement = builder.create<arith::OrIOp>(cmp.getLoc(), lhs, rhs);
+        else replacement = builder.create<arith::AndIOp>(cmp.getLoc(), lhs, rhs);
+      }
+      cmp.replaceAllUsesWith(replacement);
+      cmp.erase();
+    }
+    SmallVector<arith::XOrIOp> xors;
+    fallbackKernel.walk([&](arith::XOrIOp op) { xors.push_back(op); });
+    for (auto op : xors) {
+      OpBuilder builder(op);
+      auto constant = op.getRhs().getDefiningOp<arith::ConstantOp>();
+      auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+      mlir::Value replacement;
+      if (integer && integer.getType().isInteger(1) && integer.getValue().isOne()) {
+        replacement = builder.create<arith::SubIOp>(op.getLoc(), op.getRhs(), op.getLhs());
+      } else {
+        auto either = builder.create<arith::OrIOp>(op.getLoc(), op.getLhs(), op.getRhs());
+        auto both = builder.create<arith::AndIOp>(op.getLoc(), op.getLhs(), op.getRhs());
+        replacement = builder.create<arith::SubIOp>(op.getLoc(), either, both);
+      }
+      op.replaceAllUsesWith(replacement);
+      op.erase();
+    }
+  }
   RemoveConstantTruncF(fallbackKernel);
   if (failed(lowerSCFIfToSelect(fallbackKernel))) {
     fallbackKernel.erase();

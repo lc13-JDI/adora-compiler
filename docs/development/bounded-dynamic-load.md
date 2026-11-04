@@ -12,8 +12,9 @@ SRAM banks, routes and ACC configuration; it does not require a hardware change.
   i16-to-index casts and bounded index addition/multiplication. Index input
   objects declare `adora.value_range = [lo : i64, hi : i64]`; the compiler checks
   every address against the object and representable arithmetic domain.
-- Either a single-invocation affine body, or the fixed-role reduction below.
-  Scalar output allocations and host output copies must cover the full result.
+- A single-invocation affine body, the fixed-role reduction below, or the
+  guarded/sequential stream contract described below. Output allocations and
+  host output copies must cover the full result.
 - The pytest emitter checks buffer shape, dtype, contiguity, aliasing, index
   ranges and writable outputs before starting transfers. C/SDK emission of
   these dynamic LOAD kernels is rejected because it lacks this checked input
@@ -32,6 +33,50 @@ patterns. The final OUTPUT starts `(L-1)*II` later than the ordinary routed
 partial-sum arrival. ACC, IOB timing and address fields must be representable;
 each object must fit an available reachable SRAM bank. A nominal trip-count
 limit alone does not establish legal execution at that length.
+
+## Guarded gather and sequential outputs
+
+A separate fixed stream contract supports one zero-based, unit-step affine
+loop with a constant positive trip count (at most 4095 before physical field
+checks), no carried state, sequential `affine.load input[iv]`, ordinary dynamic
+LOADs, and exactly one `affine.store output[iv]` per output object. Output
+allocations and host copies cover the complete trip-count-sized array. INPUT
+and OUTPUT patterns are `(2,M)` in bytes; LOAD uses `(0,M)` with its explicit
+byte address. OUTPUTs start at their routed latency, without a reduction's
+final-sample delay. Every physical IOB count, stride, latency, II and SRAM
+capacity must still be representable.
+
+Nested or merged `scf.if` reads can be legalized when signed i16 coordinate
+leaves come from sequential INPUTs and actual `sge`/`slt` guard conjunctions
+prove their bounds. The compiler selects each coordinate or zero **before**
+index casts and address multiplication/addition, then issues an ordinary LOAD
+and selects the original branch result or pass-through value. It validates this
+disposable candidate before the existing strict preflights; failure preserves
+the original kernel. The proof binds predicates to the selected SSA leaves,
+checks every address intermediate and the final object extent, and trusts no
+"already safe" annotation. Re-ingestion of normalized swapped-SLE predicates
+retains the same proof. NE/EQ and predicate XOR use equivalent signed
+comparisons, AND/OR and bounded boolean subtraction supported by the paired
+target. Unknown or dependent address loads, division, branch
+writes and integer overflow flags are rejected by this specialization.
+
+These safe-address streams accept the complete signed int16 coordinate domain
+without declaring or scanning a narrower `adora.value_range`. Existing kernels
+that declare a range retain their checked host range contract. Buffer shape,
+contiguity, writable output and pairwise non-aliasing checks still run before
+DMA. Image pixels use the existing int16 transport as bits: pass a contiguous
+uint16 image with `.view(np.int16)` and interpret output with
+`.view(np.uint16)`. This preserves values such as 32768, 60000 and 65535 without
+changing signed coordinate interpretation or claiming general uint16 arithmetic.
+A zero-length application returns outside the kernel without dispatch.
+
+This strategy is **safe-address ordinary LOAD**, not physical predication:
+false iterations still read a valid element of the initialized read-only
+object (element zero for the remap/gather forms). Requests marked
+`adora.require_no_access` or `adora.no_access` on the function, kernel,
+BlockLoad or dynamic load are rejected. No CLOAD opcode or hardware change is
+introduced. The software graph/configuration tests do not constitute RTL or
+board execution.
 
 ## Rejection boundaries
 

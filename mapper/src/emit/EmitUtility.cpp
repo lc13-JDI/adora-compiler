@@ -485,6 +485,37 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
     if (reductionCount && (reductionCount != 2 || dfg->ioNodes().size() != 5))
       reject(0, "bounded loop requires two ACCs and five fixed I/O roles");
   }
+  // Fixed stream roles are separate from final-sample reductions. Infer the
+  // common invocation count from sequential INPUTs, then validate EVERY role.
+  // No OUTPUT start delay is added: every routed sample must be written.
+  int streamCycles = 0;
+  if (boundedLoads && !reductionCount) {
+    for (int id : dfg->ioNodes()) {
+      auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
+      if (io && io->operation() == "INPUT" && io->pattern().size() == 1 &&
+          io->pattern()[0].first == 2) {
+        int count = io->pattern()[0].second;
+        if (count <= 0 || (streamCycles && streamCycles != count))
+          reject(id, "stream INPUT counts must agree and be positive");
+        streamCycles = count;
+      }
+    }
+    if (streamCycles) {
+      unsigned outputs = 0;
+      for (int id : dfg->ioNodes()) {
+        auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
+        if (!io) { reject(id, "stream requires I/O nodes"); continue; }
+        const auto role = io->operation();
+        if (role == "OUTPUT") ++outputs;
+        if ((role != "INPUT" && role != "OUTPUT" && role != "LOAD") ||
+            io->additionalStartDelay() != 0 || io->reducedMemOffset() != 0 ||
+            (role == "OUTPUT" && io->memSize() != int64_t(streamCycles) * 2) ||
+            (role == "INPUT" && io->memSize() < int64_t(streamCycles) * 2))
+          reject(id, "stream requires full sequential input/output objects and ordinary LOAD roles");
+      }
+      if (!outputs) reject(0, "stream requires a complete output array");
+    }
+  }
   // Validate before indexing topology or allocating any SRAM objects.
   for (int id : dfg->ioNodes()) {
     auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
@@ -525,6 +556,8 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       std::pair<int, int> expected(0, 1);
       if (reductionCount && io->operation() != "OUTPUT")
         expected = {io->operation() == "INPUT" ? 2 : 0, reductionCycles};
+      if (streamCycles)
+        expected = {io->operation() == "LOAD" ? 0 : 2, streamCycles};
       if (io->pattern().size() != 1 || io->pattern()[0] != expected ||
           !fitsField(iob, "Cycles0", expected.second) ||
           !fitsField(iob, "Stride0", expected.first / 2))
