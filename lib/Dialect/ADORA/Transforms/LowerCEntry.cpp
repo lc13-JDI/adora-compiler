@@ -22,6 +22,7 @@ struct Object {
   int64_t elements;
   std::string dtype;
   bool write;
+  bool partial = false;
   unsigned reads = 0, writes = 0;
 };
 using Range = std::pair<int64_t, int64_t>;
@@ -138,8 +139,11 @@ void LowerCEntryPass::runOnOperation() {
     if (!elements || *elements <= 0 || *elements > bankBytes / 2)
       return reject("object elements must be positive and fit one target bank");
     if (!dtype || (*dtype != "int16" && *dtype != "uint16") ||
-        !access || (*access != "read" && *access != "write") || !contiguous || !*contiguous)
-      return reject("objects require int16/uint16 dtype, read/write effects and contiguous=true");
+        !access || (*access != "read" && *access != "write" && *access != "inout") ||
+        !contiguous || !*contiguous)
+      return reject("objects require int16/uint16 dtype, read/write/inout effects and contiguous=true");
+    if (*access == "inout" && !allowPartialWrites)
+      return reject("inout requires explicit allow-partial-writes=true");
     auto type = dyn_cast<MemRefType>(function.getArgument(*pos).getType());
     if (!type || type.getRank() != 1 || !type.getElementType().isSignlessInteger(16) ||
         !type.getLayout().isIdentity() || type.getMemorySpace())
@@ -147,7 +151,7 @@ void LowerCEntryPass::runOnOperation() {
     if (!type.isDynamicDim(0) && type.getDimSize(0) != *elements)
       return reject("object contract length contradicts static memref shape");
     seen[*pos] = true;
-    objects[*pos] = {*elements, dtype->str(), *access == "write"};
+    objects[*pos] = {*elements, dtype->str(), *access != "read", *access == "inout"};
   }
   // Any other function could call the entry with the old ABI or introduce
   // effects outside the declared kernel. This explicit profile is one entry.
@@ -223,21 +227,29 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   bool hasLoop = false;
   function.walk([&](Operation *op) { hasLoop |= isa<scf::ForOp, affine::AffineForOp>(op); });
   if (!hasLoop) {
-    // A complete unconditional store to the only one-element output proves
-    // this is a one-item computation. Wrapping it in 0..1 changes no execution
-    // count, and each direct zero-indexed stream read remains the same access.
+    // One zero-index store to the only one-element output identifies a
+    // one-item computation. In partial mode it may be guarded, but must stay
+    // on a nested true path. Wrapping in 0..1 changes no execution count.
     unsigned outputs = 0, stores = 0;
     for (const auto &object : objects) if (object.write) {
       ++outputs;
       if (object.elements != 1)
         return reject(function, "loop-free entry requires a one-element output");
     }
-    for (auto store : function.getOps<memref::StoreOp>()) {
+    function.walk([&](memref::StoreOp store) {
       auto arg = dyn_cast<BlockArgument>(store.getMemref());
-      if (arg && arg.getOwner() == &function.front() && objects[arg.getArgNumber()].write &&
-          store.getIndices().size() == 1 && constant(store.getIndices()[0]) == 0)
-        ++stores;
-    }
+      if (!arg || arg.getOwner() != &function.front() || !objects[arg.getArgNumber()].write ||
+          store.getIndices().size() != 1 || constant(store.getIndices()[0]) != 0) return;
+      bool partial = objects[arg.getArgNumber()].partial;
+      if (!partial && store->getParentOp() != function.getOperation()) return;
+      Operation *child = store;
+      for (Operation *parent = store->getParentOp(); parent != function.getOperation();
+           child = parent, parent = parent->getParentOp()) {
+        auto branch = dyn_cast<scf::IfOp>(parent);
+        if (!partial || !branch || child->getParentRegion() != &branch.getThenRegion()) return;
+      }
+      ++stores;
+    });
     if (outputs != 1 || stores != 1)
       return reject(function, "loop-free entry requires one unconditional zero-indexed output store");
     OpBuilder builder(&function.front(), function.front().begin());
@@ -254,6 +266,12 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
           store.getIndicesMutable().assign(ValueRange{single.getInductionVar()});
       }
     }
+    single.walk([&](memref::StoreOp store) {
+      auto arg = dyn_cast<BlockArgument>(store.getMemref());
+      if (arg && arg.getOwner() == &function.front() && objects[arg.getArgNumber()].partial &&
+          store.getIndices().size() == 1 && constant(store.getIndices()[0]) == 0)
+        store.getIndicesMutable().assign(ValueRange{single.getInductionVar()});
+    });
   }
   Operation *loop = nullptr;
   Value iv;
@@ -286,6 +304,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   DenseMap<Value, unsigned> positions;
   for (auto arg : function.getArguments()) positions[arg] = arg.getArgNumber();
   SmallVector<memref::LoadOp> dynamicLoads;
+  SmallVector<memref::StoreOp> conditionalStores;
   SmallVector<Operation *> linearMemory;
   SmallVector<arith::CmpIOp> comparisons;
   bool bad = false;
@@ -293,7 +312,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   loop->walk([&](Operation *op) {
     if (op == loop) return;
     if (!isa<scf::IfOp, scf::YieldOp, affine::AffineYieldOp,
-             arith::ConstantOp, arith::ExtSIOp, arith::CmpIOp,
+             arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::CmpIOp,
              arith::AndIOp, arith::IndexCastOp, arith::AddIOp,
              arith::MulIOp, memref::LoadOp, memref::StoreOp,
              affine::AffineLoadOp, affine::AffineStoreOp>(op)) {
@@ -308,10 +327,16 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
     if (auto ext = dyn_cast<arith::ExtSIOp>(op))
       if (!ext.getIn().getType().isInteger(16) || !ext.getType().isInteger(32))
         error(op, "only i16 to i32 signed C promotions are supported");
-    if (auto branch = dyn_cast<scf::IfOp>(op))
-      if (branch.getNumResults() != 1 || !branch.getResult(0).getType().isInteger(16) ||
-          branch.getElseRegion().empty())
+    if (auto ext = dyn_cast<arith::ExtUIOp>(op))
+      if (!allowPartialWrites || !ext.getIn().getType().isInteger(16) || !ext.getType().isInteger(32))
+        error(op, "unsigned promotion requires partial-write i16 loaded-value zero comparison");
+    if (auto branch = dyn_cast<scf::IfOp>(op)) {
+      bool valueSelection = branch.getNumResults() == 1 &&
+          branch.getResult(0).getType().isInteger(16) && !branch.getElseRegion().empty();
+      bool conditionalWrite = allowPartialWrites && branch.getNumResults() == 0;
+      if (!valueSelection && !conditionalWrite)
         error(op, "branch must select an i16 value with an explicit fallback");
+    }
     if (auto cmp = dyn_cast<arith::CmpIOp>(op)) comparisons.push_back(cmp);
     Value memref; Value index; bool write = false;
     if (auto load = dyn_cast<memref::LoadOp>(op)) {
@@ -345,6 +370,25 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
     if (!positions.count(memref) || !index) { error(op, "memory must address a declared whole object"); return; }
     auto &object = objects[positions[memref]];
     if (write) ++object.writes; else ++object.reads;
+    if (!write && object.partial)
+      error(op, "explicit inout reads/feedback are unsupported; old values are preserved by initialization");
+    if (write && op->getParentOp() != loop) {
+      if (!allowPartialWrites || !object.partial) {
+        error(op, "conditional write effects require an inout object and allow-partial-writes=true");
+        return;
+      }
+      if (index != iv) { error(op, "conditional output must use the same iteration index"); return; }
+      Operation *child = op;
+      for (Operation *parent = op->getParentOp(); parent != loop;
+           child = parent, parent = parent->getParentOp()) {
+        auto branch = dyn_cast<scf::IfOp>(parent);
+        if (!branch || branch.getNumResults() || child->getParentRegion() != &branch.getThenRegion()) {
+          error(op, "conditional output requires a nested true guard path without results"); return;
+        }
+      }
+      conditionalStores.push_back(cast<memref::StoreOp>(op));
+      return;
+    }
     if (index == iv && op->getParentOp() == loop) {
       if (object.elements < trips) error(op, "object length is smaller than the stream trip count");
       linearMemory.push_back(op);
@@ -356,13 +400,24 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   for (auto &object : objects) {
     if (object.write) {
       ++outputs;
-      if (object.reads || object.writes != 1 || object.elements != trips)
+      if (object.partial) {
+        if (object.reads || object.writes != 1 || conditionalStores.size() != 1 ||
+            object.elements != trips || object.dtype != "uint16")
+          error(function, "inout effects require one conditional uint16 output store, no explicit reads, and length equal to trip count");
+      } else if (object.reads || object.writes != 1 || object.elements != trips)
         error(function, "write effects require one complete unconditional output stream");
     } else if (!object.reads || object.writes)
       error(function, "read effects contradict the object contract");
   }
   if (outputs != 1) error(function, "requires exactly one write object");
   if (bad) return failure();
+  if (!conditionalStores.empty()) {
+    if (dynamicLoads.size() != 1 || conditionalStores.front().getValue() != dynamicLoads.front().getResult())
+      return reject(function, "conditional output requires exactly one guarded source loaded value");
+    const auto &source = objects[positions[dynamicLoads.front().getMemref()]];
+    if (source.write || source.dtype != "uint16" || source.reads != 1)
+      return reject(function, "conditional source must be a single read-only uint16 loaded value");
+  }
 
   // Comparison narrowing is exact only for sign extensions and representable
   // signed constants. Unsigned promoted comparisons and arbitrary i32 reject.
@@ -376,6 +431,21 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
       return reject(cmp, "unsigned comparison of promoted coordinates is unsupported");
     OpBuilder builder(cmp);
     Value lhs = signedLeaf(cmp.getLhs()), rhs = signedLeaf(cmp.getRhs());
+    // C promotes an unsigned-short pixel to i32 with extui. Equality with
+    // zero is bit-exact at either width, including 0x8000 and 0xffff. This does
+    // not authorize signed ordering, general unsigned comparisons or addresses.
+    auto narrowUnsignedZero = [&](Value value, Value other) -> Value {
+      auto ext = value.getDefiningOp<arith::ExtUIOp>();
+      if (!ext) return value;
+      auto load = ext.getIn().getDefiningOp<memref::LoadOp>();
+      if (!allowPartialWrites || (pred != P::eq && pred != P::ne) || constant(other) != 0 ||
+          !load || !llvm::is_contained(dynamicLoads, load) ||
+          objects[positions[load.getMemref()]].dtype != "uint16") return {};
+      return ext.getIn();
+    };
+    lhs = narrowUnsignedZero(lhs, rhs);
+    rhs = narrowUnsignedZero(rhs, cmp.getLhs());
+    if (!lhs || !rhs) return reject(cmp, "unsigned pixel promotion only supports an exact zero comparison");
     auto narrow = [&](Value value) -> Value {
       if (value.getType().isInteger(16)) return value;
       auto c = constant(value);
@@ -469,7 +539,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
     changed = false;
     SmallVector<Operation *> dead;
     function.walk([&](Operation *op) {
-      if (isa<arith::ExtSIOp, arith::IndexCastOp, arith::AddIOp, arith::MulIOp, arith::ConstantOp>(op) &&
+      if (isa<arith::ExtSIOp, arith::ExtUIOp, arith::IndexCastOp, arith::AddIOp, arith::MulIOp, arith::ConstantOp>(op) &&
           op->use_empty()) dead.push_back(op);
     });
     for (auto *op : llvm::reverse(dead)) { op->erase(); changed = true; }
@@ -497,7 +567,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
     auto &object = objects[arg.getArgNumber()];
     auto type = cast<MemRefType>(arg.getType());
     Operation *transfer;
-    if (object.write)
+    if (object.write && !object.partial)
       transfer = builder.create<LocalMemAllocOp>(function.getLoc(), type, kernelName);
     else
       transfer = builder.create<DataBlockLoadOp>(function.getLoc(), arg, zeroMap, ValueRange{}, type, kernelName);

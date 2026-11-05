@@ -2807,6 +2807,30 @@ static bool IsExclusiveLoopCStorePredicateLoad(mlir::Operation *owner,
   return DependsOnValue(store.getIndices().front(), source, visitingAddress);
 }
 
+// Sequential INPUT indices are controller metadata, not routed copies of the
+// loop-index ACC. Permit this role only for the bounded LOAD+CSTORE contract;
+// its object/range/effect preflight is run before CDFG construction.
+static bool IsSequentialDynamicCStoreInput(mlir::Operation *owner, mlir::Value source) {
+  auto load = dyn_cast<affine::AffineLoadOp>(owner);
+  auto loop = source.getParentBlock() ? dyn_cast<affine::AffineForOp>(source.getParentBlock()->getParentOp()) : affine::AffineForOp();
+  if (!load || !loop || source != loop.getInductionVar() ||
+      !isa<ADORA::KernelOp>(loop->getParentOp()) || load->getParentOp() != loop.getOperation() ||
+      loop.getNumResults() || !loop.hasConstantLowerBound() || !loop.hasConstantUpperBound() ||
+      loop.getConstantLowerBound() != 0 || loop.getStep().getSExtValue() != 1 ||
+      loop.getConstantUpperBound() <= 0 || loop.getConstantUpperBound() > 4095 ||
+      !load.getMemref().getDefiningOp<ADORA::DataBlockLoadOp>() ||
+      !load.getMemRefType().hasStaticShape() || load.getMemRefType().getRank() != 1 ||
+      !load.getType().isSignlessInteger(16) ||
+      load.getMemRefType().getNumElements() < loop.getConstantUpperBound()) return false;
+  auto map = load.getAffineMap();
+  if (map.getNumDims() != 1 || map.getNumSymbols() || map.getNumResults() != 1 ||
+      map.getResult(0) != getAffineDimExpr(0, loop.getContext()) ||
+      load.getMapOperands().size() != 1 || load.getMapOperands()[0] != source) return false;
+  bool dynamic = false;
+  loop.walk([&](memref::LoadOp read) { if (read->getParentOp() == loop.getOperation()) dynamic = true; });
+  return dynamic;
+}
+
 static bool IsPhysicalMemoryLeaf(mlir::Operation *owner) {
   return isa<affine::AffineLoadOp, affine::AffineStoreOp, memref::LoadOp,
              memref::StoreOp>(owner);
@@ -2833,7 +2857,8 @@ static CStoreIVUseFacts ClassifyCStoreIVUses(
     // metadata. Keep this fact distinct from a CSTORE-related unsupported
     // transformation so a CSTORE address plus another live leaf fails closed.
     if (IsPhysicalMemoryLeaf(owner)) {
-      if (IsExclusiveLoopCStorePredicateLoad(owner, value))
+      if (IsExclusiveLoopCStorePredicateLoad(owner, value) ||
+          IsSequentialDynamicCStoreInput(owner, value))
         continue;
       facts.hasOtherLiveLeaf = true;
       continue;
@@ -3438,7 +3463,8 @@ static void fixSELOperandIndices(LLVMCDFG *CDFG, bool verbose) {
   }
 }
 
-bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp kernel, bool verbose){
+bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp kernel,
+                                             bool verbose, bool certifiedBoundedInout){
   if(verbose) {kernel.dump();}
   _kernel_toDFG = &kernel;
 
@@ -4317,6 +4343,16 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     for (size_t i = 1; i < orderedMemoryOps.size(); ++i) {
       Operation *previous = orderedMemoryOps[i - 1];
       Operation *current = orderedMemoryOps[i];
+      // Only the successful bounded-inout preflight authorizes this exception:
+      // every read object is a read-only BlockLoad, distinct from the sole
+      // initialized destination, and the complete effect set is validated.
+      // Thus removing a read/read link cannot lose a transitive WAR ordering
+      // to a later write. A source attribute cannot manufacture this proof.
+      // All legacy chains and every edge involving a write remain intact.
+      if (certifiedBoundedInout &&
+          isa<affine::AffineLoadOp, memref::LoadOp>(previous) &&
+          isa<affine::AffineLoadOp, memref::LoadOp>(current))
+        continue;
       LLVMCDFGNode *sourceNode = CDFG->node(previous);
       LLVMCDFGNode *targetNode = CDFG->node(current);
       if (!CDFG->edge(sourceNode, targetNode)) {
@@ -4542,8 +4578,8 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
 
 // The memref builder materializes the default nontemporal=false property.
 // Accept that default, while rejecting unmodeled memory-access requirements.
-static bool hasUnsupportedStreamLoadAttributes(memref::LoadOp load) {
-  for (auto attr : load->getAttrs()) {
+static bool hasUnsupportedStreamMemoryAttributes(Operation *op) {
+  for (auto attr : op->getAttrs()) {
     auto flag = dyn_cast<BoolAttr>(attr.getValue());
     if (attr.getName().strref() == "nontemporal" && flag && !flag.getValue()) continue;
     return true;
@@ -4638,12 +4674,12 @@ static LogicalResult legalizeGuardedStreamLoads(ADORA::KernelOp kernel) {
     if (auto mul = dyn_cast<arith::MulIOp>(op))
       if (mul.getOverflowFlags() != arith::IntegerOverflowFlags::none)
         reject(op, "branch arithmetic overflow flags can create poison and are unsupported");
-    if (!isa<scf::IfOp, scf::YieldOp, memref::LoadOp, arith::ConstantOp,
+    if (!isa<scf::IfOp, scf::YieldOp, memref::LoadOp, memref::StoreOp, arith::ConstantOp,
              arith::CmpIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
              arith::SelectOp, arith::IndexCastOp, arith::AddIOp, arith::MulIOp>(op))
       reject(op, "unsupported branch effect or address operation");
     if (auto load = dyn_cast<memref::LoadOp>(op))
-      if (hasUnsupportedStreamLoadAttributes(load))
+      if (hasUnsupportedStreamMemoryAttributes(load.getOperation()))
         reject(op, "load attributes including volatile/no-access are unsupported");
   });
   if (invalid) return failure();
@@ -4712,6 +4748,16 @@ static LogicalResult legalizeGuardedStreamLoads(ADORA::KernelOp kernel) {
           if (!address) { reject(load, "address slice requires guard-proven nonnegative coordinate leaves; dependent loads are unsupported"); return {}; }
           auto copy = builder.create<memref::LoadOp>(op.getLoc(), load.getMemref(), ValueRange{address});
           mapping.map(load.getResult(), copy.getResult());
+        } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
+          if (!path || store.getIndices().size() != 1 ||
+              store.getIndices()[0] != loop.getInductionVar() ||
+              !store.getValue().getType().isSignlessInteger(16) ||
+              hasUnsupportedStreamMemoryAttributes(store.getOperation())) {
+            reject(store, "conditional write requires unadorned i16 dst[iv]");
+            return {};
+          }
+          builder.create<ADORA::CondStoreOp>(op.getLoc(), mapping.lookupOrDefault(store.getValue()),
+              store.getMemref(), store.getIndices(), path);
         } else {
           builder.clone(op, mapping);
         }
@@ -4746,7 +4792,9 @@ static LogicalResult legalizeGuardedStreamLoads(ADORA::KernelOp kernel) {
 // Validate the disposable candidate before optimization, so fallback cannot
 // bypass the contract. The original kernel is still present only for rollback.
 static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
+                                                   bool &certifiedBoundedInout,
                                                    ADORA::KernelOp original = {}) {
+  certifiedBoundedInout = false;
   bool invalid = false;
   auto reject = [&](Operation *op, StringRef why) {
     op->emitError("bounded dynamic LOAD: ") << why;
@@ -4822,7 +4870,14 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     if (!isHostArgument(block.getTargetMemref()))
       reject(block, "BlockStore target must be a function argument");
   });
-  auto validObject = [&](mlir::Value value) -> ADORA::DataBlockLoadOp {
+  llvm::DenseSet<mlir::Value> inoutObjects;
+  unsigned conditionalWrites = 0, dynamicReads = 0;
+  kernel.walk([&](ADORA::CondStoreOp store) {
+    inoutObjects.insert(store.getMemref());
+    ++conditionalWrites;
+  });
+  kernel.walk([&](memref::LoadOp) { ++dynamicReads; });
+  auto validObject = [&](mlir::Value value, bool allowInout = false) -> ADORA::DataBlockLoadOp {
     auto block = value.getDefiningOp<ADORA::DataBlockLoadOp>();
     auto type = dyn_cast<MemRefType>(value.getType());
     if (!block || !type || !type.hasStaticShape() || type.getRank() != 1 ||
@@ -4854,9 +4909,17 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     });
     function.walk([&](ADORA::KernelOp other) { if (other != original) ++kernels; });
     if (names != 1 || kernels != 1) return {};
+    bool inout = inoutObjects.contains(value);
+    if (inout && !allowInout) return {};
     for (Operation *user : value.getUsers()) {
-      if (!isa<memref::LoadOp, affine::AffineLoadOp>(user) ||
-          !(kernel->isAncestor(user) || (original && original->isAncestor(user)))) return {};
+      if (inout) {
+        // The original structured stores are present only for rollback. The
+        // disposable candidate supplies the complete validated effect set.
+        if (original && original->isAncestor(user)) continue;
+        if (isa<ADORA::DataBlockStoreOp>(user)) continue;
+        if (!isa<ADORA::CondStoreOp>(user) || !kernel->isAncestor(user)) return {};
+      } else if (!isa<memref::LoadOp, affine::AffineLoadOp>(user) ||
+                 !(kernel->isAncestor(user) || (original && original->isAncestor(user)))) return {};
     }
     return block;
   };
@@ -4883,6 +4946,8 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       reject(reductionLoop, "stream requires lower zero, unit step and positive bounded constant length");
     else streamCount = reductionLoop.getConstantUpperBound();
   }
+  if (hasCStore && (!stream || conditionalWrites != 1 || dynamicReads != 1 || inoutObjects.size() != 1))
+    reject(kernel, "conditional stream requires one dynamic LOAD and one initialized sequential CSTORE role");
   int64_t reductionCount = 1;
   affine::AffineLoadOp sequentialInput;
   if (reduction) {
@@ -4944,6 +5009,9 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       }
       if (auto store = dyn_cast<affine::AffineStoreOp>(user)) {
         if (sequentialStore(store)) continue;
+      }
+      if (auto store = dyn_cast<ADORA::CondStoreOp>(user)) {
+        if (store.getIndices().size() == 1 && store.getIndices()[0] == reductionLoop.getInductionVar()) continue;
       }
       reject(user, "stream induction variable may only index sequential INPUT/OUTPUT roles");
     }
@@ -5036,6 +5104,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       }
       return;
     }
+    if (stream && isa<ADORA::CondStoreOp>(op)) return;
     if (!isa<affine::AffineYieldOp, arith::ConstantOp, arith::AddIOp,
              arith::MulIOp, arith::IndexCastOp, arith::SelectOp,
              memref::LoadOp, affine::AffineLoadOp, affine::AffineStoreOp>(op))
@@ -5051,9 +5120,9 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
   llvm::DenseSet<mlir::Value> inputs, outputObjects;
   std::map<unsigned, std::set<int64_t>> writtenElements;
   function.walk([&](ADORA::DataBlockLoadOp block) {
-    inputs.insert(block.getOriginalMemref());
-    if (!validObject(block.getResult()))
-      reject(block, "all read objects must satisfy the read-only BlockLoad contract");
+    if (!inoutObjects.contains(block.getResult())) inputs.insert(block.getOriginalMemref());
+    if (!validObject(block.getResult(), /*allowInout=*/true))
+      reject(block, "all objects must satisfy the read-only or initialized-inout BlockLoad contract");
   });
   kernel.walk([&](affine::AffineLoadOp load) {
     int64_t index;
@@ -5063,6 +5132,43 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       reject(load, "affine reads must be constant in-object reads in the invocation loop");
   });
   function.walk([&](ADORA::DataBlockStoreOp block) {
+    if (inoutObjects.contains(block.getSourceMemref())) {
+      auto initial = validObject(block.getSourceMemref(), /*allowInout=*/true);
+      auto target = dyn_cast<BlockArgument>(block.getTargetMemref());
+      auto type = dyn_cast<MemRefType>(block.getSourceMemref().getType());
+      auto map = block->getAttrOfType<AffineMapAttr>("map");
+      int64_t offset;
+      if (!stream || !initial || !target || !isHostArgument(target) || inputs.contains(target) ||
+          initial.getOriginalMemref() != target || block.getSourceMemref().getType() != target.getType() ||
+          !type || type.getNumElements() != streamCount || !map ||
+          !constantIndex(map.getValue(), offset) || offset != 0 ||
+          block->hasAttr("strides") || block->hasAttr("EmitSkip") ||
+          block.getKernelName() != kernel.getKernelName() || block.getId() != initial.getId() ||
+          !outputObjects.insert(block.getSourceMemref()).second) {
+        reject(block, "inout requires a full initialized BlockLoad and matching same-argument BlockStore");
+        return;
+      }
+      unsigned writes = 0;
+      for (Operation *user : block.getSourceMemref().getUsers()) {
+        if (user == block.getOperation() || (original && original->isAncestor(user))) continue;
+        auto store = dyn_cast<ADORA::CondStoreOp>(user);
+        auto read = store ? store.getValue().getDefiningOp<memref::LoadOp>() : memref::LoadOp();
+        if (!store || store->getParentOp() != invocationLoop || store.getIndices().size() != 1 ||
+            store.getIndices()[0] != reductionLoop.getInductionVar() || !read ||
+            read.getMemref() == store.getMemref() || !store->getAttrs().empty())
+          reject(user, "inout requires one direct CSTORE of the loaded sample at dst[iv], without feedback");
+        else ++writes;
+      }
+      if (writes != 1) reject(block, "inout requires exactly one conditional write role");
+      for (int64_t element = 0; element < streamCount; ++element)
+        if (!writtenElements[target.getArgNumber()].insert(element).second)
+          reject(block, "inout host target overlaps another output");
+      return;
+    }
+    if (hasCStore) {
+      reject(block, "conditional stream permits only its one initialized inout output");
+      return;
+    }
     auto allocation = block.getSourceMemref().getDefiningOp<ADORA::LocalMemAllocOp>();
     auto sourceType = dyn_cast<MemRefType>(block.getSourceMemref().getType());
     auto targetType = dyn_cast<MemRefType>(block.getTargetMemref().getType());
@@ -5124,7 +5230,10 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     if (auto store = dyn_cast<affine::AffineStoreOp>(op)) {
       if (!outputObjects.contains(store.getMemref()))
         reject(op, "store is not part of a validated output");
-    } else if (isa<memref::StoreOp, ADORA::CondStoreOp, affine::AffineVectorStoreOp,
+    } else if (auto store = dyn_cast<ADORA::CondStoreOp>(op)) {
+      if (!stream || !outputObjects.contains(store.getMemref()))
+        reject(op, "CSTORE is not part of a validated initialized inout output");
+    } else if (isa<memref::StoreOp, affine::AffineVectorStoreOp,
                    mlir::vector::StoreOp, mlir::vector::TransferWriteOp, memref::CopyOp>(op)) {
       reject(op, "unsupported store in bounded dynamic LOAD kernel");
     }
@@ -5187,7 +5296,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     out = {(int64_t)*limits.first, (int64_t)*limits.second}; return true;
   };
   kernel.walk([&](memref::LoadOp load) {
-    if (stream && hasUnsupportedStreamLoadAttributes(load))
+    if (stream && hasUnsupportedStreamMemoryAttributes(load.getOperation()))
       reject(load, "stream LOAD attributes including volatile are unsupported");
     auto loop = dyn_cast<affine::AffineForOp>(load->getParentOp());
     if (!loop || loop->getParentOp() != kernel.getOperation() ||
@@ -5204,6 +5313,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       reject(load, "requires unique read-only rank1 i16 BlockLoad and proven in-object address; index BlockLoad needs valid adora.value_range");
     }
   });
+  certifiedBoundedInout = !invalid && hasCStore && stream;
   return failure(invalid);
 }
 
@@ -5219,8 +5329,9 @@ LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
   }
   kernel.getOperation()->getBlock()->push_back(fallbackKernel);
   fallbackKernel->moveBefore(kernel);
+  bool certifiedBoundedInout = false;
   if (failed(preflightSCFIfToSelect(fallbackKernel)) ||
-      failed(preflightBoundedDynamicLoads(fallbackKernel, kernel))) {
+      failed(preflightBoundedDynamicLoads(fallbackKernel, certifiedBoundedInout, kernel))) {
     fallbackKernel.erase();
     return failure();
   }
@@ -5330,7 +5441,7 @@ LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
   };
 
   /// Generate
-  if(generateCDFGfromKernelAfterOptimization(CDFG, optimizedKernel, verbose)){
+  if(generateCDFGfromKernelAfterOptimization(CDFG, optimizedKernel, verbose, certifiedBoundedInout)){
     kernel->getRegion(0).takeBody(optimizedKernel->getRegion(0));
     optimizedKernel.erase();
     fallbackKernel.erase();
@@ -5340,7 +5451,7 @@ LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
     if(verbose) optimizedKernel.dump();
     if(verbose) fallbackKernel.dump();
     resetCDFG();
-    if(generateCDFGfromKernelAfterOptimization(CDFG, fallbackKernel, verbose)){
+    if(generateCDFGfromKernelAfterOptimization(CDFG, fallbackKernel, verbose, certifiedBoundedInout)){
       kernel->getRegion(0).takeBody(fallbackKernel->getRegion(0));
       optimizedKernel.erase();
       fallbackKernel.erase();

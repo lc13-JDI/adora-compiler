@@ -464,12 +464,27 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
   // Its scalar OUTPUT must sample the last sum, (L-1)*II cycles later. The
   // route stays live throughout; only the OUTPUT controller's start is delayed.
   int reductionCycles = 0, reductionCount = 0;
+  int indexCycles = 0, indexCount = 0;
   if (boundedLoads) {
     for (auto entry : dfg->nodes()) {
       auto *node = entry.second;
       if (!node->accumulative()) continue;
-      ++reductionCount;
       auto *pe = dynamic_cast<FUNode *>(mapper->_mapping->dfgNodeAttr(entry.first).adgNode);
+      if (node->isLoopIndexAcc()) {
+        ++indexCount;
+        indexCycles = node->cycles();
+        // The established index-ACC configuration uses slot-gated WI=1,
+        // Latency=0 and SkipFirst=1, independent of reduction scheduling.
+        if (node->operation() != "ACC" || node->initVal() != 0 || node->interval() != 1 ||
+            node->repeats() != 1 || node->isAccFirst() || node->cycles() <= 0 ||
+            mapper->_mapping->dfgNodeAttr(entry.first).lat != node->opLatency() ||
+            !fitsField(pe, "WI", 1) || !fitsField(pe, "Latency", 0) ||
+            !fitsField(pe, "Cycles", node->cycles()) || !fitsField(pe, "Repeats", 1) ||
+            !fitsField(pe, "InitVal", 0) || !fitsField(pe, "SkipFirst", 1))
+          reject(entry.first, "conditional stream requires representable index-ACC timing");
+        continue;
+      }
+      ++reductionCount;
       int64_t wi = int64_t(node->interval()) * mapper->_mapping->II();
       int64_t lat = mapper->_mapping->dfgNodeAttr(entry.first).lat - node->opLatency();
       if (node->operation() != "ACC" || node->initVal() != 0 ||
@@ -501,19 +516,23 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       }
     }
     if (streamCycles) {
-      unsigned outputs = 0;
+      unsigned outputs = 0, conditionalOutputs = 0;
       for (int id : dfg->ioNodes()) {
         auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
         if (!io) { reject(id, "stream requires I/O nodes"); continue; }
         const auto role = io->operation();
-        if (role == "OUTPUT") ++outputs;
-        if ((role != "INPUT" && role != "OUTPUT" && role != "LOAD") ||
+        if (role == "OUTPUT" || role == "CSTORE") ++outputs;
+        if (role == "CSTORE") ++conditionalOutputs;
+        if ((role != "INPUT" && role != "OUTPUT" && role != "LOAD" && role != "CSTORE") ||
             io->additionalStartDelay() != 0 || io->reducedMemOffset() != 0 ||
-            (role == "OUTPUT" && io->memSize() != int64_t(streamCycles) * 2) ||
+            ((role == "OUTPUT" || role == "CSTORE") && io->memSize() != int64_t(streamCycles) * 2) ||
             (role == "INPUT" && io->memSize() < int64_t(streamCycles) * 2))
           reject(id, "stream requires full sequential input/output objects and ordinary LOAD roles");
       }
       if (!outputs) reject(0, "stream requires a complete output array");
+      if ((conditionalOutputs && (conditionalOutputs != 1 || outputs != 1 || indexCount != 1 || indexCycles != streamCycles)) ||
+          (!conditionalOutputs && indexCount))
+        reject(0, "conditional stream requires one full-length CSTORE and matching index ACC");
     }
   }
   // Validate before indexing topology or allocating any SRAM objects.
@@ -557,7 +576,12 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       if (reductionCount && io->operation() != "OUTPUT")
         expected = {io->operation() == "INPUT" ? 2 : 0, reductionCycles};
       if (streamCycles)
-        expected = {io->operation() == "LOAD" ? 0 : 2, streamCycles};
+        expected = {(io->operation() == "LOAD" || io->operation() == "CSTORE") ? 0 : 2, streamCycles};
+      if (io->operation() == "CSTORE" &&
+          (!fitsField(iob, "UseEn", 1) || !fitsField(iob, "IsStore", 1) ||
+           io->inputEdges().size() != 3 || !io->inputEdges().count(0) ||
+           !io->inputEdges().count(1) || !io->inputEdges().count(2)))
+        reject(id, "conditional stream requires data/address/predicate ports and physical write-enable fields");
       if (io->pattern().size() != 1 || io->pattern()[0] != expected ||
           !fitsField(iob, "Cycles0", expected.second) ||
           !fitsField(iob, "Stride0", expected.first / 2))
@@ -682,6 +706,20 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       for(auto& id : IONodes){
         DFGIONode* IoNode = dynamic_cast<DFGIONode*>(dfg->node(id));
         if(IoNode->memRefName() == BlockStoreName){
+          if (boundedLoads && IoNode->operation() == "CSTORE") {
+            auto initial = blockstore.getSourceMemref().getDefiningOp<ADORA::DataBlockLoadOp>();
+            auto found = dfg_io_infos.find(id);
+            if (!initial || initial.getOriginalMemref() != blockstore.getTargetMemref() ||
+                found == dfg_io_infos.end() || _LoadToDfgIoInfos[initial].size() != 1 ||
+                _LoadToDfgIoInfos[initial][0].addr != found->second.addr ||
+                _StoreToDfgIoInfo.count(blockstore)) {
+              reject(id, "conditional output must reuse its initialized same-object SRAM binding");
+              return;
+            }
+            // H2D(old dst), kernel CSTORE and D2H must share one allocation.
+            _StoreToDfgIoInfo[blockstore] = found->second;
+            continue;
+          }
           int memSize = dynamic_cast<DFGIONode*>(dfg->node(id))->memSize();
           int spadDataByte = adg->cfgSpadDataWidth() / 8; // dual ports of cfg-spad have the same width 
           memSize = (memSize + spadDataByte - 1) / spadDataByte * spadDataByte; // align to spadDataByte

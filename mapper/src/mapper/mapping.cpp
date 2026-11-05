@@ -1418,7 +1418,13 @@ void Mapping::latencySchedule(){
             // if all its output ports are connected to DFG output ports, keep original latency
             // otherwise, update the latency
             // int targetLat = _dfgNodeAttr[nodeId].lat; 
-            if(updated){
+            // The index ACC is an autonomous source with fixed Latency=0 in
+            // the physical contract. Its constant step has no routed input
+            // whose delay could postpone launch. Keep its forward latency
+            // bound; any extra alignment must be provided by real routes/RDUs
+            // and checked by calEdgeLatVio(), never by moving this source.
+            // Ordinary data-dependent reduction ACCs remain schedulable.
+            if(updated && !dfgNode->isLoopIndexAcc()){
                 // targetLat = std::max(targetLat, std::min(maxLat, minLat)); /// for backedge jhlou
                 if(_dfg->backEdgesheadNodeId().count(nodeId)){
                     targetLat = std::max(targetLat, std::max(maxLat, minLat));  

@@ -23,7 +23,9 @@ def LowerCEntry : Pass<"adora-lower-c-entry", "ModuleOp"> {
                           "::mlir::affine::AffineDialect", "::mlir::memref::MemRefDialect"];
   let options = [
     Option<"contract", "contract", "std::string", "\"\"", "Static object JSON contract">,
-    Option<"bankBytes", "bank-bytes", "int64_t", "8192", "Target scratchpad bank capacity in bytes">
+    Option<"bankBytes", "bank-bytes", "int64_t", "8192", "Target scratchpad bank capacity in bytes">,
+    Option<"allowPartialWrites", "allow-partial-writes", "bool", "false",
+           "Allow a guarded same-iteration store to an initialized inout object">
   ];
 }
 

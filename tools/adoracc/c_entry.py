@@ -1,4 +1,4 @@
-"""Opt-in, fail-closed ordinary C entry for the bounded guarded-stream profile.
+"""Opt-in, fail-closed ordinary C entries for bounded guarded memory kernels.
 
 The C++ bridge owns IR proofs and effect validation. This module owns the C
 source boundary, hardware/host contracts, orchestration, and artifact provenance.
@@ -20,7 +20,7 @@ _IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
 TARGET = 'x86_64-unknown-linux-gnu'
 
 
-def validate_contract(value: dict) -> dict:
+def validate_contract(value: dict, *, allow_partial: bool = False) -> dict:
     if not isinstance(value, dict):
         raise ValueError('C entry contract must be a JSON object')
     unknown = set(value) - {'entry', 'defines', 'objects', 'source', 'id'}
@@ -49,8 +49,11 @@ def validate_contract(value: dict) -> dict:
             raise ValueError('elements must be an explicit positive integer')
         if obj.get('host_dtype') not in ('uint16', 'int16'):
             raise ValueError('host_dtype must be uint16 or int16; int32 truncation is unsupported')
-        if obj.get('access_assertion') not in ('read', 'write'):
-            raise ValueError('access_assertion must be read or write and agree with IR effects')
+        access = obj.get('access_assertion')
+        if access not in (('read', 'write', 'inout') if allow_partial else ('read', 'write')):
+            raise ValueError('access_assertion must agree with IR effects; inout requires guarded-inplace')
+        if access == 'inout' and obj['host_dtype'] != 'uint16':
+            raise ValueError('inout destination requires uint16 pixels')
         if obj.get('contiguous') is not True:
             raise ValueError('objects must explicitly require contiguous=true')
         ordered.append(dict(obj))
@@ -64,7 +67,7 @@ def validate_hardware(adg: dict, operations: dict, contract: dict) -> int:
     if not isinstance(adg, dict) or not isinstance(operations, dict):
         raise ValueError('ADG and operations must be JSON objects')
     if adg.get('data_width') != 16:
-        raise ValueError('guarded-stream requires ADG data_width=16')
+        raise ValueError('checked C requires ADG data_width=16')
     bank = adg.get('iob_spad_bank_size')
     if type(bank) is not int or bank <= 0:
         raise ValueError('ADG must declare positive iob_spad_bank_size in bytes')
@@ -72,19 +75,25 @@ def validate_hardware(adg: dict, operations: dict, contract: dict) -> int:
         raise ValueError('object exceeds the declared hardware bank capacity')
     modes = adg.get('iob_mode_names', {})
     if not isinstance(modes, dict) or 'SRAM_MODE' not in modes.values():
-        raise ValueError('guarded-stream requires hardware SRAM_MODE for dynamic LOAD')
+        raise ValueError('checked C requires hardware SRAM_MODE for dynamic LOAD')
     ops = operations.get('Operations', [])
     if not isinstance(ops, list) or any(not isinstance(op, dict) for op in ops):
         raise ValueError('Operations must be an array of operation records')
     if not any(op.get('name') == 'LOAD' and op.get('numOperands') == 1 and
                op.get('numRes') == 1 for op in ops):
         raise ValueError('operations must declare a one-address, one-result LOAD')
+    if any(obj['access_assertion'] == 'inout' for obj in contract['objects']):
+        if 'COND_LS_MODE' not in modes.values() or not any(
+                op.get('name') == 'CSTORE' and op.get('numOperands') == 3 and
+                op.get('numRes') == 0 for op in ops):
+            raise ValueError('guarded-inplace requires COND_LS_MODE and three-operand CSTORE')
     return bank
 
 
-def checked_wrapper(contract: dict, factory_name: str = '_adora_make_checked_entry') -> str:
+def checked_wrapper(contract: dict, factory_name: str = '_adora_make_checked_entry',
+                    *, allow_partial: bool = False) -> str:
     """Wrap a successfully verified/emitted function without copying pixel data."""
-    contract = validate_contract(contract)
+    contract = validate_contract(contract, allow_partial=allow_partial)
     specs = [(o['elements'], o['host_dtype'], o['access_assertion']) for o in contract['objects']]
     entry = contract['entry']
     return f'''
@@ -101,7 +110,7 @@ def {factory_name}(_unchecked):
                 raise ValueError(f'C entry argument {{position}}: incorrect shape or dtype')
             if not buffer.flags.c_contiguous:
                 raise ValueError(f'C entry argument {{position}}: expected contiguous storage')
-            if access == 'write' and not buffer.flags.writeable:
+            if access in ('write', 'inout') and not buffer.flags.writeable:
                 raise ValueError(f'C entry argument {{position}}: output must be writable')
         for left in range(len(buffers)):
             for right in range(left + 1, len(buffers)):
@@ -117,7 +126,7 @@ del {factory_name}
 '''
 
 
-def checked_module(mapper_source: str, contract: dict) -> tuple[str, str]:
+def checked_module(mapper_source: str, contract: dict, *, allow_partial: bool = False) -> tuple[str, str]:
     """Isolate emitter globals from arbitrary valid public C entry names.
 
     Only the selected async definition is renamed. C calls/recursion are
@@ -125,7 +134,7 @@ def checked_module(mapper_source: str, contract: dict) -> tuple[str, str]:
     Matching the complete emitted argument list distinguishes an entry named
     aux_stream from the emitter's own aux_stream helper.
     """
-    contract = validate_contract(contract)
+    contract = validate_contract(contract, allow_partial=allow_partial)
     tree = ast.parse(mapper_source)
     entry = contract['entry']
     arguments = ['runtime', *(f'arg_{i}' for i in range(len(contract['objects'])))]
@@ -161,7 +170,8 @@ def checked_module(mapper_source: str, contract: dict) -> tuple[str, str]:
     matches[0].name = private_entry
     factory = fresh('_adora_private_checked_factory')
     private_contract = dict(contract, entry=private_entry)
-    private_source = ast.unparse(tree) + '\n' + checked_wrapper(private_contract, factory)
+    private_source = ast.unparse(tree) + '\n' + checked_wrapper(
+        private_contract, factory, allow_partial=allow_partial)
     compile(private_source, '<adora private implementation>', 'exec')
     # The implementation is embedded so the final .py is independently usable.
     # Its readable companion is retained alongside the unmodified mapper output.
@@ -236,7 +246,10 @@ def validate_source_ast(ast: dict, contract: dict) -> None:
         expected = ['unsigned', 'short', '*'] if obj['host_dtype'] == 'uint16' else ['short', '*']
         if base != expected:
             raise ValueError(f'argument {obj["argument_position"]}: source type {spelling!r} contradicts host dtype or is unsupported')
-        if obj['access_assertion'] == 'write' and 'const' in tokens:
+        # A const pointer still addresses writable pixels. Only qualification
+        # of the pointee contradicts a destination effect; aliases are already
+        # desugared above and the single-pointer base type was checked.
+        if obj['access_assertion'] in ('write', 'inout') and 'const' in tokens[:tokens.index('*')]:
             raise ValueError('write assertion contradicts const-qualified C input')
     for node in _walk(function):
         kind = node.get('kind', '')
@@ -261,19 +274,23 @@ def _sha256(path: Path) -> str:
 def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
     """Run the complete opt-in path; every required stage is fatal on failure."""
     if args.input.suffix.lower() != '.c':
-        raise ValueError('guarded-stream profile requires ordinary .c input')
+        raise ValueError('checked C profile requires ordinary .c input')
     if not args.contract or not args.adg_path or not args.op_file or not args.output:
-        raise ValueError('guarded-stream requires --contract, --adg-path, --op-file and --output')
+        raise ValueError('checked C profile requires --contract, --adg-path, --op-file and --output')
     if args.enable_unroll:
-        raise ValueError('guarded-stream does not enable generic unrolling')
+        raise ValueError('checked C profiles do not enable generic unrolling')
     source = args.input.resolve()
     contract_path = args.contract.resolve()
     adg_path = args.adg_path.resolve()
     ops_path = args.op_file.resolve()
     output = args.output.resolve()
     if output.suffix != '.py' or output.exists():
-        raise ValueError('guarded-stream --output must be a new .py file')
-    contract = validate_contract(json.loads(contract_path.read_text()))
+        raise ValueError('checked C --output must be a new .py file')
+    partial = args.profile == 'guarded-inplace'
+    contract = validate_contract(json.loads(contract_path.read_text()), allow_partial=partial)
+    if partial and (sum(obj['access_assertion'] == 'inout' for obj in contract['objects']) != 1 or
+                    any(obj['access_assertion'] == 'write' for obj in contract['objects'])):
+        raise ValueError('guarded-inplace requires exactly one inout destination and read-only inputs')
     bank = validate_hardware(json.loads(adg_path.read_text()), json.loads(ops_path.read_text()), contract)
     root = args.work_dir.resolve() / 'adora-c-entry'
     root.mkdir(parents=True, exist_ok=False)
@@ -298,7 +315,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         raise ValueError('set GeneralOpNameFile to the compiler GeneralOpName.txt table')
     shutil.copy2(name_file, root / 'GeneralOpName.txt')
     environment = dict(os.environ, GeneralOpNameFile=str(root / 'GeneralOpName.txt'))
-    provenance = {'profile': 'guarded-stream', 'target': TARGET, 'status': 'running',
+    provenance = {'profile': args.profile, 'target': TARGET, 'status': 'running',
                   'source': {'path': str(source), 'sha256': _sha256(source)},
                   'tools': {name: {'path': str(Path(path).resolve()), 'sha256': _sha256(Path(path))}
                             for name, path in tools.items()}, 'commands': [],
@@ -328,7 +345,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
 
     try:
         widths = dirs['frontend'] / 'target_widths.h'
-        widths.write_text('_Static_assert(__CHAR_BIT__ == 8 && sizeof(short) == 2 && sizeof(int) == 4, "guarded-stream requires 8-bit bytes, 16-bit short and 32-bit int");\n')
+        widths.write_text('_Static_assert(__CHAR_BIT__ == 8 && sizeof(short) == 2 && sizeof(int) == 4, "checked C requires 8-bit bytes, 16-bit short and 32-bit int");\n')
         defines = [f'-D{name}={constant}' for name, constant in sorted(contract['defines'].items())]
         # One preprocessor invocation prevents different Clang versions from
         # selecting different macro branches for the AST and MLIR frontends.
@@ -359,7 +376,8 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         bridge_input.write_text(strip_module_attrs(raw_text))
         bridged = dirs['ir'] / 'bridged.mlir'
         run([tools['cgra-opt'], bridge_input,
-             f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank}',
+             f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank}' +
+             (' allow-partial-writes=true' if partial else ''),
              '--verify-each', '-o', bridged], 'c-entry-bridge')
         final_ir = dirs['ir'] / 'final.mlir'
         run([tools['cgra-opt'], bridged, '--adora-kernel-dfg-gen', '--verify-each',
@@ -375,7 +393,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         configs = list(dirs['map'].glob('*_map_result/config.bit'))
         if not raw_python.is_file() or not configs or any(not config.stat().st_size for config in configs):
             raise ValueError('mapper did not produce Python and nonempty hardware configuration')
-        generated, private_source = checked_module(raw_python.read_text(), contract)
+        generated, private_source = checked_module(raw_python.read_text(), contract, allow_partial=partial)
         (dirs['map'] / 'generated.py').write_text(private_source)
         compile(generated, str(output), 'exec')
         if _sha256(source) != provenance['source']['sha256']:
