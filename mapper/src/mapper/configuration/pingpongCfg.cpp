@@ -42,6 +42,11 @@ std::map<int, CfgData> Configuration::getIobPingpongCfgData(IOBNode* node, bool 
     int dataBytes = _mapping->getADG()->bitWidth() / 8;
     int baseAddr = _dfgIoSpadAddrs[dfgNode->id()];
     int offset = dfgIONode->reducedMemOffset() / dataBytes;
+    validateSequentialCStore(node, dfgIONode, baseAddr + offset, latency, isStore);
+    if (dfgIONode->isSequentialCStore() && en_pingpong) {
+        std::cerr << "Sequential CSTORE does not support pingpong relocation\n";
+        exit(1);
+    }
     int baseAddrId = node->cfgIdMap["BaseAddr"];    
 
     int memsize = dfgIONode->memSize();
@@ -143,7 +148,8 @@ std::map<int, CfgData> Configuration::getIobPingpongCfgData(IOBNode* node, bool 
 
     // dumpCfgData(std::cout);
     if(node->cfgIdMap.count("UseAddr")){        
-        int useAddr = op == "LOAD" || op == "STORE" || op == "CLOAD" || op == "CSTORE";
+        int useAddr = op == "LOAD" || op == "STORE" || op == "CLOAD" ||
+                      (op == "CSTORE" && !dfgIONode->isSequentialCStore());
         int useAddrId = node->cfgIdMap["UseAddr"];
         addCfgData(cfg, node->configInfo(useAddrId), (uint32_t)useAddr);
         // CfgDataLoc useAddrCfgLoc = node->configInfo(useAddrId);

@@ -344,6 +344,40 @@ std::map<int, CfgData> Configuration::getGpeCfgData(GPENode* node){
 }
 
 // get config data for IOB, return<LSB-location, CfgData>
+void Configuration::validateSequentialCStore(IOBNode *node, DFGIONode *io,
+                                             int baseAddr, int latency, int isStore) {
+    if (!io->isSequentialCStore()) return;
+    auto fits = [&](const std::string &name, int64_t value) {
+        auto field = node->cfgIdMap.find(name);
+        if (field == node->cfgIdMap.end() || value < 0) return false;
+        auto loc = node->configInfo(field->second);
+        int width = loc.high - loc.low + 1;
+        return width > 0 && (width >= 63 || value < (int64_t(1) << width));
+    };
+    const int slots = io->sequentialCStoreSlots();
+    const int bankWords = _mapping->getADG()->iobSpadBankSize() / 2;
+    bool valid = io->operation() == "CSTORE" && isStore == 1 &&
+        _mapping->getADG()->bitWidth() == 16 && _mapping->II() == 1 &&
+        _mapping->getADG()->iobAgNestLevels() >= 1 &&
+        slots >= 1 && slots <= 4095 && io->memSize() == slots * 2 &&
+        io->memRefName() == io->sequentialCStoreObject() && !io->memRefName().empty() &&
+        io->reducedMemOffset() == 0 && io->additionalStartDelay() == 0 &&
+        !io->isPingpong() && !IsADGNodeConfigVariable(node) &&
+        io->pattern().size() == 1 && io->pattern()[0] == std::make_pair(2, slots) &&
+        io->inputEdges().size() == 3 && io->inputEdges().count(0) &&
+        io->inputEdges().count(1) && io->inputEdges().count(2) &&
+        bankWords > 0 && baseAddr >= 0 && baseAddr % bankWords + slots <= bankWords &&
+        fits("BaseAddr", baseAddr) && fits("Latency", latency) && fits("II", 1) &&
+        fits("UseAddr", 0) && fits("UseEn", 1) && fits("IsStore", 1) &&
+        fits("Stride0", 1) && fits("Cycles0", slots);
+    for (int dim = 1; dim < _mapping->getADG()->iobAgNestLevels(); ++dim)
+        valid &= fits("Stride" + std::to_string(dim), 0) && fits("Cycles" + std::to_string(dim), 0);
+    if (!valid) {
+        std::cerr << "Invalid sequential CSTORE configuration: mode/count/object, fixed II=1, bank footprint or controller fields\n";
+        exit(1);
+    }
+}
+
 std::map<int, CfgData> Configuration::getIobCfgData(IOBNode* node){
     if(!_mapping->isMapped(node)){
         return {};
@@ -385,6 +419,7 @@ std::map<int, CfgData> Configuration::getIobCfgData(IOBNode* node){
     int dataBytes = _mapping->getADG()->bitWidth() / 8;
     int baseAddr = _dfgIoSpadAddrs[dfgNode->id()];
     int offset = dfgIONode->reducedMemOffset() / dataBytes;
+    validateSequentialCStore(node, dfgIONode, baseAddr + offset, latency, isStore);
     int baseAddrId = node->cfgIdMap["BaseAddr"];    
     // CfgDataLoc baseAddrCfgLoc = node->configInfo(baseAddrId);
     // int baseAddrCfgLen = baseAddrCfgLoc.high - baseAddrCfgLoc.low + 1;
@@ -478,7 +513,8 @@ std::map<int, CfgData> Configuration::getIobCfgData(IOBNode* node){
 
     // dumpCfgData(std::cout);
     if(node->cfgIdMap.count("UseAddr")){        
-        int useAddr = op == "LOAD" || op == "STORE" || op == "CLOAD" || op == "CSTORE";
+        int useAddr = op == "LOAD" || op == "STORE" || op == "CLOAD" ||
+                      (op == "CSTORE" && !dfgIONode->isSequentialCStore());
         int useAddrId = node->cfgIdMap["UseAddr"];
         addCfgData(cfg, node->configInfo(useAddrId), (uint32_t)useAddr);
         // CfgDataLoc useAddrCfgLoc = node->configInfo(useAddrId);

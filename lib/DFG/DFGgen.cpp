@@ -3048,9 +3048,9 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     node->setACCinterval("1");
     node->setACCrepeat("1");
 
-    // The explicit address and predicate are consumed once per logical
-    // iteration. Preserve that execution count in the CSTORE IOB pattern; a
-    // loop-free CSTORE remains at the established single access (0,1).
+    // Preserve one slot per iteration. Proven initialized inout stores use
+    // the internal two-byte traversal, while retaining the address route;
+    // legacy stores use the explicit address and zero internal stride.
     forOp.walk([&](ADORA::CondStoreOp store) {
       if (store.getIndices().size() != 1)
         return;
@@ -3059,7 +3059,8 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
                           visitingAddress))
         return;
       if (LLVMCDFGNode *storeNode = CDFG->node(store.getOperation()))
-        storeNode->setLinearAccess("0," + std::to_string(tripCount));
+        storeNode->setLinearAccess((storeNode->isSequentialCStore() ? "2," : "0,") +
+                                   std::to_string(tripCount));
     });
 
     LLVMCDFGNode *stepNode = CDFG->addNode("CONST");
@@ -3993,10 +3994,9 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     node->setLinearAccess("0," + (loop ? getTripCountAsStr(loop) : std::string("1")));
   }
 
-  // CSTORE is an I/O node with an explicit scalar address, so it still needs
-  // the same identity and footprint metadata as affine memory operations.
-  // The access pattern describes one explicit address per invocation rather
-  // than an inferred affine traversal.
+  // CSTORE retains all three routed operands. Only the complete initialized
+  // inout proof permits internal sequential addressing; otherwise the pattern
+  // describes explicit addresses and preserves the legacy zero stride.
   for (auto &nodePair : CDFG->nodes()) {
     LLVMCDFGNode *node = nodePair.second;
     auto store = dyn_cast_or_null<ADORA::CondStoreOp>(node->operation());
@@ -4030,6 +4030,19 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     node->setMemrefSize(GetMemrefSize(store));
     node->setInitAddr("0");
     node->setLinearAccess("0,1");
+    if (certifiedBoundedInout) {
+      auto slots = store->getAttrOfType<IntegerAttr>("adora.cstore_slots");
+      auto object = store->getAttrOfType<StringAttr>("adora.cstore_object");
+      auto mode = store->getAttrOfType<StringAttr>("adora.cstore_address_mode");
+      if (!slots || !object || !mode || mode.getValue() != "sequential" ||
+          slots.getInt() < 1 || slots.getInt() > 4095 ||
+          object.getValue() != refName || node->getMemrefSize() != slots.getInt() * 2) {
+        store.emitError("sequential CSTORE lost its validated count or object binding");
+        return false;
+      }
+      node->setSequentialCStore(slots.getInt(), refName);
+      node->setLinearAccess("2," + std::to_string(slots.getInt()));
+    }
   }
 
   /*** Add Edges ***/
@@ -4557,12 +4570,16 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
         ? findLoopIndexAddressAcc(node->getInputPort(1))
         : nullptr;
     const std::string expectedPattern = loopIndexAcc
-        ? "0," + loopIndexAcc->getACCcount()
+        ? (node->isSequentialCStore() ? "2," : "0,") + loopIndexAcc->getACCcount()
         : "0,1";
     if (!node || portCounts[0] != 1 || portCounts[1] != 1 ||
         portCounts[2] != 1 || node->getMemrefName().empty() ||
         node->getMemrefSize() <= 0 || node->getInitAddr() != "0" ||
-        node->getLinearAccess() != expectedPattern) {
+        node->getLinearAccess() != expectedPattern ||
+        (node->isSequentialCStore() &&
+         (!certifiedBoundedInout || !loopIndexAcc ||
+          std::to_string(node->sequentialCStoreSlots()) != loopIndexAcc->getACCcount() ||
+          node->sequentialCStoreObject() != node->getMemrefName()))) {
       store.emitError(
           "malformed CSTORE CDFG node: requires exactly connected ports 0, "
           "1, and 2 and valid memory metadata");
@@ -4801,6 +4818,18 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     invalid = true;
   };
   bool hasCStore = false, hasDynamicLoad = false;
+  bool hasCStoreClaim = false;
+  kernel.walk([&](Operation *op) {
+    for (auto attr : op->getAttrs()) {
+      auto name = attr.getName().strref();
+      if (!name.starts_with("adora.cstore_")) continue;
+      hasCStoreClaim = true;
+      if (!isa<ADORA::CondStoreOp>(op) ||
+          (name != "adora.cstore_address_mode" && name != "adora.cstore_slots" &&
+           name != "adora.cstore_object"))
+        reject(op, "sequential CSTORE metadata must describe its conditional store only");
+    }
+  });
   kernel.walk([&](ADORA::CondStoreOp) { hasCStore = true; });
   kernel.walk([&](memref::LoadOp load) {
     // CSTORE graph construction deliberately omits unrelated direct memory.
@@ -4824,7 +4853,11 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     }
     hasDynamicLoad = true;
   });
-  if (!hasDynamicLoad) return success();
+  if (!hasDynamicLoad) {
+    if (hasCStoreClaim)
+      reject(kernel, "sequential CSTORE metadata requires the complete initialized inout SSA proof");
+    return failure(invalid);
+  }
   auto function = kernel->getParentOfType<func::FuncOp>();
   if (!function || !llvm::hasSingleElement(function.getBody()) ||
       kernel->getParentOp() != function.getOperation()) {
@@ -5155,7 +5188,12 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
         auto read = store ? store.getValue().getDefiningOp<memref::LoadOp>() : memref::LoadOp();
         if (!store || store->getParentOp() != invocationLoop || store.getIndices().size() != 1 ||
             store.getIndices()[0] != reductionLoop.getInductionVar() || !read ||
-            read.getMemref() == store.getMemref() || !store->getAttrs().empty())
+            read.getMemref() == store.getMemref() ||
+            llvm::any_of(store->getAttrs(), [](NamedAttribute attr) {
+              auto name = attr.getName().strref();
+              return name != "adora.cstore_address_mode" && name != "adora.cstore_slots" &&
+                     name != "adora.cstore_object";
+            }))
           reject(user, "inout requires one direct CSTORE of the loaded sample at dst[iv], without feedback");
         else ++writes;
       }
@@ -5313,6 +5351,29 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       reject(load, "requires unique read-only rank1 i16 BlockLoad and proven in-object address; index BlockLoad needs valid adora.value_range");
     }
   });
+  // Metadata is a checked record of this proof, never authorization to skip it.
+  // Re-running the pass recomputes the destination traversal and host binding.
+  if (!invalid && hasCStore && stream) {
+    kernel.walk([&](ADORA::CondStoreOp store) {
+      auto block = store.getMemref().getDefiningOp<ADORA::DataBlockLoadOp>();
+      const std::string object = std::string(kernel.getKernelName()) + ":" + std::string(block.getId());
+      bool claimed = store->hasAttr("adora.cstore_address_mode") ||
+                     store->hasAttr("adora.cstore_slots") || store->hasAttr("adora.cstore_object");
+      auto mode = store->getAttrOfType<StringAttr>("adora.cstore_address_mode");
+      auto slots = store->getAttrOfType<IntegerAttr>("adora.cstore_slots");
+      auto binding = store->getAttrOfType<StringAttr>("adora.cstore_object");
+      if (claimed && (!mode || mode.getValue() != "sequential" || !slots ||
+                      !slots.getType().isInteger(64) || slots.getInt() != streamCount ||
+                      !binding || binding.getValue() != object)) {
+        reject(store, "sequential CSTORE mode/count/object metadata contradicts the proven destination");
+        return;
+      }
+      OpBuilder builder(store);
+      store->setAttr("adora.cstore_address_mode", builder.getStringAttr("sequential"));
+      store->setAttr("adora.cstore_slots", builder.getI64IntegerAttr(streamCount));
+      store->setAttr("adora.cstore_object", builder.getStringAttr(object));
+    });
+  }
   certifiedBoundedInout = !invalid && hasCStore && stream;
   return failure(invalid);
 }
@@ -5320,6 +5381,18 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
 LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
                                                   ADORA::KernelOp kernel,
                                                   bool verbose){
+  // Check placement before legalization can erase an annotated source op.
+  bool misplacedClaim = false;
+  auto owner = kernel->getParentOfType<ModuleOp>();
+  (owner ? owner.getOperation() : kernel.getOperation())->walk([&](Operation *op) {
+    for (auto attr : op->getAttrs())
+      if (attr.getName().strref().starts_with("adora.cstore_") &&
+          !isa<ADORA::CondStoreOp>(op)) {
+        op->emitError("bounded dynamic LOAD: sequential CSTORE metadata belongs only on a proven conditional store");
+        misplacedClaim = true;
+      }
+  });
+  if (misplacedClaim) return failure();
   // Legalize guarded reads on a detached copy, then run strict preflights.
   // The original is replaced only after complete CDFG generation succeeds.
   ADORA::KernelOp fallbackKernel = kernel.clone();

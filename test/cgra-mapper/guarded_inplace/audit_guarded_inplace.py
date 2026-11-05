@@ -121,9 +121,11 @@ def audit(entry, adg_path, operations, count):
         inst, attrs = h.find_iob(adg, physical)
         fields = {f: h.decode_controller_field(packets, inst, attrs, adg, f) for f in
                   ('BaseAddr', 'UseAddr', 'UseEn', 'IsStore', 'Latency', 'II', 'Cycles0', 'Stride0')}
-        assert fields['UseAddr'] == int(operation != 'INPUT')
+        assert fields['UseAddr'] == int(operation == 'LOAD')
         assert fields['UseEn'] == fields['IsStore'] == int(operation == 'CSTORE')
-        assert fields['Cycles0'] == count and fields['Stride0'] == int(operation == 'INPUT')
+        assert fields['Cycles0'] == count and fields['Stride0'] == int(operation != 'LOAD')
+        if operation == 'CSTORE':
+            assert fields['II'] == 1
         # The IO manifest records store completion; input roles already report
         # input arrival. Controller latency always denotes operand arrival.
         arrival = latency - op_latencies[operation] if operation == 'CSTORE' else latency

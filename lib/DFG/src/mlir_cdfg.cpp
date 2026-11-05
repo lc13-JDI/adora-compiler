@@ -224,6 +224,13 @@ void LLVMCDFG::CDFGtoDOT(std::string fileName) {
             ofs << "\", offset=\"0," << node->getInitAddr();
             ofs << "\", pattern=\"" << node->getLinearAccess();
             ofs << "\"";
+            if (TypeName == "CSTORE") {
+                ofs << ", cstore_address_mode=\""
+                    << (node->isSequentialCStore() ? "sequential" : "explicit") << "\"";
+                if (node->isSequentialCStore())
+                    ofs << ", cstore_slots=\"" << node->sequentialCStoreSlots()
+                        << "\", cstore_object=\"" << node->sequentialCStoreObject() << "\"";
+            }
         }
         else if(node->isAcc()){
             ofs << ", acc_params=\""  << node->getACCInfo_str();

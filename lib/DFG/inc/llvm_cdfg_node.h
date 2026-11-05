@@ -139,6 +139,11 @@ private:
     std::string _InitAddr = "";
     int _MemrefSize = 0;
     std::string _MemrefName;
+    // Set only after the initialized inout SSA proof. Absent means legacy
+    // explicit byte addressing; a traversal pattern alone is not a proof.
+    int _SequentialCStoreSlots = 0;
+    bool _SequentialCStore = false;
+    std::string _SequentialCStoreObject;
 
     /// accumulation
     std::string _ACCinit = "";
@@ -186,6 +191,14 @@ public:
                                 && _LinearAccess != "";}
     std::string getLinearAccess(){ return _LinearAccess;} 
     void setLinearAccess(std::string str) { _LinearAccess = str;}
+    bool isSequentialCStore() const { return _SequentialCStore; }
+    int sequentialCStoreSlots() const { return _SequentialCStoreSlots; }
+    const std::string &sequentialCStoreObject() const { return _SequentialCStoreObject; }
+    void setSequentialCStore(int slots, const std::string &object) {
+      _SequentialCStore = true;
+      _SequentialCStoreSlots = slots;
+      _SequentialCStoreObject = object;
+    }
     std::string getInitAddr(){ return _InitAddr;} 
     void setInitAddr(std::string str) { _InitAddr = str;}
     int getMemrefSize(){ return _MemrefSize;} 

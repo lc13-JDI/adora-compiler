@@ -109,6 +109,8 @@ private:
     static void addIobDelayCfg(std::map<int, CfgData> &cfg, IOBNode *node,
                                ADGNode *delayNode,
                                const std::map<int, int> &delayUsed);
+    void validateSequentialCStore(IOBNode *node, DFGIONode *io, int baseAddr,
+                                  int latency, int isStore);
     
     // std::string getVarConfigFromAddr(std::map<int, std::vector<int>> lsb2addr,int  addr);
 public:

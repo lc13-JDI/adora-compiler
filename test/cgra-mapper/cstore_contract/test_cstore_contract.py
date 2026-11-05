@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 CASES = (
@@ -290,6 +291,10 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
 def run_dfg_contract_tests(mapper, operations):
     unit = mapper.with_name("cstore-dfg-contract-test")
     expected = {
+        "sequential-record-valid": (0, ()),
+        "forged-sequential": (1, ("Invalid sequential CSTORE DFG",)),
+        "forged-sequential-zero": (1, ("Invalid sequential CSTORE DFG",)),
+        "forged-sequential-missing-mode": (1, ("Invalid sequential CSTORE DFG",)),
         "zero-immediate": (0, ()),
         "one-immediate": (0, ()),
         "two-immediate": (1, ("Invalid CSTORE DFG node", "immediate inputs")),
@@ -305,6 +310,9 @@ def run_dfg_contract_tests(mapper, operations):
         "store-out-of-range": (1, ("Invalid STORE DFG node", "out of range")),
         "store-memory-ignored": (0, ()),
     }
+    for field in ('zero', 'overflow', 'count', 'count-type', 'source-object', 'node-object',
+                  'mode', 'pattern', 'missing', 'size', 'offset'):
+        expected['sequential-record-' + field] = (1, ('Invalid sequential CSTORE DFG',))
     for case, (status, messages) in expected.items():
         result = subprocess.run([str(unit), case, str(operations)], text=True,
                                 stdout=subprocess.PIPE,
@@ -317,6 +325,31 @@ def run_dfg_contract_tests(mapper, operations):
             if message not in result.stdout:
                 raise AssertionError(
                     f"dfg-{case}: missing diagnostic {message!r}\n{result.stdout}")
+    # Graph files cannot prove host initialization or target binding. Absence
+    # remains explicit; plausible annotations alone must not enable sequencing.
+    for name, attrs, status in [
+        ('legacy', {}, 0),
+        ('explicit', {'cstore_address_mode': 'explicit'}, 0),
+        ('forged', {'cstore_address_mode': 'sequential', 'cstore_slots': '4', 'cstore_object': 'kernel:dst'}, 1),
+        ('unknown', {'cstore_address_mode': 'automatic'}, 1),
+        ('unknown-field', {'cstore_proven': 'yes'}, 1),
+        ('slots-only', {'cstore_slots': '4'}, 1),
+        ('binding-only', {'cstore_object': 'kernel:dst'}, 1),
+        ('explicit-conflict', {'cstore_address_mode': 'explicit', 'cstore_slots': '4'}, 1),
+    ]:
+        nodes = [dict(_gvid=0, name='store', opcode='CSTORE', ref_name='kernel:dst',
+                      offset='0,0', size='8', pattern='0,4', **attrs)]
+        nodes += [dict(_gvid=i, name=f'input{i}', opcode='INPUT', ref_name=f'kernel:arg{i}',
+                       offset='0,0', size='8', pattern='0,4') for i in range(1, 4)]
+        graph = dict(objects=nodes, edges=[dict(_gvid=i-1, tail=i, head=0, operand=str(i-1)) for i in range(1, 4)])
+        with tempfile.TemporaryDirectory(prefix='adora-cstore-json-') as directory:
+            path = Path(directory)/'graph.json'
+            path.write_text(json.dumps(graph))
+            result = subprocess.run([str(unit), 'json', str(operations), str(path)], text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        assert result.returncode == status, (name, result.stdout)
+        if status:
+            assert 'Invalid serialized CSTORE access metadata' in result.stdout, (name, result.stdout)
 
 
 def run_cstore_immediate_mapper_test(workdir, mapper, adg, operations,

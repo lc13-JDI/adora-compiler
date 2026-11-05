@@ -308,6 +308,20 @@ DFG* DFGIR::parseDFGJson(std::string filename){
         std::string nodeName = nodeJson["name"].get<std::string>();
         std::string opName = nodeJson["opcode"].get<std::string>();
         std::transform(opName.begin(), opName.end(), opName.begin(), toupper);
+        // Serialized graphs have no host/SSA object proof. They retain the
+        // legacy explicit mode; even plausible sequential annotations cannot
+        // authorize internal addressing without the MLIR producer analysis.
+        bool extraCStoreMetadata = false;
+        for (const auto &attribute : nodeJson.items())
+            if (attribute.key().rfind("cstore_", 0) == 0 &&
+                attribute.key() != "cstore_address_mode") extraCStoreMetadata = true;
+        if (extraCStoreMetadata ||
+            (nodeJson.contains("cstore_address_mode") &&
+             (opName != "CSTORE" || !nodeJson["cstore_address_mode"].is_string() ||
+              nodeJson["cstore_address_mode"].get<std::string>() != "explicit"))) {
+            std::cerr << "Invalid serialized CSTORE access metadata: sequential mode requires a proven MLIR object binding\n";
+            exit(1);
+        }
         int id = nodeJson["_gvid"].get<int>() + 1; // start from 1
         nextMaterializedNodeId = std::max(nextMaterializedNodeId, id);
         // if(opName == "INPUT"){
@@ -518,6 +532,31 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
         std::cout << NodeName << "\n";
         std::transform(opName.begin(), opName.end(), opName.begin(), toupper);
         int64_t loadCycles = 0;
+        bool sourceCStoreClaim = false;
+        if (auto *operation = node->operation())
+            for (auto attr : operation->getAttrs())
+                sourceCStoreClaim |= attr.getName().strref().starts_with("adora.cstore_");
+        if (sourceCStoreClaim && !node->isSequentialCStore()) {
+            std::cerr << "Invalid sequential CSTORE DFG: source metadata has no proven node mode\n";
+            exit(1);
+        }
+        if (node->isSequentialCStore()) {
+            int slots = node->sequentialCStoreSlots();
+            auto store = mlir::dyn_cast_or_null<mlir::ADORA::CondStoreOp>(node->operation());
+            auto mode = store ? store->getAttrOfType<mlir::StringAttr>("adora.cstore_address_mode") : mlir::StringAttr();
+            auto count = store ? store->getAttrOfType<mlir::IntegerAttr>("adora.cstore_slots") : mlir::IntegerAttr();
+            auto object = store ? store->getAttrOfType<mlir::StringAttr>("adora.cstore_object") : mlir::StringAttr();
+            if (opName != "CSTORE" || !mode || mode.getValue() != "sequential" ||
+                !count || !count.getType().isInteger(64) || count.getInt() != slots || !object ||
+                object.getValue() != node->getMemrefName() ||
+                slots < 1 || slots > 4095 || node->getMemrefSize() != slots * 2 ||
+                node->getInitAddr() != "0" ||
+                node->sequentialCStoreObject() != node->getMemrefName() ||
+                node->getLinearAccess() != "2," + std::to_string(slots)) {
+                std::cerr << "Invalid sequential CSTORE DFG mode/count/object contract\n";
+                exit(1);
+            }
+        }
         const std::string loadPatternStorage = node->getLinearAccess();
         llvm::StringRef loadPattern(loadPatternStorage);
         bool validLoadPattern = loadPattern.consume_front("0,") &&
@@ -587,6 +626,9 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
                 //     dfg_io_node->setReducedMemOffset(0);
                 // }
                 dfg_io_node->setMemSize(node->getMemrefSize());
+                if (node->isSequentialCStore())
+                    dfg_io_node->setSequentialCStore(node->sequentialCStoreSlots(),
+                                                   node->sequentialCStoreObject());
 
                 /// set dfg io node
                 dfg_io_node->setPingpong(node->isPingpong());

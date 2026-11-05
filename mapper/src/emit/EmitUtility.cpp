@@ -552,6 +552,13 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
         }))
       reject(id, "no valid reachable SRAM bank");
     if (boundedLoads) {
+      if (io->isSequentialCStore() &&
+          (io->operation() != "CSTORE" || !streamCycles ||
+           io->sequentialCStoreSlots() != streamCycles ||
+           io->sequentialCStoreObject() != io->memRefName() ||
+           mapper->_mapping->II() != 1 || io->isPingpong() ||
+           !fitsField(iob, "UseAddr", 0)))
+        reject(id, "sequential CSTORE requires its proven full object, count and fixed II=1");
       if (reductionCount && io->operation() == "OUTPUT") {
         if (io->inputEdges().size() != 1) {
           reject(id, "final output requires one direct ACC result");
@@ -576,7 +583,10 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       if (reductionCount && io->operation() != "OUTPUT")
         expected = {io->operation() == "INPUT" ? 2 : 0, reductionCycles};
       if (streamCycles)
-        expected = {(io->operation() == "LOAD" || io->operation() == "CSTORE") ? 0 : 2, streamCycles};
+        expected = {(io->operation() == "LOAD" ||
+                     (io->operation() == "CSTORE" && !io->isSequentialCStore())) ? 0 : 2, streamCycles};
+      if (streamCycles && io->operation() == "CSTORE" && !io->isSequentialCStore())
+        reject(id, "initialized conditional stream lost its proven sequential address mode");
       if (io->operation() == "CSTORE" &&
           (!fitsField(iob, "UseEn", 1) || !fitsField(iob, "IsStore", 1) ||
            io->inputEdges().size() != 3 || !io->inputEdges().count(0) ||

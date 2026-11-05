@@ -28,12 +28,79 @@ void addEdge(LLVMCDFG &cdfg, LLVMCDFGNode *source, LLVMCDFGNode *destination,
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
+  if (argc != 3 && argc != 4) {
     std::cerr << "usage: cstore-dfg-contract-test <case> <operations.json>\n";
     return 2;
   }
 
   const std::string testCase = argv[1];
+  if (testCase == "json" && argc == 4) {
+    Operations::Instance(argv[2]);
+    DFGIR dfg(argv[3]);
+    auto *io = dynamic_cast<DFGIONode *>(dfg.getDFG()->node(1));
+    return io && !io->isSequentialCStore() ? 0 : 2;
+  }
+  if (testCase.rfind("forged-sequential", 0) == 0) {
+    Operations::Instance(argv[2]);
+    mlir::MLIRContext context;
+    context.allowUnregisteredDialects();
+    LLVMCDFG cdfg("forged-sequential");
+    auto *store = addNode(cdfg, context, "CSTORE");
+    if (testCase == "forged-sequential-missing-mode")
+      store->operation()->setAttr("adora.cstore_address_mode", mlir::StringAttr::get(&context, "sequential"));
+    else
+      store->setSequentialCStore(testCase == "forged-sequential-zero" ? 0 : 4, "kernel:dst");
+    store->setMemrefName("kernel:dst");
+    store->setMemrefSize(8);
+    store->setInitAddr("0");
+    store->setLinearAccess("2,4");
+    for (int port = 0; port < 3; ++port)
+      addEdge(cdfg, addNode(cdfg, context, "Input"), store, port);
+    DFGIR dfg(&cdfg);
+    return dfg.getDFG() ? 0 : 2;
+  }
+  if (testCase.rfind("sequential-record-", 0) == 0) {
+    Operations::Instance(argv[2]);
+    mlir::MLIRContext context;
+    context.allowUnregisteredDialects();
+    context.getOrLoadDialect<mlir::ADORA::ADORADialect>();
+    mlir::OpBuilder builder(&context);
+    auto loc = builder.getUnknownLoc();
+    mlir::OperationState valuesState(loc, "test.values");
+    valuesState.addTypes({builder.getI16Type(),
+                         mlir::MemRefType::get({4}, builder.getI16Type()),
+                         builder.getIndexType(), builder.getI1Type()});
+    auto *values = mlir::Operation::create(valuesState);
+    mlir::OperationState state(loc, mlir::ADORA::CondStoreOp::getOperationName());
+    state.addOperands(values->getResults());
+    state.addAttribute("adora.cstore_address_mode", builder.getStringAttr("sequential"));
+    state.addAttribute("adora.cstore_slots", builder.getI64IntegerAttr(4));
+    state.addAttribute("adora.cstore_object", builder.getStringAttr("kernel:dst"));
+    auto *operation = mlir::Operation::create(state);
+    LLVMCDFG cdfg("sequential-record");
+    auto *store = cdfg.addNode(operation, "CSTORE");
+    store->setSequentialCStore(4, "kernel:dst");
+    store->setMemrefName("kernel:dst");
+    store->setMemrefSize(8);
+    store->setInitAddr("0");
+    store->setLinearAccess("2,4");
+    if (testCase == "sequential-record-zero") store->setSequentialCStore(0, "kernel:dst");
+    if (testCase == "sequential-record-overflow") store->setSequentialCStore(4096, "kernel:dst");
+    if (testCase == "sequential-record-count") operation->setAttr("adora.cstore_slots", builder.getI64IntegerAttr(3));
+    if (testCase == "sequential-record-count-type") operation->setAttr("adora.cstore_slots", builder.getI32IntegerAttr(4));
+    if (testCase == "sequential-record-source-object") operation->setAttr("adora.cstore_object", builder.getStringAttr("kernel:src"));
+    if (testCase == "sequential-record-node-object") store->setSequentialCStore(4, "kernel:src");
+    if (testCase == "sequential-record-mode") operation->setAttr("adora.cstore_address_mode", builder.getStringAttr("explicit"));
+    if (testCase == "sequential-record-pattern") store->setLinearAccess("0,4");
+    if (testCase == "sequential-record-missing") operation->removeAttr("adora.cstore_slots");
+    if (testCase == "sequential-record-size") store->setMemrefSize(6);
+    if (testCase == "sequential-record-offset") store->setInitAddr("2");
+    for (int port = 0; port < 3; ++port)
+      addEdge(cdfg, addNode(cdfg, context, "Input"), store, port);
+    DFGIR dfg(&cdfg);
+    auto *io = dynamic_cast<DFGIONode *>(dfg.getDFG()->node(store->id() + 1));
+    return io && io->isSequentialCStore() && io->sequentialCStoreSlots() == 4 ? 0 : 2;
+  }
   if (testCase.rfind("load-", 0) == 0) {
     Operations::Instance(argv[2]);
     mlir::MLIRContext context;

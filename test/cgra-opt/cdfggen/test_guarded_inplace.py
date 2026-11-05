@@ -48,7 +48,11 @@ def check_graph(dot, nonzero):
     assert nodes[acc]['loop_index_acc'] == nodes[acc]['skip_first'] == '1'
     assert nodes[acc]['acc_params'] == '0,4,1,1'
     assert set(edges[store]) == {0, 1, 2} and set(edges[load]) == {0}
-    assert nodes[load]['pattern'] == nodes[store]['pattern'] == '0,4'
+    assert nodes[load]['pattern'] == '0,4'
+    assert nodes[store]['pattern'] == '2,4'
+    assert nodes[store]['cstore_address_mode'] == 'sequential'
+    assert nodes[store]['cstore_slots'] == '4'
+    assert nodes[store]['cstore_object'] == nodes[store]['ref_name'] == 'b2_inplace:dst'
     assert all(nodes[n]['pattern'] == '2,4' for n in byop('INPUT'))
     def ancestors(node, seen=None):
         seen = set() if seen is None else seen
@@ -155,6 +159,38 @@ negative = {
     'bad-read-bound': guarded.replace('%bounds = arith.andi %lo, %hi', '%bounds = arith.andi %lo, %lo'),
     'volatile-store': guarded.replace('memref.store %value, %old[%i] :', 'memref.store %value, %old[%i] {volatile} :'),
     'no-access': base.replace('} {KernelName = "b2_inplace"}', '} {KernelName = "b2_inplace", adora.require_no_access}'),
+    'step-two': base.replace('= 0 to 4', '= 0 to 4 step 2'),
 }
+claim = ' {adora.cstore_address_mode = "sequential", adora.cstore_slots = 4 : i64, adora.cstore_object = "b2_inplace:dst"}'
+claimed = base.replace('if %read_guard :', 'if %read_guard' + claim + ' :')
+run('reproved-claim', claimed, True)
+for name, replacement in {
+    'wrong-mode': claim.replace('"sequential"', '"explicit"'),
+    'unknown-mode': claim.replace('"sequential"', '"automatic"'),
+    'wrong-slot-claim': claim.replace('4 : i64', '3 : i64'),
+    'zero-slot-claim': claim.replace('4 : i64', '0 : i64'),
+    'overflow-slot-claim': claim.replace('4 : i64', '4096 : i64'),
+    'wrong-slot-type': claim.replace('4 : i64', '4 : i32'),
+    'wrong-object-claim': claim.replace('b2_inplace:dst', 'b2_inplace:src'),
+    'incomplete-claim': ' {adora.cstore_address_mode = "sequential"}',
+    'unknown-claim': claim[:-1] + ', adora.cstore_trusted}',
+}.items():
+    negative[name] = base.replace('if %read_guard :', 'if %read_guard' + replacement + ' :')
+negative['forged-scatter'] = claimed.replace('%old[%i] if', '%old[%address] if')
+negative['claim-on-kernel'] = base.replace('} {KernelName = "b2_inplace"}', '} {KernelName = "b2_inplace", adora.cstore_slots = 4 : i64}')
+negative['claim-on-module'] = base.replace('module {', 'module attributes {adora.cstore_slots = 4 : i64} {')
+negative['claim-on-source-store'] = guarded.replace('memref.store %value, %old[%i] :',
+                                                     'memref.store %value, %old[%i]' + claim + ' :')
+negative['unproven-legacy-claim'] = '''module {
+ func.func @legacy(%value: i16, %enable: i1, %dst: memref<4xi16>) {
+  ADORA.kernel {
+   affine.for %i = 0 to 4 {
+    ADORA.cond_store %value, %dst[%i] if %enable''' + claim + ''' : memref<4xi16>
+   }
+   ADORA.terminator
+  } {KernelName = "legacy"}
+  return
+ }
+}'''
 for name,text in negative.items(): run(name,text)
-print(f'guarded inout: 3 positive graph/model/re-ingestion checks and {len(negative)} rejections passed')
+print(f'guarded inout: 4 positive graph/model/re-ingestion checks and {len(negative)} rejections passed')

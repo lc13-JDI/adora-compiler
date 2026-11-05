@@ -15,7 +15,8 @@
 // LOAD :  load data from external memory with address; data = load(addr)
 // STORE : store data to external memory with address; void store(data, addr)
 // CLOAD :  conditional load data from external memory with address; data = load(addr, en)
-// CSTORE : conditional store data to external memory with address; void store(data, addr, en)
+// CSTORE : conditional store(data, byte_addr, en); certified sequential mode
+//          keeps all ports but selects the IOB's internal word traversal.
 
 class DFGNode : public GraphNode
 {
@@ -85,6 +86,9 @@ private:
     int _memSize;                // referred memory size in byte, e.g. size is (15+1-4)*4
     std::vector<std::pair<int, int>> _pattern; // memory access pattern, nested <stride, loop-cycles>
     std::vector<int> _groupNodes; // other I/O nodes in the same group where nodes access the same array
+    int _sequentialCStoreSlots = 0;
+    bool _sequentialCStore = false;
+    std::string _sequentialCStoreObject;
 
     // @jhlou
     bool _pingpong = false;
@@ -102,6 +106,14 @@ public:
     const std::vector<std::pair<int, int>>& pattern(){ return _pattern; }
     int getNestedLevels(){ return _pattern.size(); }
     void addPatternLevel(int stride, int cycles){ _pattern.push_back(std::make_pair(stride, cycles)); }
+    bool isSequentialCStore() const { return _sequentialCStore; }
+    int sequentialCStoreSlots() const { return _sequentialCStoreSlots; }
+    const std::string &sequentialCStoreObject() const { return _sequentialCStoreObject; }
+    void setSequentialCStore(int slots, const std::string &object) {
+        _sequentialCStore = true;
+        _sequentialCStoreSlots = slots;
+        _sequentialCStoreObject = object;
+    }
 
     void addGroupNode(int id){ _groupNodes.push_back(id); }
     const std::vector<int>& groupNodes(){ return _groupNodes; }
