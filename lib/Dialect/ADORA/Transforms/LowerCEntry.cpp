@@ -9,6 +9,9 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
 #include "PassDetail.h"
 #include <algorithm>
 #include <functional>
@@ -87,6 +90,7 @@ static void refine(Value guard, Value leaf, Range &range,
 class LowerCEntryPass : public LowerCEntryBase<LowerCEntryPass> {
   void runOnOperation() override;
   LogicalResult lower(func::FuncOp function, SmallVector<Object> &objects);
+  LogicalResult lowerLarge(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root);
 };
 } // namespace
 
@@ -104,7 +108,8 @@ void LowerCEntryPass::runOnOperation() {
   if (!root) return reject("object contract must be an object");
   for (const auto &field : *root)
     if (field.first != "entry" && field.first != "defines" && field.first != "objects" &&
-        field.first != "source" && field.first != "id")
+        field.first != "source" && field.first != "id" &&
+        !(largeObjects && field.first == "host_plan"))
       return reject("unsupported object contract key: " + field.first.str());
   auto entry = root->getString("entry");
   auto list = root->getArray("objects");
@@ -136,7 +141,7 @@ void LowerCEntryPass::runOnOperation() {
     auto contiguous = object->getBoolean("contiguous");
     if (!pos || *pos < 0 || *pos >= objects.size() || seen[*pos])
       return reject("object contract argument positions must be unique and in range");
-    if (!elements || *elements <= 0 || *elements > bankBytes / 2)
+    if (!elements || *elements <= 0 || *elements > (largeObjects ? 16777216 : bankBytes / 2))
       return reject("object elements must be positive and fit one target bank");
     if (!dtype || (*dtype != "int16" && *dtype != "uint16") ||
         !access || (*access != "read" && *access != "write" && *access != "inout") ||
@@ -157,7 +162,11 @@ void LowerCEntryPass::runOnOperation() {
   // effects outside the declared kernel. This explicit profile is one entry.
   for (auto other : module.getOps<func::FuncOp>())
     if (other != function) return reject("only the selected C entry is supported");
-  if (failed(lower(function, objects))) signalPassFailure();
+  if (largeObjects) {
+    if (!allowPartialWrites || bankBytes < 512 || descriptor.empty())
+      return reject("large objects require partial writes, a 512-byte bank and descriptor output");
+    if (failed(lowerLarge(function, objects, *root))) signalPassFailure();
+  } else if (failed(lower(function, objects))) signalPassFailure();
 }
 
 LogicalResult LowerCEntryPass::lower(func::FuncOp function,
@@ -610,6 +619,8 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   function->setAttr("adora.c_entry", builder.getUnitAttr());
   return success();
 }
+
+#include "LowerLargeCEntry.inc"
 
 std::unique_ptr<OperationPass<ModuleOp>> mlir::ADORA::createLowerCEntryPass() {
   return std::make_unique<LowerCEntryPass>();

@@ -25,7 +25,9 @@ def LowerCEntry : Pass<"adora-lower-c-entry", "ModuleOp"> {
     Option<"contract", "contract", "std::string", "\"\"", "Static object JSON contract">,
     Option<"bankBytes", "bank-bytes", "int64_t", "8192", "Target scratchpad bank capacity in bytes">,
     Option<"allowPartialWrites", "allow-partial-writes", "bool", "false",
-           "Allow a guarded same-iteration store to an initialized inout object">
+           "Allow a guarded same-iteration store to an initialized inout object">,
+    Option<"largeObjects", "large-objects", "bool", "false", "Prove a host-wide gather and emit its fixed 256-word local kernel">,
+    Option<"descriptor", "descriptor", "std::string", "\"\"", "Write the verified host descriptor (large-objects only)">
   ];
 }
 

@@ -13,17 +13,19 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
 
 
 _IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
 TARGET = 'x86_64-unknown-linux-gnu'
 
 
-def validate_contract(value: dict, *, allow_partial: bool = False) -> dict:
+def validate_contract(value: dict, *, allow_partial: bool = False, allow_large: bool = False) -> dict:
     if not isinstance(value, dict):
         raise ValueError('C entry contract must be a JSON object')
-    unknown = set(value) - {'entry', 'defines', 'objects', 'source', 'id'}
+    unknown = set(value) - ({'entry', 'defines', 'objects', 'source', 'id', 'host_plan'} if allow_large else {'entry', 'defines', 'objects', 'source', 'id'})
     if unknown:
         raise ValueError(f'unsupported contract fields: {sorted(unknown)}')
     entry = value.get('entry')
@@ -60,6 +62,17 @@ def validate_contract(value: dict, *, allow_partial: bool = False) -> dict:
     ordered.sort(key=lambda obj: obj['argument_position'])
     if [obj['argument_position'] for obj in ordered] != list(range(len(ordered))):
         raise ValueError('objects must cover consecutive argument positions exactly once')
+    if allow_large:
+        plan = value.get('host_plan')
+        if (not isinstance(plan, dict) or set(plan) != {'strategy', 'tile_items', 'bind_arguments', 'ownership'} or
+                plan.get('strategy') != 'per-query' or plan.get('tile_items') != 256 or plan.get('ownership') != 'copy'):
+            raise ValueError('large C entry requires a per-query, 256-item, owned-copy host_plan')
+        bound = plan.get('bind_arguments')
+        if (len(ordered) != 5 or not isinstance(bound, list) or len(bound) != 3 or
+                any(type(i) is not int or i < 0 or i >= 5 for i in bound) or len(set(bound)) != 3):
+            raise ValueError('large C entry requires five objects and three distinct bound arguments')
+        if any(obj['elements'] > 16777216 for obj in ordered):
+            raise ValueError('large C entry resource bound is 16777216 elements per object')
     return dict(value, defines=dict(defines), objects=ordered)
 
 
@@ -196,7 +209,7 @@ def _walk(node):
         yield from _walk(child)
 
 
-def validate_source_ast(ast: dict, contract: dict) -> None:
+def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False) -> None:
     """Check source properties lost by optimized MLIR, using Clang semantic AST."""
     # Clang JSON desugars scalar typedefs but may spell a pointer's pointee with
     # its typedef name. Resolve those names through actual TypedefDecl nodes.
@@ -251,6 +264,14 @@ def validate_source_ast(ast: dict, contract: dict) -> None:
         # desugared above and the single-pointer base type was checked.
         if obj['access_assertion'] in ('write', 'inout') and 'const' in tokens[:tokens.index('*')]:
             raise ValueError('write assertion contradicts const-qualified C input')
+    if allow_large:
+        loops = [node for node in _walk(function) if node.get('kind') == 'ForStmt']
+        if len(loops) != 1:
+            raise ValueError('large C entry requires one source for loop')
+        declarations = [node for node in loops[0].get('inner', [])[0].get('inner', [])
+                        if node.get('kind') == 'VarDecl']
+        if len(declarations) != 1 or source_type(declarations[0]) != 'int':
+            raise ValueError('large C entry requires a signed 32-bit source induction variable')
     for node in _walk(function):
         kind = node.get('kind', '')
         spelling = source_type(node)
@@ -271,6 +292,65 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_large_source_address(ast: dict, proof: dict) -> None:
+    """Retain the original C size_t address domain after SSA role inference."""
+    function = next(node for node in _walk(ast) if node.get('kind') == 'FunctionDecl'
+                    and node.get('name') == proof['entry']
+                    and any(child.get('kind') == 'CompoundStmt' for child in node.get('inner', [])))
+    params = [node for node in function['inner'] if node.get('kind') == 'ParmVarDecl']
+    source_id = params[proof['source_argument']]['id']
+    accesses = []
+    for node in _walk(function):
+        if node.get('kind') != 'ArraySubscriptExpr' or len(node.get('inner', [])) != 2:
+            continue
+        base, index = node['inner']
+        if any(child.get('kind') == 'DeclRefExpr' and child.get('referencedDecl', {}).get('id') == source_id
+               for child in _walk(base)):
+            accesses.append(index)
+    if len(accesses) != 1:
+        raise ValueError('large C source must have one direct source array access')
+    ctype = accesses[0].get('type', {})
+    if ctype.get('desugaredQualType', ctype.get('qualType')) != 'unsigned long':
+        raise ValueError('large C source address must use the target 64-bit size_t domain')
+
+
+def large_local_contract() -> dict:
+    return {'entry': '_adora_large_tile', 'objects': [
+        {'argument_position': i, 'elements': 256, 'host_dtype': dtype,
+         'access_assertion': access, 'contiguous': True}
+        for i, dtype, access in [(0, 'uint16', 'read'), (1, 'int16', 'read'),
+                                 (2, 'int16', 'read'), (3, 'uint16', 'inout')]]}
+
+
+def large_checked_module(mapper_source: str, descriptor: dict) -> tuple[str, str]:
+    """Embed the proven tile and versioned host support into one public module."""
+    tile_source, private_source = checked_module(mapper_source, large_local_contract(), allow_partial=True)
+    support = Path(__file__).with_name('prepared_xy.py').read_text()
+    entry = descriptor['entry']
+    if entry in {'make_plan', 'execute_plan', '_tile', '_adora_create_large_entry'}:
+        raise ValueError('C entry name conflicts with the large-plan public API')
+    generated = f'''# Compiler-proved global C entry and owned per-query host plan.
+# The embedded descriptor is derived from typed SSA, never imported from user JSON.
+def _adora_create_large_entry():
+    public_namespace = globals()
+    tile_namespace = {{'__name__': __name__ + '._tile', '__file__': __file__}}
+    exec(compile({tile_source!r}, __file__, 'exec'), tile_namespace)
+    globals()['_tile'] = tile_namespace['_adora_large_tile']
+    support_namespace = {{'__name__': __name__ + '._support', '__file__': __file__}}
+    exec(compile({support!r}, __file__, 'exec'), support_namespace)
+    async def dispatch(runtime, *buffers):
+        return await public_namespace['_tile'](runtime, *buffers)
+    make_plan, execute_plan, once = support_namespace['bind_prepared_entry'](dispatch, {descriptor!r})
+    public_namespace['make_plan'] = make_plan
+    public_namespace['execute_plan'] = execute_plan
+    public_namespace[{entry!r}] = once
+_adora_create_large_entry()
+del _adora_create_large_entry
+'''
+    compile(generated, '<adora large module>', 'exec')
+    return generated, private_source
+
+
 def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
     """Run the complete opt-in path; every required stage is fatal on failure."""
     if args.input.suffix.lower() != '.c':
@@ -286,12 +366,14 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
     output = args.output.resolve()
     if output.suffix != '.py' or output.exists():
         raise ValueError('checked C --output must be a new .py file')
-    partial = args.profile == 'guarded-inplace'
-    contract = validate_contract(json.loads(contract_path.read_text()), allow_partial=partial)
+    large = args.profile == 'guarded-inplace-large'
+    partial = args.profile in ('guarded-inplace', 'guarded-inplace-large')
+    contract = validate_contract(json.loads(contract_path.read_text()), allow_partial=partial, allow_large=large)
     if partial and (sum(obj['access_assertion'] == 'inout' for obj in contract['objects']) != 1 or
                     any(obj['access_assertion'] == 'write' for obj in contract['objects'])):
         raise ValueError('guarded-inplace requires exactly one inout destination and read-only inputs')
-    bank = validate_hardware(json.loads(adg_path.read_text()), json.loads(ops_path.read_text()), contract)
+    local_contract = large_local_contract() if large else contract
+    bank = validate_hardware(json.loads(adg_path.read_text()), json.loads(ops_path.read_text()), local_contract)
     root = args.work_dir.resolve() / 'adora-c-entry'
     root.mkdir(parents=True, exist_ok=False)
     dirs = {name: root / name for name in ('frontend', 'ir', 'dfg', 'map')}
@@ -304,6 +386,8 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
     shutil.copy2(ops_path, root / 'operations.json')
     normalized = root / 'contract.json'
     normalized.write_text(json.dumps(contract, indent=2) + '\n')
+    if large:
+        (root / 'local-contract.json').write_text(json.dumps(local_contract, indent=2) + '\n')
     tools = {'cgeist': require_tool('cgeist'), 'clang': require_tool('clang'),
              'cgra-opt': require_local('cgra-opt'), 'cgra-mapper': require_local('cgra-mapper')}
     name_file = os.environ.get('GeneralOpNameFile')
@@ -321,6 +405,11 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
                             for name, path in tools.items()}, 'commands': [],
                   'environment': {'GeneralOpNameFile': environment['GeneralOpNameFile']},
                   'scheduling': 'not required: one fixed kernel, explicitly omitted'}
+    if large:
+        provenance['production_python'] = {
+            name: {'path': str(Path(__file__).with_name(name).resolve()),
+                   'sha256': _sha256(Path(__file__).with_name(name))}
+            for name in ('adoracc.py', 'c_entry.py', 'prepared_xy.py')}
     manifest = root / 'provenance.json'
 
     def save():
@@ -337,7 +426,21 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
                 with stdout.open('w') as out:
                     completed = subprocess.run(record['argv'], cwd=cwd, env=environment, stdout=out, stderr=err)
             else:
-                completed = subprocess.run(record['argv'], cwd=cwd, env=environment, stdout=err, stderr=subprocess.STDOUT)
+                if name == 'mapper' and large:
+                    process = subprocess.Popen(record['argv'], cwd=cwd, env=environment,
+                                               stdout=err, stderr=subprocess.STDOUT, start_new_session=True)
+                    try:
+                        process.wait(timeout=args.mapper_wall_timeout)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+                        record['returncode'] = process.returncode
+                        record['wall_timeout'] = args.mapper_wall_timeout
+                        save()
+                        raise ValueError(f'mapper exceeded {args.mapper_wall_timeout}s wall timeout; no callable published')
+                    completed = process
+                else:
+                    completed = subprocess.run(record['argv'], cwd=cwd, env=environment, stdout=err, stderr=subprocess.STDOUT)
         record['returncode'] = completed.returncode
         save()
         if completed.returncode:
@@ -345,7 +448,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
 
     try:
         widths = dirs['frontend'] / 'target_widths.h'
-        widths.write_text('_Static_assert(__CHAR_BIT__ == 8 && sizeof(short) == 2 && sizeof(int) == 4, "checked C requires 8-bit bytes, 16-bit short and 32-bit int");\n')
+        widths.write_text('_Static_assert(__CHAR_BIT__ == 8 && sizeof(short) == 2 && sizeof(int) == 4 && sizeof(void*) == 8 && sizeof(long) == 8, "checked C requires 8-bit bytes, 16-bit short and 32-bit int");\n')
         defines = [f'-D{name}={constant}' for name, constant in sorted(contract['defines'].items())]
         # One preprocessor invocation prevents different Clang versions from
         # selecting different macro branches for the AST and MLIR frontends.
@@ -356,7 +459,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         run([tools['clang'], '-x', 'c', '-std=c11', '-target', TARGET,
              '-Xclang', '-ast-dump=json', '-fsyntax-only', preprocessed],
             'source-ast', stdout=ast)
-        validate_source_ast(json.loads(ast.read_text()), contract)
+        validate_source_ast(json.loads(ast.read_text()), contract, allow_large=large)
         raw = dirs['frontend'] / 'raw.mlir'
         run([tools['cgeist'], preprocessed, '-O2', '-S', '-std=c11', f'--target={TARGET}',
              f'--function={contract["entry"]}', '--show-ast',
@@ -368,7 +471,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
             raise ValueError('cgeist did not preserve the expected target/layout metadata')
         provenance['frontend_target'] = {'llvm.data_layout': layout.group(1),
                                          'llvm.target_triple': triple.group(1),
-                                         'short_bits': 16, 'int_bits': 32, 'char_bits': 8,
+                                         'short_bits': 16, 'int_bits': 32, 'char_bits': 8, 'size_t_bits': 64,
                                          'checked_by': str(widths)}
         # Polygeist and ADORA use different LLVM revisions. Only the WORK COPY
         # loses module metadata (not operation attributes); raw retains it all.
@@ -377,8 +480,12 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         bridged = dirs['ir'] / 'bridged.mlir'
         run([tools['cgra-opt'], bridge_input,
              f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank}' +
-             (' allow-partial-writes=true' if partial else ''),
+             (' allow-partial-writes=true' if partial else '') +
+             (f' large-objects=true descriptor={root / "host-proof.json"}' if large else ''),
              '--verify-each', '-o', bridged], 'c-entry-bridge')
+        if large:
+            proof = json.loads((root / 'host-proof.json').read_text())
+            validate_large_source_address(json.loads(ast.read_text()), proof)
         final_ir = dirs['ir'] / 'final.mlir'
         run([tools['cgra-opt'], bridged, '--adora-kernel-dfg-gen', '--verify-each',
              '-o', final_ir], 'dfg', cwd=dirs['dfg'])
@@ -386,30 +493,116 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         if not graphs or any(not graph.stat().st_size or 'undefined' in graph.read_text() for graph in graphs):
             raise ValueError('DFG generation did not produce valid nonempty graphs')
         raw_python = dirs['map'] / 'unchecked.py'
-        run([tools['cgra-mapper'], final_ir, f'--adg={root / "adg.json"}',
+        mapper_command = [tools['cgra-mapper'], final_ir, f'--adg={root / "adg.json"}',
              f'--op-file={root / "operations.json"}', '--output-type=pytest',
              f'--output={raw_python}', f'--seed={args.seed}', f'--max-iters={args.max_iters}',
-             f'--timeout={args.timeout}'], 'mapper', cwd=dirs['map'])
+             f'--timeout={args.timeout}']
+        cache = None
+        if large and args.kernel_cache:
+            cache_base = args.kernel_cache.resolve()
+            if cache_base == root or root in cache_base.parents:
+                raise ValueError('kernel cache must be outside this compilation artifact directory')
+            key = hashlib.sha256(b'adora-large-kernel-cache-v1' + bridged.read_bytes() +
+                json.dumps(provenance['tools'], sort_keys=True).encode() +
+                (root / 'adg.json').read_bytes() + (root / 'operations.json').read_bytes() +
+                (root / 'GeneralOpName.txt').read_bytes() +
+                json.dumps({'seed': args.seed, 'max_iters': args.max_iters, 'timeout': args.timeout}, sort_keys=True).encode()).hexdigest()
+            cache = cache_base / key
+            provenance['kernel_cache'] = {'key': key, 'hit': False}
+            if cache.is_dir():
+                cache_manifest = json.loads((cache / 'hashes.json').read_text())
+                if (not isinstance(cache_manifest, dict) or cache_manifest.get('key') != key or
+                        cache.is_symlink() or (cache / 'map').is_symlink() or (cache / 'hashes.json').is_symlink()):
+                    raise ValueError('kernel cache identity check failed')
+                hashes = cache_manifest.get('files')
+                inventory = list((cache / 'map').rglob('*'))
+                if (not isinstance(hashes, dict) or not hashes or
+                    any(not isinstance(path, str) or Path(path).is_absolute() or
+                        '..' in Path(path).parts or str(Path(path)) != path for path in hashes) or
+                    any(path.is_symlink() or (not path.is_dir() and not path.is_file()) for path in inventory) or
+                    set(hashes) != {str(path.relative_to(cache / 'map')) for path in inventory if path.is_file()} or
+                    any(not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest) or
+                        _sha256(cache / 'map' / path) != digest for path, digest in hashes.items())):
+                    raise ValueError('kernel cache integrity check failed')
+                shutil.copytree(cache / 'map', dirs['map'], dirs_exist_ok=True)
+                provenance['kernel_cache']['hit'] = True
+        if not (large and provenance.get('kernel_cache', {}).get('hit')):
+            run(mapper_command, 'mapper', cwd=dirs['map'])
         configs = list(dirs['map'].glob('*_map_result/config.bit'))
         if not raw_python.is_file() or not configs or any(not config.stat().st_size for config in configs):
             raise ValueError('mapper did not produce Python and nonempty hardware configuration')
-        generated, private_source = checked_module(raw_python.read_text(), contract, allow_partial=partial)
+        if large:
+            proof = json.loads((root / 'host-proof.json').read_text())
+            proof['support_version'] = 1
+            proof['module_identity'] = hashlib.sha256(source_copy.read_bytes() +
+                normalized.read_bytes() + bridged.read_bytes() + raw_python.read_bytes() +
+                json.dumps(provenance['tools'], sort_keys=True).encode() +
+                json.dumps(provenance['production_python'], sort_keys=True).encode()).hexdigest()
+            provenance['verified_host_descriptor'] = proof
+            generated, private_source = large_checked_module(raw_python.read_text(), proof)
+        else:
+            generated, private_source = checked_module(raw_python.read_text(), contract, allow_partial=partial)
+        if cache is not None and not cache.exists():
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            pending = cache.with_name(cache.name + '.pending-' + str(os.getpid()))
+            shutil.copytree(dirs['map'], pending / 'map')
+            hashes = {str(path.relative_to(pending / 'map')): _sha256(path)
+                      for path in (pending / 'map').rglob('*') if path.is_file()}
+            (pending / 'hashes.json').write_text(json.dumps({'key': key, 'files': hashes}, sort_keys=True))
+            pending.rename(cache)
         (dirs['map'] / 'generated.py').write_text(private_source)
         compile(generated, str(output), 'exec')
         if _sha256(source) != provenance['source']['sha256']:
             raise ValueError('C source changed during compilation')
         output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open('x') as stream:
-            stream.write(generated)
         provenance['status'] = 'complete'
-        provenance['checked_entry'] = {'path': str(output), 'sha256': _sha256(output), 'name': contract['entry']}
+        provenance['checked_entry'] = {
+            'path': str(output),
+            'sha256': hashlib.sha256(generated.encode('utf-8')).hexdigest(),
+            'name': contract['entry']}
     except Exception as exc:
         provenance['status'] = 'failed'
         provenance['error'] = str(exc)
         raise
     finally:
-        provenance['artifacts'] = {str(path.relative_to(root)): _sha256(path)
-                                   for path in sorted(root.rglob('*')) if path.is_file() and path != manifest}
-        save()
+        try:
+            provenance['artifacts'] = {str(path.relative_to(root)): _sha256(path)
+                                       for path in sorted(root.rglob('*')) if path.is_file() and path != manifest}
+            save()
+        except Exception as exc:
+            provenance['status'] = 'failed'
+            provenance['error'] = str(exc)
+            try:
+                save()
+            except OSError:
+                pass
+            raise
+    # Finish every proof, artifact hash and provenance write before exposing a
+    # callable. A same-directory hard link publishes atomically without replacing
+    # an output another invocation may have created after the initial check.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         dir=output.parent, prefix='.adora-entry-',
+                                         suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(generated)
+        os.link(temporary, output)
+    except Exception as exc:
+        provenance['status'] = 'failed'
+        provenance['error'] = str(exc)
+        try:
+            save()
+        except OSError:
+            pass  # Preserve the publication error; never remove another output.
+        raise
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                # Cleanup failure cannot turn a successfully published callable
+                # into a reported compilation failure.
+                pass
     print(f'[adoracc] Checked C entry: {output}\n[adoracc] Provenance: {manifest}')
     return 0
