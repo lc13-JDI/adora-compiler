@@ -12,6 +12,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "PassDetail.h"
 #include <algorithm>
 #include <functional>
@@ -52,6 +53,10 @@ static arith::CmpIPredicate reverse( arith::CmpIPredicate p) {
   case P::sle: return P::sge;
   case P::sgt: return P::slt;
   case P::sge: return P::sle;
+  case P::ult: return P::ugt;
+  case P::ule: return P::uge;
+  case P::ugt: return P::ult;
+  case P::uge: return P::ule;
   default: return p;
   }
 }
@@ -89,7 +94,8 @@ static void refine(Value guard, Value leaf, Range &range,
 
 class LowerCEntryPass : public LowerCEntryBase<LowerCEntryPass> {
   void runOnOperation() override;
-  LogicalResult lower(func::FuncOp function, SmallVector<Object> &objects);
+  LogicalResult lower(func::FuncOp function, SmallVector<Object> &objects,
+                      bool provenRange = false);
   LogicalResult lowerLarge(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root);
 };
 } // namespace
@@ -170,7 +176,7 @@ void LowerCEntryPass::runOnOperation() {
 }
 
 LogicalResult LowerCEntryPass::lower(func::FuncOp function,
-                                   SmallVector<Object> &objects) {
+                                   SmallVector<Object> &objects, bool provenRange) {
   auto reject = [&](Operation *op, Twine message) -> LogicalResult {
     op->emitError("C-entry: ") << message;
     return failure();
@@ -421,7 +427,9 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   if (outputs != 1) error(function, "requires exactly one write object");
   if (bad) return failure();
   if (!conditionalStores.empty()) {
-    if (dynamicLoads.size() != 1 || conditionalStores.front().getValue() != dynamicLoads.front().getResult())
+    // provenRange is internal to the fresh function built by lowerLarge after
+    // its exhaustive effect proof; no user IR attribute can enable this path.
+    if (dynamicLoads.size() != 1 || (!provenRange && conditionalStores.front().getValue() != dynamicLoads.front().getResult()))
       return reject(function, "conditional output requires exactly one guarded source loaded value");
     const auto &source = objects[positions[dynamicLoads.front().getMemref()]];
     if (source.write || source.dtype != "uint16" || source.reads != 1)
@@ -556,7 +564,8 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   function.walk([&](Operation *op) {
     for (Type type : op->getResultTypes())
       if (type.isInteger(32)) error(op, "unproven i32 computation remains after C promotion normalization");
-    if (isa<arith::AddIOp, arith::MulIOp>(op) && !op->getResult(0).getType().isIndex())
+    if (isa<arith::AddIOp, arith::MulIOp>(op) && !op->getResult(0).getType().isIndex() &&
+        !(provenRange && isa<arith::AddIOp>(op) && op->getResult(0).getType().isInteger(16)))
       error(op, "only proven address arithmetic is supported");
   });
   if (bad) return failure();

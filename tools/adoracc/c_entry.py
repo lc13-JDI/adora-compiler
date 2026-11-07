@@ -292,6 +292,59 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def normalize_unsigned_promotions(ast: dict, text: str) -> tuple[str, list]:
+    """Expose builtin uint16 types at C integer promotions, without changing values.
+
+    Some cgeist revisions inspect BuiltinType without desugaring a typedef and
+    incorrectly sign-extend uint16_t. A redundant unsigned-short cast fixes that
+    frontend input. Clang AST types and byte ranges authorize each edit; signed
+    casts and IR are never reinterpreted. Already-builtin expressions are stable.
+    """
+    edits = {}
+    raw = text.encode('utf-8')
+    for node in _walk(ast):
+        if node.get('castKind') != 'IntegralCast' or len(node.get('inner', [])) != 1:
+            continue
+        target = node.get('type', {})
+        child = node['inner'][0]
+        source = child.get('type', {})
+        if (target.get('desugaredQualType', target.get('qualType')) != 'int' or
+                source.get('desugaredQualType', source.get('qualType')) != 'unsigned short' or
+                source.get('qualType') == 'unsigned short'):
+            continue
+        loc = child.get('range', {})
+        begin, end = loc.get('begin', {}), loc.get('end', {})
+        if any(type(v) is not int for v in (begin.get('offset'), end.get('offset'), end.get('tokLen'))):
+            raise ValueError('unsigned C promotion requires unambiguous preprocessed AST byte offsets')
+        first, last = begin['offset'], end['offset'] + end['tokLen']
+        if not 0 <= first < last <= len(raw):
+            raise ValueError('unsigned C promotion AST range is outside the preprocessed input')
+        edits[first, last] = dict(begin=first, end=last, from_type=source['qualType'],
+                                  to_type='int', value_type='unsigned short')
+    ordered = [edits[key] for key in sorted(edits)]
+    if any(left['end'] > right['begin'] for left, right in zip(ordered, ordered[1:])):
+        raise ValueError('overlapping unsigned C promotions are unsupported')
+    for edit in reversed(ordered):
+        first, last = edit['begin'], edit['end']
+        raw = raw[:first] + b'((unsigned short)(' + raw[first:last] + b'))' + raw[last:]
+    return raw.decode('utf-8'), ordered
+
+
+def validate_large_value_proof(proof: dict) -> None:
+    """Reject incomplete value semantics before DFG, cache, or publication."""
+    if not isinstance(proof, dict) or proof.get('schema') != 'adora.guarded-inplace-large.v1':
+        raise ValueError('large C entry: incompatible compiler proof schema')
+    mode = proof.get('value_mode')
+    if mode not in ('direct', 'nonzero', 'range') or type(proof.get('value_nonzero')) is not bool or proof['value_nonzero'] != (mode == 'nonzero'):
+        raise ValueError('large C entry: missing or contradictory compiler-proved value mode')
+    if mode == 'range':
+        lo, hi = proof.get('range_lo'), proof.get('range_hi')
+        if type(lo) is not int or type(hi) is not int or not 0 < lo <= hi <= 65535:
+            raise ValueError('large C entry: invalid compiler-proved uint16 range')
+    elif any(key not in proof or proof[key] is not None for key in ('range_lo', 'range_hi')):
+        raise ValueError('large C entry: non-range proof must carry null range bounds')
+
+
 def validate_large_source_address(ast: dict, proof: dict) -> None:
     """Retain the original C size_t address domain after SSA role inference."""
     function = next(node for node in _walk(ast) if node.get('kind') == 'FunctionDecl'
@@ -460,8 +513,17 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
              '-Xclang', '-ast-dump=json', '-fsyntax-only', preprocessed],
             'source-ast', stdout=ast)
         validate_source_ast(json.loads(ast.read_text()), contract, allow_large=large)
+        frontend_input = preprocessed
+        if large:
+            normalized_source, edits = normalize_unsigned_promotions(json.loads(ast.read_text()), preprocessed.read_text())
+            frontend_input = dirs['frontend'] / 'normalized.c'
+            frontend_input.write_text(normalized_source)
+            (dirs['frontend'] / 'unsigned-promotions.json').write_text(json.dumps(edits, indent=2) + '\n')
+            provenance['unsigned_promotion_normalization'] = {
+                'input_sha256': _sha256(preprocessed), 'output_sha256': _sha256(frontend_input),
+                'edits': edits, 'reason': 'type-preserving builtin unsigned-short spelling for cgeist typedef promotions'}
         raw = dirs['frontend'] / 'raw.mlir'
-        run([tools['cgeist'], preprocessed, '-O2', '-S', '-std=c11', f'--target={TARGET}',
+        run([tools['cgeist'], frontend_input, '-O2', '-S', '-std=c11', f'--target={TARGET}',
              f'--function={contract["entry"]}', '--show-ast',
              '-o', raw], 'cgeist')
         raw_text = raw.read_text()
@@ -485,6 +547,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
              '--verify-each', '-o', bridged], 'c-entry-bridge')
         if large:
             proof = json.loads((root / 'host-proof.json').read_text())
+            validate_large_value_proof(proof)
             validate_large_source_address(json.loads(ast.read_text()), proof)
         final_ir = dirs['ir'] / 'final.mlir'
         run([tools['cgra-opt'], bridged, '--adora-kernel-dfg-gen', '--verify-each',
@@ -502,7 +565,8 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
             cache_base = args.kernel_cache.resolve()
             if cache_base == root or root in cache_base.parents:
                 raise ValueError('kernel cache must be outside this compilation artifact directory')
-            key = hashlib.sha256(b'adora-large-kernel-cache-v1' + bridged.read_bytes() +
+            key = hashlib.sha256(b'adora-large-kernel-cache-v2' + bridged.read_bytes() +
+                json.dumps({name: proof[name] for name in ('value_mode', 'range_lo', 'range_hi')}, sort_keys=True).encode() +
                 json.dumps(provenance['tools'], sort_keys=True).encode() +
                 (root / 'adg.json').read_bytes() + (root / 'operations.json').read_bytes() +
                 (root / 'GeneralOpName.txt').read_bytes() +
@@ -533,9 +597,11 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
             raise ValueError('mapper did not produce Python and nonempty hardware configuration')
         if large:
             proof = json.loads((root / 'host-proof.json').read_text())
-            proof['support_version'] = 2
+            validate_large_value_proof(proof)
+            proof['support_version'] = 3
             proof['module_identity'] = hashlib.sha256(source_copy.read_bytes() +
                 normalized.read_bytes() + bridged.read_bytes() + raw_python.read_bytes() +
+                json.dumps(proof, sort_keys=True).encode() +
                 json.dumps(provenance['tools'], sort_keys=True).encode() +
                 json.dumps(provenance['production_python'], sort_keys=True).encode()).hexdigest()
             provenance['verified_host_descriptor'] = proof

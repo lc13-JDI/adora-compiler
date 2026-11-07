@@ -24,6 +24,45 @@ def descriptor(items=4, nonzero=False):
 
 
 class HostProtocol(unittest.IsolatedAsyncioTestCase):
+    async def test_range_descriptor_is_explicit_and_fail_closed(self):
+        d = dict(descriptor(), support_version=3, value_mode='range', range_lo=32768, range_hi=60000)
+        self.module._validate_descriptor(d)
+        for changes in [dict(value_mode=None), dict(value_mode='unknown'), dict(value_nonzero=True),
+                        dict(range_lo=0), dict(range_lo=True), dict(range_hi=65536),
+                        dict(range_lo=60001), dict(range_hi=None), dict(value_mode='direct')]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.module._validate_descriptor(dict(d, **changes))
+        for key in ('value_mode', 'range_lo', 'range_hi'):
+            missing = dict(d)
+            del missing[key]
+            with self.assertRaises(ValueError):
+                self.module._validate_descriptor(missing)
+
+    async def test_range_mode_never_filters_or_skips_pixels_on_host(self):
+        calls = []
+        async def tile(runtime, packed, idx, enabled, dst):
+            calls.append((packed.copy(), enabled.copy(), dst.copy()))
+            valid = (idx >= 0) & (enabled != 0)
+            values = packed[idx[valid]]
+            dst[valid] = np.where((values >= 32768) & (values <= 60000), values, 0)
+        d = dict(descriptor(), support_version=3, value_mode='range', range_lo=32768, range_hi=60000)
+        make, _, _ = self.bind(tile=tile, desc=d)
+        x, y, en = self.arrays()
+        plan = make(x, y, en)
+        src = np.full(8193, 60001, np.uint16)
+        old = np.full(4, 43, np.uint16)
+        await plan.execute(object(), src, old)
+        np.testing.assert_array_equal(old, [0, 0, 43, 43])
+        self.assertEqual(len(calls), 1)
+        np.testing.assert_array_equal(calls[0][0][:2], [60001, 60001])
+        np.testing.assert_array_equal(calls[0][1][:4], [1, 1, 0, 0])
+        src[8192], src[0] = 32768, 60000
+        old[:] = 51
+        await plan.execute(object(), src, old)
+        np.testing.assert_array_equal(old, [32768, 60000, 51, 51])
+        self.assertEqual(len(calls), 2)
+        plan.close()
+
     def setUp(self):
         self.assertTrue(MODULE.exists(), 'production prepared P host support is missing')
         spec = importlib.util.spec_from_file_location('prepared_xy', MODULE)

@@ -13,7 +13,7 @@ import types
 
 import numpy as np
 
-SUPPORT_VERSION = 2
+SUPPORT_VERSION = 3
 SCHEMA = 'adora.guarded-inplace-large.v1'
 # Conservative allocation limits; checked before any user-sized allocation.
 MAX_ELEMENTS = 16 * 1024 * 1024
@@ -50,7 +50,8 @@ def _validate_descriptor(value):
     if not isinstance(value, dict):
         raise ValueError('prepared entry: descriptor must be a compiler-produced object')
     result = dict(value)
-    if result.get('schema') != SCHEMA or type(result.get('support_version')) is not int or result['support_version'] != SUPPORT_VERSION:
+    version = result.get('support_version')
+    if result.get('schema') != SCHEMA or type(version) is not int or version not in (2, SUPPORT_VERSION):
         raise ValueError('prepared entry: incompatible descriptor/support version')
     if not isinstance(result.get('module_identity'), str) or not re.fullmatch('[0-9a-f]{64}', result['module_identity']):
         raise ValueError('prepared entry: missing compiled module identity')
@@ -65,6 +66,19 @@ def _validate_descriptor(value):
         raise ValueError('prepared entry: only M=N=256 is supported')
     if type(result.get('value_nonzero')) is not bool:
         raise ValueError('prepared entry: value_nonzero must be a compiler-proved boolean')
+    if version == 2:
+        if any(key in result for key in ('value_mode', 'range_lo', 'range_hi')):
+            raise ValueError('prepared entry: legacy descriptor cannot carry new value semantics')
+    else:
+        mode = result.get('value_mode')
+        if mode not in ('direct', 'nonzero', 'range') or result['value_nonzero'] != (mode == 'nonzero'):
+            raise ValueError('prepared entry: missing or contradictory value mode')
+        if mode == 'range':
+            lo, hi = result.get('range_lo'), result.get('range_hi')
+            if type(lo) is not int or type(hi) is not int or not 0 < lo <= hi <= 65535:
+                raise ValueError('prepared entry: invalid uint16 inclusive range')
+        elif any(key not in result or result[key] is not None for key in ('range_lo', 'range_hi')):
+            raise ValueError('prepared entry: non-range mode must carry null range bounds')
     roles = [result.get(key) for key in ('source_argument', 'x_argument', 'y_argument',
                                         'enable_argument', 'destination_argument')]
     if any(type(role) is not int for role in roles) or sorted(roles) != list(range(5)):

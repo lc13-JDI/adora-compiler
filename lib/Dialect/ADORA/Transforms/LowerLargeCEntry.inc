@@ -77,7 +77,7 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
   function.walk([&](Operation *op) {
     if (op==function.getOperation()) return;
     if (!isa<arith::ConstantOp,arith::ExtSIOp,arith::ExtUIOp,arith::IndexCastOp,
-             arith::AddIOp,arith::MulIOp,arith::CmpIOp,arith::AndIOp,
+             arith::AddIOp,arith::MulIOp,arith::CmpIOp,arith::AndIOp,arith::SelectOp,arith::TruncIOp,
              memref::LoadOp,memref::StoreOp,scf::IfOp,scf::YieldOp,
              affine::AffineYieldOp,func::ReturnOp>(op) && op!=loop) { bad=true; return; }
     if (loop && op!=loop && !loop->isAncestor(op) && !isa<arith::ConstantOp,func::ReturnOp>(op)) bad=true;
@@ -95,19 +95,24 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
     if (auto l=dyn_cast<memref::LoadOp>(op)) loads.push_back(l);
     if (auto s=dyn_cast<memref::StoreOp>(op)) stores.push_back(s);
     if (auto branch=dyn_cast<scf::IfOp>(op)) {
-      if (branch.getNumResults() || !branch.getElseRegion().empty()) bad=true;
+      if (branch.getNumResults()>1 || (!branch.getNumResults() && !branch.getElseRegion().empty())) bad=true;
       branches.push_back(branch);
     }
-    if (isa<scf::YieldOp,affine::AffineYieldOp,func::ReturnOp>(op) && op->getNumOperands()) bad=true;
+    if (isa<affine::AffineYieldOp,func::ReturnOp>(op) && op->getNumOperands()) bad=true;
   });
   if (bad || loads.size()!=4 || stores.size()!=1) return reject("unsupported operations, attributes, or effects; requires four reads and one store");
   auto store=stores.front();
   if (!positions.count(store.getMemref()) || store.getIndices().size()!=1 || !isIteration(store.getIndices()[0]))
     return reject("unique destination must be the same-iteration contiguous store");
   unsigned dst=positions[store.getMemref()];
-  auto sourceLoad=store.getValue().getDefiningOp<memref::LoadOp>();
+  memref::LoadOp sourceLoad;
+  for (auto load:loads)
+    if (positions.count(load.getMemref()) && !llvm::is_contained(bound,positions[load.getMemref()])) {
+      if (sourceLoad) return reject("requires a unique source read");
+      sourceLoad=load;
+    }
   if (!sourceLoad || !positions.count(sourceLoad.getMemref()) || sourceLoad.getIndices().size()!=1)
-    return reject("destination must receive the direct source loaded value");
+    return reject("destination must receive the unique source loaded value or its proven range selection");
   unsigned src=positions[sourceLoad.getMemref()];
   if (src==dst || llvm::is_contained(bound,src) || llvm::is_contained(bound,dst))
     return reject("source, destination and bound arrays must be distinct objects");
@@ -167,6 +172,93 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
   if(objects[src].elements%width) return reject("source shape must be width*height");
   int64_t height=objects[src].elements/width;
   if(height<1 || height>32767) return reject("height outside signed-coordinate bounds");
+  bool rangeMode=store.getValue()!=sourceLoad.getResult();
+  int64_t rangeLo=0,rangeHi=0;
+  llvm::SmallPtrSet<Operation *,16> valueOps;
+  if(rangeMode) {
+    // This finite-domain proof follows typed SSA, including sign extension,
+    // truncation and branch yields. It never reinterprets signed IR using a
+    // host dtype assertion. Only two comparisons of this read are admitted.
+    unsigned nodes=0, comparisons=0, lowerBounds=0,upperBounds=0;
+    auto pixelProjection = [&](Value v)->bool {
+      if(v==sourceLoad.getResult()) return true;
+      if(auto e=v.getDefiningOp<arith::ExtUIOp>())
+        return e.getIn()==sourceLoad.getResult() && e.getType().isInteger(32);
+      if(auto e=v.getDefiningOp<arith::ExtSIOp>())
+        return e.getIn()==sourceLoad.getResult() && e.getType().isInteger(32);
+      return false;
+    };
+    std::function<bool(Value)> tree = [&](Value v)->bool {
+      if(++nodes>128) return false;
+      if(v==sourceLoad.getResult()) return true;
+      auto op=v.getDefiningOp();
+      auto type=dyn_cast<IntegerType>(v.getType());
+      if(!op || !type || (type.getWidth()!=1 && type.getWidth()!=16 && type.getWidth()!=32)) return false;
+      if(valueOps.contains(op)) return true;
+      valueOps.insert(op);
+      if(isa<arith::ConstantOp>(op)) return constant(v).has_value();
+      if(isa<arith::ExtSIOp,arith::ExtUIOp,arith::TruncIOp>(op)) return tree(op->getOperand(0));
+      if(auto cmp=dyn_cast<arith::CmpIOp>(op)) {
+        Value l=cmp.getLhs(),r=cmp.getRhs();auto p=cmp.getPredicate();
+        if(constant(l)) {std::swap(l,r);p=reverse(p);}
+        auto c=constant(r);
+        if(!pixelProjection(l)||!c) return false;
+        using P=arith::CmpIPredicate;
+        if(p==P::sge||p==P::uge) {rangeLo=*c;++lowerBounds;}
+        else if(p==P::sgt||p==P::ugt) {rangeLo=*c+1;++lowerBounds;}
+        else if(p==P::sle||p==P::ule) {rangeHi=*c;++upperBounds;}
+        else if(p==P::slt||p==P::ult) {rangeHi=*c-1;++upperBounds;}
+        else return false;
+        ++comparisons;
+        return tree(l)&&tree(r);
+      }
+      if(auto a=dyn_cast<arith::AndIOp>(op))
+        return a.getType().isInteger(1)&&tree(a.getLhs())&&tree(a.getRhs());
+      if(auto s=dyn_cast<arith::SelectOp>(op))
+        return tree(s.getCondition())&&tree(s.getTrueValue())&&tree(s.getFalseValue());
+      if(auto branch=dyn_cast<scf::IfOp>(op)) {
+        if(branch.getNumResults()!=1||branch.getElseRegion().empty()) return false;
+        auto t=dyn_cast<scf::YieldOp>(branch.getThenRegion().front().getTerminator());
+        auto f=dyn_cast<scf::YieldOp>(branch.getElseRegion().front().getTerminator());
+        return t&&f&&t.getNumOperands()==1&&f.getNumOperands()==1&&
+          tree(branch.getCondition())&&tree(t.getOperand(0))&&tree(f.getOperand(0));
+      }
+      return false;
+    };
+    if(!tree(store.getValue())||comparisons!=2||lowerBounds!=1||upperBounds!=1||
+       rangeLo<1||rangeLo>rangeHi||rangeHi>65535)
+      return reject("range effect requires two constant bounds on the same uint16 read and a pure value merge");
+    std::function<llvm::APInt(Value,unsigned)> evaluate = [&](Value v,unsigned pixel)->llvm::APInt {
+      if(v==sourceLoad.getResult()) return llvm::APInt(16,pixel);
+      auto op=v.getDefiningOp();
+      unsigned bits=cast<IntegerType>(v.getType()).getWidth();
+      if(auto c=constant(v)) return llvm::APInt(bits,*c);
+      if(auto e=dyn_cast<arith::ExtUIOp>(op)) return evaluate(e.getIn(),pixel).zext(bits);
+      if(auto e=dyn_cast<arith::ExtSIOp>(op)) return evaluate(e.getIn(),pixel).sext(bits);
+      if(auto e=dyn_cast<arith::TruncIOp>(op)) return evaluate(e.getIn(),pixel).trunc(bits);
+      if(auto a=dyn_cast<arith::AndIOp>(op)) return evaluate(a.getLhs(),pixel)&evaluate(a.getRhs(),pixel);
+      if(auto c=dyn_cast<arith::CmpIOp>(op)) {
+        auto l=evaluate(c.getLhs(),pixel),r=evaluate(c.getRhs(),pixel);bool yes=false;
+        using P=arith::CmpIPredicate;
+        switch(c.getPredicate()) {
+        case P::sge:yes=l.sge(r);break;case P::sgt:yes=l.sgt(r);break;
+        case P::sle:yes=l.sle(r);break;case P::slt:yes=l.slt(r);break;
+        case P::uge:yes=l.uge(r);break;case P::ugt:yes=l.ugt(r);break;
+        case P::ule:yes=l.ule(r);break;case P::ult:yes=l.ult(r);break;
+        default:llvm_unreachable("validated range comparison");
+        }
+        return llvm::APInt(1,yes);
+      }
+      if(auto s=dyn_cast<arith::SelectOp>(op))
+        return evaluate(evaluate(s.getCondition(),pixel).isZero()?s.getFalseValue():s.getTrueValue(),pixel);
+      auto branch=cast<scf::IfOp>(op);
+      auto &region=evaluate(branch.getCondition(),pixel).isZero()?branch.getElseRegion():branch.getThenRegion();
+      return evaluate(region.front().getTerminator()->getOperand(0),pixel);
+    };
+    for(unsigned v=0;v<65536;++v)
+      if(evaluate(store.getValue(),v)!=llvm::APInt(16,rangeLo<=v&&v<=rangeHi?v:0))
+        return reject("range expression is not uint16 inclusive-range value-or-zero for every input code");
+  }
   // Exact boolean conjunctions, not merely range sufficiency: host skip and
   // device write conditions must be equivalent to the original control path.
   auto path = [&](Operation *op, SmallVector<Value> &conditions)->bool {
@@ -211,15 +303,19 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
   if(!readMask || *readMask!=31 || !writeMask || (*writeMask!=31 && *writeMask!=63))
     return reject("read guard or write predicate does not match the proven address semantics");
   for(auto branch:branches)
-    if(!branch->isAncestor(sourceLoad) && !branch->isAncestor(store)) return reject("unrelated control effects unsupported");
+    if(!branch->isAncestor(sourceLoad) && !branch->isAncestor(store) && !valueOps.contains(branch)) return reject("unrelated control effects unsupported");
   bool nonzero=*writeMask==63;
+  if(rangeMode && nonzero) return reject("range selection must write for every valid address, including zero");
   std::string entry=function.getSymName().str();
   llvm::json::Object proof{{"schema","adora.guarded-inplace-large.v1"},{"entry",entry},
     {"width",width},{"height",height},{"items",trips},{"source_elements",objects[src].elements},
     {"tile_items",256},{"value_nonzero",nonzero},{"source_argument",int64_t(src)},
+    {"value_mode",rangeMode?"range":nonzero?"nonzero":"direct"},
+    {"range_lo",rangeMode?llvm::json::Value(rangeLo):llvm::json::Value(nullptr)},
+    {"range_hi",rangeMode?llvm::json::Value(rangeHi):llvm::json::Value(nullptr)},
     {"destination_argument",int64_t(dst)},{"x_argument",int64_t(bound[0])},
     {"y_argument",int64_t(bound[1])},{"enable_argument",int64_t(bound[2])},
-    {"global_address_bits",64},{"device_element_bits",16},{"proof","typed SSA exact guards, wide address and unique direct-value effect"}};
+    {"global_address_bits",64},{"device_element_bits",16},{"proof","typed SSA exact guards, wide address and unique value effect; range exhaustively checked over uint16"}};
   // Construct a local semantic equivalent only after the global proof passes.
   auto loc=function.getLoc(); OpBuilder b(function.getContext());
   function.getBody().getBlocks().clear();
@@ -245,10 +341,29 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
     auto nz=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ne,pixel,zero);
     auto inner=b.create<scf::IfOp>(loc,nz,false); b.setInsertionPointToStart(&inner.getThenRegion().front());
   }
-  b.create<memref::StoreOp>(loc,pixel,function.getArgument(3),ValueRange{localLoop.getInductionVar()});
+  Value data=pixel;
+  if(rangeMode) {
+    // unsigned16 v is ordered exactly by signed16((v + 0x8000) mod 65536).
+    // This add intentionally carries no nsw/nuw flags.
+    auto bias=b.create<arith::ConstantIntOp>(loc,-32768,16);
+    auto biased=b.create<arith::AddIOp>(loc,pixel,bias);
+    auto lower=b.create<arith::ConstantIntOp>(loc,rangeLo-32768,16);
+    auto upper=b.create<arith::ConstantIntOp>(loc,rangeHi-32768,16);
+    auto above=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sge,biased,lower);
+    auto below=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sle,biased,upper);
+    auto inside=b.create<arith::AndIOp>(loc,above,below);
+    auto selection=b.create<scf::IfOp>(loc,TypeRange{b.getI16Type()},inside,true);
+    b.setInsertionPointToStart(&selection.getThenRegion().front());
+    b.create<scf::YieldOp>(loc,ValueRange{pixel});
+    b.setInsertionPointToStart(&selection.getElseRegion().front());
+    b.create<scf::YieldOp>(loc,ValueRange{zero});
+    b.setInsertionPointAfter(selection);
+    data=selection.getResult(0);
+  }
+  b.create<memref::StoreOp>(loc,data,function.getArgument(3),ValueRange{localLoop.getInductionVar()});
   b.setInsertionPointToEnd(body); b.create<func::ReturnOp>(loc);
   SmallVector<Object> localObjects{{256,"uint16",false},{256,"int16",false},{256,"int16",false},{256,"uint16",true,true}};
-  if(failed(lower(function,localObjects))) return failure();
+  if(failed(lower(function,localObjects,rangeMode))) return failure();
   std::error_code ec; llvm::raw_fd_ostream out(descriptor,ec,llvm::sys::fs::OF_Text);
   if(ec) return reject("cannot write verified descriptor");
   out << llvm::formatv("{0:2}\n",llvm::json::Value(std::move(proof)));

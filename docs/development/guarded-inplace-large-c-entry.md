@@ -162,8 +162,14 @@ execution. Distinct plans do not promise serialization on a shared runtime;
 callers must sequence them unless their runtime independently supports it.
 
 The descriptor schema is `adora.guarded-inplace-large.v1`, host support version
-2. Version 2 rejects stale version 1 descriptors. Previously generated modules
-embed their own version 1 support and remain independently executable.
+3. New compiler proofs explicitly identify `value_mode` as `direct`, `nonzero`,
+or `range`, with `range_lo`/`range_hi` integers for range mode and null bounds
+otherwise. `value_nonzero` must agree with the mode. Missing or contradictory
+proofs fail before mapping/publication. Kernel cache keys and module identities
+include value semantics; different intervals cannot reuse the wrong kernel.
+Version 3 also accepts legacy version 2 descriptors only when they contain no
+new mode/range fields. Previously generated modules retain their own embedded
+support and remain independently executable. Foreign-plan rejection is unchanged.
 Source and target each have a conservative maximum of 16,777,216 elements,
 checked before user-sized allocations. The compiler additionally restricts width and height to 1..32767.
 Dimensions and their product are checked in Python's wide integer domain; accepted offsets are stored as int64. All
@@ -182,6 +188,58 @@ instance also has an opaque process-local identity: even a plan from an
 identically compiled independent module is rejected by `module.execute_plan`.
 Python private names are implementation details, not a security sandbox against
 a caller modifying generated executable code.
+
+## Inclusive depth-range overlay
+
+The large profile also supports the following effect inside the same exact
+enable and two-dimensional address guard:
+
+```c
+uint16_t v = src[(size_t)yy * (size_t)W + (size_t)xx];
+dst[i] = (LO <= v && v <= HI) ? v : 0;
+```
+
+`LO` and `HI` must be fixed positive inclusive bounds with
+`0 < LO <= HI <= 65535`. A valid address always writes, including a missing
+depth value of zero or an out-of-range nonzero value. An invalid address keeps
+the old destination. For example, with old value 43 and bounds [5000,10000],
+a valid depth 11000 writes zero; an invalid coordinate retains 43. The
+nonzero-overlay mode would instead write 11000 for that valid depth.
+
+The proof follows typed SSA through a single guarded source load and a single
+same-iteration destination store. It accepts pure select/value-returning
+`scf.if`/yield trees, integer extensions/truncations, and two constant interval
+comparisons of that same read. It evaluates the value expression for every one
+of the 65,536 uint16 bit patterns, including the actual signedness of each
+extension and comparison, before constructing the local kernel. Reversed
+comparisons, reordered conjunctions and parameter names/orders do not define
+semantics. Separate branch stores, additional reads/effects, wrong indices,
+missing address guards, feedback and unproved range expressions reject.
+
+The device computes signed16 `((v + 0x8000) mod 65536)` and compares against
+`LO-32768` and `HI-32768`; this order mapping is exact across the high bit. The
+modular ADD has no signed/unsigned no-overflow flags. A value selection supplies
+either the original bits of `v` or zero to CSTORE. The write predicate remains
+the address/enable guard. No host packing, task selection, or copyback code
+examines pixel range. The 256-slot ABI, window size, completion cursor, serial
+awaits and failure semantics remain unchanged.
+
+The bounded dynamic-LOAD validator independently checks the modular bias,
+two signed bounds, original-pixel/zero select and exact safe-address/write-guard
+identity. It retains the existing unique read, initialized destination and
+sequential CSTORE checks; compiler attributes cannot bypass this validation.
+
+Some supported cgeist builds inspect typedef types without desugaring when
+lowering integer promotions, incorrectly emitting a signed extension for
+`uint16_t`. The checked large-C frontend exposes the builtin unsigned-short
+type using a redundant `((unsigned short)(expression))` cast at Clang-proved
+unsigned16-to-int conversion sites. It uses AST byte offsets and desugared
+types, preserves the original preprocessed source, and records `normalized.c`
+and `unsigned-promotions.json` with hashes in provenance. Repeating the
+normalization on the normalized AST makes no changes. An explicit signed
+reinterpretation is not repaired; the SSA proof rejects it when it fails the
+unsigned range effect. No Polygeist source change or textual IR signedness
+replacement is involved.
 
 ## Packing and output
 

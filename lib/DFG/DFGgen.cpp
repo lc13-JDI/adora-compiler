@@ -23,6 +23,7 @@
 #include <iostream>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <bit>
@@ -5164,6 +5165,55 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
         index >= load.getMemRefType().getNumElements())))
       reject(load, "affine reads must be constant in-object reads in the invocation loop");
   });
+  // Independently recognize the local range effect, rather than accepting a
+  // compiler attribute as authorization for arbitrary CSTORE data. The data
+  // path is exactly select(lo <= signed16(v+0x8000) <= hi, v, 0), and its
+  // store predicate is the same guard that selects the safe read address.
+  auto rangeSelectedRead = [&](ADORA::CondStoreOp store) -> memref::LoadOp {
+    auto integer = [](mlir::Value v) -> std::optional<int64_t> {
+      auto c = v.getDefiningOp<arith::ConstantOp>();
+      auto a = c ? dyn_cast<IntegerAttr>(c.getValue()) : IntegerAttr();
+      if (!a || !a.getType().isSignlessInteger(16)) return std::nullopt;
+      return a.getInt();
+    };
+    auto select = store.getValue().getDefiningOp<arith::SelectOp>();
+    if (!select || integer(select.getFalseValue()) != 0) return {};
+    auto read = select.getTrueValue().getDefiningOp<memref::LoadOp>();
+    if (!read || read.getIndices().size() != 1) return {};
+    auto address = read.getIndices()[0].getDefiningOp<arith::IndexCastOp>();
+    auto safe = address ? address.getIn().getDefiningOp<arith::SelectOp>() : arith::SelectOp();
+    if (!safe || safe.getCondition() != store.getCondition() || integer(safe.getFalseValue()) != 0)
+      return {};
+    auto both = select.getCondition().getDefiningOp<arith::AndIOp>();
+    if (!both) return {};
+    mlir::Value biased;
+    std::optional<int64_t> lower, upper;
+    for (mlir::Value value : {both.getLhs(), both.getRhs()}) {
+      auto cmp = value.getDefiningOp<arith::CmpIOp>();
+      if (!cmp) return {};
+      auto lhs = cmp.getLhs(), rhs = cmp.getRhs();
+      auto predicate = cmp.getPredicate();
+      using P = arith::CmpIPredicate;
+      if (integer(lhs)) {
+        std::swap(lhs, rhs);
+        if (predicate == P::sle) predicate = P::sge;
+        else if (predicate == P::sge) predicate = P::sle;
+        else return {};
+      }
+      auto bound = integer(rhs);
+      if (!bound || (biased && biased != lhs)) return {};
+      biased = lhs;
+      if (predicate == P::sge && !lower) lower = *bound;
+      else if (predicate == P::sle && !upper) upper = *bound;
+      else return {};
+    }
+    if (!lower || !upper || *lower < -32767 || *lower > *upper) return {};
+    auto add = biased.getDefiningOp<arith::AddIOp>();
+    if (!add || add.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
+        !((add.getLhs() == read.getResult() && integer(add.getRhs()) == -32768) ||
+          (add.getRhs() == read.getResult() && integer(add.getLhs()) == -32768))) return {};
+    return read;
+  };
   function.walk([&](ADORA::DataBlockStoreOp block) {
     if (inoutObjects.contains(block.getSourceMemref())) {
       auto initial = validObject(block.getSourceMemref(), /*allowInout=*/true);
@@ -5186,6 +5236,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
         if (user == block.getOperation() || (original && original->isAncestor(user))) continue;
         auto store = dyn_cast<ADORA::CondStoreOp>(user);
         auto read = store ? store.getValue().getDefiningOp<memref::LoadOp>() : memref::LoadOp();
+        if (store && !read) read = rangeSelectedRead(store);
         if (!store || store->getParentOp() != invocationLoop || store.getIndices().size() != 1 ||
             store.getIndices()[0] != reductionLoop.getInductionVar() || !read ||
             read.getMemref() == store.getMemref() ||
@@ -5194,7 +5245,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
               return name != "adora.cstore_address_mode" && name != "adora.cstore_slots" &&
                      name != "adora.cstore_object";
             }))
-          reject(user, "inout requires one direct CSTORE of the loaded sample at dst[iv], without feedback");
+          reject(user, "inout requires one CSTORE of the loaded sample or proven range-selected sample at dst[iv], without feedback");
         else ++writes;
       }
       if (writes != 1) reject(block, "inout requires exactly one conditional write role");
