@@ -533,7 +533,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
             raise ValueError('mapper did not produce Python and nonempty hardware configuration')
         if large:
             proof = json.loads((root / 'host-proof.json').read_text())
-            proof['support_version'] = 1
+            proof['support_version'] = 2
             proof['module_identity'] = hashlib.sha256(source_copy.read_bytes() +
                 normalized.read_bytes() + bridged.read_bytes() + raw_python.read_bytes() +
                 json.dumps(provenance['tools'], sort_keys=True).encode() +

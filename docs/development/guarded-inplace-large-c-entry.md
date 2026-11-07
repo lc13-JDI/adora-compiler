@@ -124,6 +124,25 @@ and releases it on safe completion. Its cost includes plan creation every time.
 Changing coordinates or enable requires a new plan. Changing source or old
 destination values takes effect on the next execution without rebuilding.
 
+The default host preparation uses bounded NumPy windows and cursor completion
+accounting. Diagnostic choices are explicit keyword-only plan options:
+
+```python
+plan = module.make_plan(x, y, en, preparation="window", window_tiles=32,
+                        bookkeeping="cursor", probes=True)
+```
+
+`window_tiles` accepts integers from 1 through 256; allocated capacity is further
+limited to the number of active tiles. `preparation="tile"` retains the original
+per-tile preparation algorithm as a fallback/control. `bookkeeping="eager"`
+retains the original `completed.append((begin, end))` and `tuple(completed)`
+on each completion, plus the final report's tuple copy, permitting a
+preparation-only comparison against the cursor implementation. These choices never move value predicates
+or output computation onto the host, change the 256-slot device ABI, or allow
+multiple outstanding calls. `probes=False` disables fine-grained clocks;
+unmeasured phase values are `None`, while `total` remains measured. The once-only
+five-array entry uses default options.
+
 ## Ownership and validation
 
 A plan owns immutable byte copies of all three bound int16 arrays. Setting a
@@ -143,11 +162,17 @@ execution. Distinct plans do not promise serialization on a shared runtime;
 callers must sequence them unless their runtime independently supports it.
 
 The descriptor schema is `adora.guarded-inplace-large.v1`, host support version
-1. Source and target each have a conservative maximum of 16,777,216 elements,
+2. Version 2 rejects stale version 1 descriptors. Previously generated modules
+embed their own version 1 support and remain independently executable.
+Source and target each have a conservative maximum of 16,777,216 elements,
 checked before user-sized allocations. The compiler additionally restricts width and height to 1..32767.
 Dimensions and their product are checked in Python's wide integer domain; accepted offsets are stored as int64. All
 hardware indices remain 0..255 or -1. Positive signed-int16 coordinates limit
 the reachable portion of any dimension, independently of allocation capacity.
+Before copying input arrays the plan also checks its conservative immutable
+ndarray payload estimate against a 768 MiB limit and the platform index size.
+Allocation failures retain `MemoryError` with a plan-specific diagnostic; these
+checks do not guarantee that the process has enough available memory.
 
 The compiler embeds host support and the generated local implementation into
 the public module, together with a compiled artifact identity. Descriptor JSON
@@ -168,26 +193,67 @@ output slots are zero. Real old destination slots come from the current frame.
 Only a tile with no valid read guard is skipped. Pixel values never select tasks,
 so the optional source-value-nonzero predicate remains on the device.
 
+The window path precomputes immutable local indices, enable masks, valid packed
+positions, int64 source offsets, and safe destination gather indices. A batch
+contains up to `window_tiles` active tiles in global order; skipped tiles consume
+no window slots. Each execution gathers current source and old destination
+values for just that batch. Invalid source offsets are never gathered; padded
+old destinations are explicitly zeroed. Prefetching the old values of later
+tiles is safe because their destination ranges are disjoint and the caller's
+exclusive borrow covers the entire execution.
+
 After the generated call completes, the first `count` returned destination
 slots are copied back without a host predicate or host result merge. Padding
-is never copied beyond the real output range. Scratch buffers are reused only
-after completion. The immutable plan payload is `14*T + ceil(T/256)` bytes:
-three 16-bit snapshots, one 64-bit offset per query, and one activity byte per
-tile. Persistent scratch payload is 2,560 bytes (four tile arrays and local slot
-indices). Plan construction uses additional O(T) temporary arrays; execution
-uses bounded tile temporaries. Python object headers, runtime-owned resources,
-caller frames, and transient allocation peaks are excluded from these payload
-figures and require separate process-memory measurement.
+is never copied beyond the real output range. The device still sees one serial
+256-slot call; no window is refilled until all its calls have completed.
+
+On a 64-bit host, with T queries, V valid queries, A active tiles and
+B=min(window_tiles,A), immutable window ndarray payload is `6*T + 16*V +
+12*256*A` bytes. Persistent dynamic scratch is `4*256*B` bytes (packed and old
+uint16 arrays). `execution_scratch_bound_bytes` conservatively allows
+`16*256*B` bytes for these arrays and NumPy gather temporaries. Thus the default
+32-tile capacity uses at most 32 KiB persistent dynamic scratch, with a 128 KiB
+execution payload bound; the maximum configurable capacity has a 1 MiB bound.
+All-invalid plans allocate zero dynamic payload. The tile fallback retains
+`14*T + ceil(T/256)` immutable bytes and 2,560 persistent scratch bytes, with a
+6,144-byte execution payload bound. These execution bounds exclude the existing
+static plan and runtime-owned allocations.
+
+Plan construction uses additional O(T) temporary arrays and O(window_tiles*256)
+window construction buffers. Python headers, caller frames, allocator overhead,
+runtime resources, and construction peaks are excluded from ndarray payload
+figures and require separate memory measurement. `completion_metadata_bytes`
+counts the immutable active-range tuple, its range tuples and integer endpoints
+using `sys.getsizeof`; additional window-container headers are excluded.
+`completion_snapshot_bound_bytes` bounds one observation tuple's container,
+whose range entries share immutable objects. Eager bookkeeping additionally
+allocates a growing list and one new pair tuple per completed tile, and may
+temporarily hold two prefix containers. Those Python allocations are excluded
+from the static metadata count and ndarray scratch bound; measure their peak
+separately. Callers can also retain arbitrarily many snapshots.
 
 `plan.stats` reports `plan_bytes`, `scratch_bytes`, `active_tiles`,
-`skipped_tiles`, `plan_build_ns`, and completed `executions`. Every successful
+`skipped_tiles`, `plan_build_ns`, and completed `executions`, together with the
+actual `preparation`, `window_tiles`, `bookkeeping`, `probes` and the memory
+fields above. Every successful
 execution returns `completed_ranges` (half-open output intervals), tile counts,
 and `timings_ns` for precheck, prepare, pack, device, copyback, and total.
+Window `prepare` covers clearing packed storage and gathering/zeroing old output;
+`pack` covers valid source gathers. Immutable template construction belongs to
+`plan_build_ns`, not execution. `copyback` includes cursor/prefix updates.
+`total` retains the old boundary: entry through final copyback, before final
+report construction and its detached return copy. It also includes loop and
+bookkeeping work outside the phase clocks. Measure outer coroutine wall time
+when accounting for report construction or comparing full host overhead.
 `device` measures awaited generated-call wall time, including runtime and
 simulation overhead; it is not hardware execution time. Timing calls are part
 of production host overhead. `last_report` returns a detached copy of the last
-successful report. `completed_ranges` reports progress of the current/latest
-attempt; skipped unchanged ranges are not listed as device-completed ranges.
+successful report, even while a later attempt is pending or fails.
+`completed_ranges` materializes an immutable snapshot of the current/latest
+attempt from a completion cursor; reading it while a call awaits observes every
+previously copied tile. Existing snapshots never change. Skipped unchanged
+ranges are not listed as device-completed ranges. A precheck rejection leaves
+previous progress/report untouched.
 
 ## Failure and cancellation
 
@@ -203,6 +269,11 @@ its scratch, runtime, and frame borrow. Ordinary exceptions become
 Cancellation/control-flow exceptions keep their original type and receive the
 same fields. Previously copied ranges remain visible; no whole-frame rollback
 is promised. The failed tile has not been copied to the global destination.
+Failure during host preparation, before a new call begins, reports the next
+uncopied active range without poisoning the plan. Already completed output is
+still retained. This is distinct from a failure inside a generated await, where
+completion is unknown and the entire window owner is retained by the rooted
+plan alongside runtime, source and destination.
 
 The implementation uses scheduler-neutral awaits and does not require an
 asyncio loop. Cocotb 1.9 `Task.kill()` can unschedule a started coroutine without

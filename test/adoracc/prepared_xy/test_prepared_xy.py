@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -15,7 +16,7 @@ MODULE = ROOT / 'tools/adoracc/prepared_xy.py'
 
 
 def descriptor(items=4, nonzero=False):
-    return dict(schema='adora.guarded-inplace-large.v1', support_version=1,
+    return dict(schema='adora.guarded-inplace-large.v1', support_version=2,
                 module_identity='a' * 64, entry='overlay', width=8193, height=1,
                 items=items, source_elements=8193, tile_items=256,
                 value_nonzero=nonzero, source_argument=0, x_argument=1,
@@ -147,10 +148,11 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
                      (x.byteswap().view('>i2'), y, en)]:
             with self.assertRaises(ValueError):
                 make(*args)
-        for changes in [dict(support_version=2), dict(schema='external'),
+        for changes in [dict(support_version=1), dict(support_version=3), dict(schema='external'),
                         dict(module_identity='unverified'), dict(width=True),
                         dict(items=2**63), dict(width=2**63),
-                        dict(source_elements=0), dict(tile_items=128),
+                        dict(source_elements=0), dict(items=0), dict(width=0),
+                        dict(height=0), dict(tile_items=128),
                         dict(x_argument=0), dict(value_nonzero=1)]:
             with self.assertRaises(ValueError):
                 self.bind(desc=dict(descriptor(), **changes))
@@ -179,7 +181,7 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report['completed_ranges'], ((0, 256), (256, 353)))
         np.testing.assert_array_equal(base[1:-1], np.full(353, 60000, np.uint16))
         np.testing.assert_array_equal(base[[0, -1]], [17, 17])
-        self.assertEqual(self.calls[0], self.calls[1])
+        self.assertEqual(len(self.calls), 2)
         self.assertLessEqual(plan.stats['scratch_bytes'], 8192)
         self.assertLessEqual(plan.stats['plan_bytes'], 32 * 353 + 4096)
         plan.close()
@@ -328,6 +330,261 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(value is plan for value in self.module._POISONED_PLANS))
         with self.assertRaises(ValueError):
             plan.close()
+
+    async def test_window_modes_typed_buffers_and_bounded_memory(self):
+        items = 256 * 67 + 1
+        x, y, en = self.arrays(items)
+        x[::7] = -1
+        en[256:512] = 0
+        src = np.arange(8193, dtype=np.uint16)
+        expected = np.full(items, 73, np.uint16)
+        valid = (en != 0) & (x >= 0)
+        expected[valid] = src[x[valid]]
+        reference_buffers = None
+        for preparation, bookkeeping, probes in (
+                ('tile', 'eager', True), ('window', 'eager', True),
+                ('window', 'cursor', True), ('window', 'cursor', False)):
+            self.calls.clear()
+            make, _, _ = self.bind(items=items)
+            plan = make(x, y, en, preparation=preparation, window_tiles=3,
+                        bookkeeping=bookkeeping, probes=probes)
+            dst = np.full(items, 73, np.uint16)
+            report = await plan.execute(None, src, dst)
+            np.testing.assert_array_equal(dst, expected)
+            for call in self.calls:
+                for value, dtype in zip(call, (np.uint16, np.int16, np.int16, np.uint16)):
+                    self.assertEqual(value.shape, (256,))
+                    self.assertEqual(value.dtype, dtype)
+                    self.assertTrue(value.flags.c_contiguous)
+            if reference_buffers is None:
+                reference_buffers = list(self.calls)
+            else:
+                for actual, reference in zip(self.calls, reference_buffers):
+                    for a, b in zip(actual, reference):
+                        np.testing.assert_array_equal(a, b)
+                self.assertEqual(len(self.calls), len(reference_buffers))
+            self.assertEqual(plan.stats['preparation'], preparation)
+            self.assertLessEqual(plan.stats['scratch_bytes'], 8192)
+            self.assertLessEqual(plan.stats['execution_scratch_bound_bytes'], 3 * 256 * 16)
+            self.assertGreaterEqual(report['timings_ns']['total'], 0)
+            for phase in ('precheck', 'prepare', 'pack', 'device', 'copyback'):
+                if probes:
+                    self.assertGreaterEqual(report['timings_ns'][phase], 0)
+                else:
+                    self.assertIsNone(report['timings_ns'][phase])
+            plan.close()
+
+    async def test_769_progress_snapshots_failure_and_cancellation(self):
+        for cancel, bookkeeping in ((False, 'cursor'), (True, 'cursor'),
+                                    (False, 'eager'), (True, 'eager')):
+            entered, resume = asyncio.Event(), asyncio.Event()
+            calls = []
+            fail = False
+            async def tile(runtime, packed, idx, en, old):
+                calls.append(old)
+                if fail and len(calls) == 2:
+                    entered.set()
+                    await resume.wait()
+                    raise RuntimeError('second active tile failed')
+                old[:] = 91
+            make, _, _ = self.bind(items=769, tile=tile)
+            x, y, en = self.arrays(769)
+            en[256:512] = 0
+            plan = make(x, y, en, window_tiles=2, bookkeeping=bookkeeping)
+            src, dst = np.zeros(8193, np.uint16), np.full(769, 13, np.uint16)
+            previous = await plan.execute(object(), src, dst)
+            saved = plan.completed_ranges
+            self.assertEqual(saved, ((0, 256), (512, 768), (768, 769)))
+            dst.fill(13)
+            calls.clear()
+            fail = True
+            runtime = object()
+            task = asyncio.create_task(plan.execute(runtime, src, dst))
+            await entered.wait()
+            progress = plan.completed_ranges
+            self.assertEqual(progress, ((0, 256),))
+            self.assertEqual(plan.last_report, previous)
+            self.assertEqual(saved, ((0, 256), (512, 768), (768, 769)))
+            with self.assertRaises(ValueError):
+                await plan.execute(runtime, src, dst)
+            with self.assertRaises(ValueError):
+                plan.close()
+            if cancel:
+                task.cancel()
+                exception = asyncio.CancelledError
+            else:
+                resume.set()
+                exception = self.module.PlanExecutionError
+            with self.assertRaises(exception) as caught:
+                await task
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(caught.exception.failed_range, (512, 768))
+            self.assertEqual(caught.exception.completed_ranges, progress)
+            self.assertEqual(plan.completed_ranges, progress)
+            self.assertEqual(plan.last_report, previous)
+            self.assertTrue(plan.poisoned)
+            self.assertIn(plan, self.module._POISONED_PLANS)
+            self.assertIs(plan._retained[0], runtime)
+            self.assertIs(plan._retained[1], src)
+            self.assertIs(plan._retained[2], dst)
+            np.testing.assert_array_equal(dst[:256], np.full(256, 91))
+            np.testing.assert_array_equal(dst[256:], np.full(513, 13))
+
+    async def test_window_options_and_templates_are_immutable(self):
+        make, _, _ = self.bind(items=769)
+        arrays = self.arrays(769)
+        for options in (dict(window_tiles=0), dict(window_tiles=257),
+                        dict(window_tiles=True), dict(window_tiles=1.5),
+                        dict(preparation='native'), dict(bookkeeping='unknown'),
+                        dict(probes=1)):
+            with self.assertRaises(ValueError):
+                make(*arrays, **options)
+        plan = make(*arrays, window_tiles=2)
+        self.assertEqual(plan.stats['window_tiles'], 2)
+        for window in plan._windows:
+            for array in window[1:]:
+                self.assertFalse(array.flags.writeable)
+                with self.assertRaises(ValueError):
+                    array.flags.writeable = True
+        plan.close()
+
+    async def test_boundary_lengths_last_only_and_rebuilt_enable(self):
+        src = np.arange(8193, dtype=np.uint16)
+        src[0], src[1], src[8192] = 0, 32768, 65535
+        for items in (1, 255, 256, 257, 353):
+            for nonzero in (False, True):
+                make, _, _ = self.bind(items=items, nonzero=nonzero)
+                x = np.resize(np.array([0, 1, 8192, -1], np.int16), items)
+                y, en = np.zeros(items, np.int16), np.zeros(items, np.int16)
+                empty = make(x, y, en, window_tiles=2)
+                en[-1], x[-1] = -2, 8192
+                last_only = make(x, y, en, window_tiles=2)
+                en.fill(2)
+                full = make(x, y, en, window_tiles=2)
+                for plan, mode in ((empty, 'empty'), (last_only, 'last'), (full, 'full')):
+                    dst = np.full(items, 41, np.uint16)
+                    expected = dst.copy()
+                    if mode == 'last':
+                        expected[-1] = 65535
+                    elif mode == 'full':
+                        valid = x >= 0
+                        if nonzero:
+                            valid &= src[np.maximum(x, 0)] != 0
+                        expected[valid] = src[x[valid]]
+                    await plan.execute(None, src, dst)
+                    np.testing.assert_array_equal(dst, expected)
+                    plan.close()
+
+    async def test_success_progress_snapshots_and_precheck_preserve_history(self):
+        gates = [asyncio.Event() for _ in range(3)]
+        entered = [asyncio.Event() for _ in range(3)]
+        calls = []
+        async def tile(runtime, packed, idx, en, old):
+            i = len(calls)
+            calls.append(i)
+            entered[i].set()
+            await gates[i].wait()
+            old[:] = 60 + i
+        make, _, _ = self.bind(items=769, tile=tile)
+        x, y, en = self.arrays(769)
+        en[256:512] = 0
+        plan = make(x, y, en, window_tiles=2)
+        src, dst = np.zeros(8193, np.uint16), np.full(769, 13, np.uint16)
+        task = asyncio.create_task(plan.execute(None, src, dst))
+        observations = []
+        for i in range(3):
+            await entered[i].wait()
+            observations.append(plan.completed_ranges)
+            self.assertEqual(len(observations[-1]), i)
+            self.assertIsNone(plan.last_report)
+            gates[i].set()
+        report = await task
+        self.assertEqual(observations, [(), ((0, 256),), ((0, 256), (512, 768))])
+        with self.assertRaises(ValueError):
+            await plan.execute(None, src[:-1], dst)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(plan.completed_ranges, report['completed_ranges'])
+        self.assertEqual(plan.last_report, report)
+        plan.close()
+
+    async def test_resource_diagnostics_and_preparation_failure_boundary(self):
+        make, _, _ = self.bind(items=769)
+        arrays = self.arrays(769)
+        with patch.object(self.module, 'MAX_PLAN_BYTES', 1):
+            with self.assertRaisesRegex(ValueError, 'resource bound'):
+                make(*arrays)
+        with patch.object(self.module, '_immutable', side_effect=MemoryError):
+            with self.assertRaisesRegex(MemoryError, 'allocation failed'):
+                make(*arrays)
+        self.assertEqual(self.calls, [])
+        arrays[2][256:512] = 0
+        plan = make(*arrays, window_tiles=1)
+        src, dst = np.ones(8193, np.uint16), np.full(769, 77, np.uint16)
+        take = self.module.np.take
+        preparations = []
+        def exhausted(*args, **kwargs):
+            preparations.append(None)
+            if len(preparations) == 2:
+                raise MemoryError('bounded gather allocation failed')
+            return take(*args, **kwargs)
+        with patch.object(self.module.np, 'take', side_effect=exhausted):
+            with self.assertRaises(self.module.PlanExecutionError) as caught:
+                await plan.execute(None, src, dst)
+        self.assertEqual(caught.exception.completed_ranges, ((0, 256),))
+        self.assertEqual(caught.exception.failed_range, (512, 768))
+        self.assertFalse(caught.exception.poisoned)
+        self.assertFalse(plan.poisoned)
+        self.assertEqual(len(self.calls), 1)
+        np.testing.assert_array_equal(dst[256:], np.full(513, 77))
+        plan.close()
+
+    async def test_unscheduled_window_retains_frames_after_namespace_gc(self):
+        class Suspended:
+            def __await__(self):
+                yield 'pending window'
+        class Runtime:
+            pass
+        namespace = {'__name__': 'temporary_embedded_window_support'}
+        exec(MODULE.read_text(), namespace)
+        async def tile(runtime, *buffers):
+            await Suspended()
+        make, execute, once = namespace['bind_prepared_entry'](tile, descriptor(items=769))
+        plan = make(*self.arrays(769), window_tiles=2)
+        runtime = Runtime()
+        src, dst = np.zeros(8193, np.uint16), np.zeros(769, np.uint16)
+        references = [weakref.ref(value) for value in (runtime, src, dst, *plan._scratch)]
+        coroutine = plan.execute(runtime, src, dst)
+        self.assertEqual(coroutine.send(None), 'pending window')
+        registry = namespace['_INFLIGHT_PLANS']
+        plan_id = id(plan)
+        del plan, runtime, src, dst, namespace, make, execute, once
+        gc.collect()
+        self.assertTrue(all(reference() is not None for reference in references))
+        retained = next(value for value in registry if id(value) == plan_id)
+        self.assertTrue(retained.pending)
+        self.assertEqual(retained.completed_ranges, ())
+        coroutine.close()
+        del coroutine, retained
+        gc.collect()
+        self.assertTrue(all(reference() is not None for reference in references))
+
+    async def test_wide_offsets_readonly_source_and_closed_snapshot(self):
+        desc = dict(descriptor(), width=32767, height=3, source_elements=98301)
+        make, _, _ = self.bind(desc=desc)
+        x = np.array([32766, 32767, 32766, -1], np.int16)
+        y = np.array([2, 0, 3, 0], np.int16)
+        plan = make(x, y, np.ones(4, np.int16))
+        self.assertEqual(plan._windows[0][4].dtype, np.dtype(np.int64))
+        np.testing.assert_array_equal(plan._windows[0][4], [98300])
+        src = np.arange(98301, dtype=np.uint16)
+        src[98300] = 65535
+        src.flags.writeable = False
+        dst = np.full(4, 123, np.uint16)
+        report = await plan.execute(None, src, dst)
+        np.testing.assert_array_equal(dst, [65535, 123, 123, 123])
+        plan.close()
+        self.assertEqual(plan.completed_ranges, report['completed_ranges'])
+        self.assertEqual(plan.last_report, report)
 
 
 if __name__ == '__main__':
