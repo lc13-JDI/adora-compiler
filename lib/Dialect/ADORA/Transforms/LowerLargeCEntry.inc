@@ -3,7 +3,7 @@
 // address/effect fact from typed SSA and then constructs a fresh local function.
 LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
                                          SmallVector<Object> &objects,
-                                         llvm::json::Object &root) {
+                                         llvm::json::Object &root, const CanvasProof *canvas) {
   auto reject = [&](Twine message) -> LogicalResult {
     function.emitError("large C-entry: ") << message; return failure();
   };
@@ -316,6 +316,28 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
     {"destination_argument",int64_t(dst)},{"x_argument",int64_t(bound[0])},
     {"y_argument",int64_t(bound[1])},{"enable_argument",int64_t(bound[2])},
     {"global_address_bits",64},{"device_element_bits",16},{"proof","typed SSA exact guards, wide address and unique value effect; range exhaustively checked over uint16"}};
+  if (canvas) {
+    if (!rangeMode || nonzero) return reject("canvas update requires inclusive range value-or-zero");
+    for (const char *key : {"source_argument", "destination_argument", "x_argument", "y_argument", "enable_argument"})
+      proof[key] = int64_t(canvas->originalPositions[*proof.getInteger(key)]);
+    proof["schema"] = "adora.guarded-canvas-mask.v1";
+    proof["old_argument"] = int64_t(canvas->oldArgument);
+    proof["regular_entry"] = "_adora_canvas_regular_tile";
+    proof["old_only_entry"] = "_adora_canvas_old_tile";
+    proof["ownership"] = "copy";
+    proof["value_mode"] = "canvas-mask";
+    proof["canvas_uses"] = int64_t(canvas->canvasUses);
+    proof["canvas_use_kinds"] = canvas->canvasUses == 3
+        ? llvm::json::Array{"unconditional-old-store", "guarded-range-store", "same-slot-mask-load"}
+        : llvm::json::Array{"complete-SSA-merge-store", "same-slot-mask-load"};
+    proof["proof"] = "typed SSA private allocation and exhaustive use/effect census; identical loop domains; complete old initialization and unique mask consumer; exact guards, wide address, uint16 range and mask enumerations";
+    if (failed(emitCanvas(function, rangeLo, rangeHi))) return failure();
+    std::error_code ec; llvm::raw_fd_ostream out(descriptor, ec, llvm::sys::fs::OF_Text);
+    if (ec) return reject("cannot write verified descriptor");
+    out << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(proof)));
+    function.erase();
+    return success();
+  }
   // Construct a local semantic equivalent only after the global proof passes.
   auto loc=function.getLoc(); OpBuilder b(function.getContext());
   function.getBody().getBlocks().clear();

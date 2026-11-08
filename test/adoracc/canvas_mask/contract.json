@@ -1,0 +1,70 @@
+{
+  "entry": "depth_canvas_mask",
+  "defines": {
+    "W": 32,
+    "H": 8,
+    "T": 512,
+    "LO": 5000,
+    "HI": 10000
+  },
+  "objects": [
+    {
+      "argument_position": 0,
+      "name": "src",
+      "elements": 256,
+      "host_dtype": "uint16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 1,
+      "name": "x",
+      "elements": 512,
+      "host_dtype": "int16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 2,
+      "name": "y",
+      "elements": 512,
+      "host_dtype": "int16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 3,
+      "name": "enabled",
+      "elements": 512,
+      "host_dtype": "int16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 4,
+      "name": "old",
+      "elements": 512,
+      "host_dtype": "uint16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 5,
+      "name": "mask",
+      "elements": 512,
+      "host_dtype": "uint16",
+      "contiguous": true,
+      "access_assertion": "write"
+    }
+  ],
+  "host_plan": {
+    "strategy": "per-query",
+    "tile_items": 256,
+    "bind_arguments": [
+      1,
+      2,
+      3
+    ],
+    "ownership": "copy"
+  }
+}

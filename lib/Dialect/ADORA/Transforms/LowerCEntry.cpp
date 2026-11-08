@@ -92,11 +92,19 @@ static void refine(Value guard, Value leaf, Range &range,
   }
 }
 
+struct CanvasProof {
+  unsigned oldArgument;
+  SmallVector<unsigned> originalPositions;
+  unsigned canvasUses;
+};
+
 class LowerCEntryPass : public LowerCEntryBase<LowerCEntryPass> {
   void runOnOperation() override;
   LogicalResult lower(func::FuncOp function, SmallVector<Object> &objects,
                       bool provenRange = false);
-  LogicalResult lowerLarge(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root);
+  LogicalResult lowerLarge(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root, const CanvasProof *canvas = nullptr);
+  LogicalResult lowerCanvas(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root);
+  LogicalResult emitCanvas(func::FuncOp function, int64_t rangeLo, int64_t rangeHi);
 };
 } // namespace
 
@@ -168,7 +176,12 @@ void LowerCEntryPass::runOnOperation() {
   // effects outside the declared kernel. This explicit profile is one entry.
   for (auto other : module.getOps<func::FuncOp>())
     if (other != function) return reject("only the selected C entry is supported");
-  if (largeObjects) {
+  if (canvasMask) {
+    if (!largeObjects || bankBytes < 512 || descriptor.empty() ||
+        (canvasKernel != "both" && canvasKernel != "regular" && canvasKernel != "old-only"))
+      return reject("canvas-mask requires large-objects, a 512-byte bank, descriptor and a valid canvas-kernel role");
+    if (failed(lowerCanvas(function, objects, *root))) signalPassFailure();
+  } else if (largeObjects) {
     if (!allowPartialWrites || bankBytes < 512 || descriptor.empty())
       return reject("large objects require partial writes, a 512-byte bank and descriptor output");
     if (failed(lowerLarge(function, objects, *root))) signalPassFailure();
@@ -330,7 +343,10 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
              arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::CmpIOp,
              arith::AndIOp, arith::IndexCastOp, arith::AddIOp,
              arith::MulIOp, memref::LoadOp, memref::StoreOp,
-             affine::AffineLoadOp, affine::AffineStoreOp>(op)) {
+             affine::AffineLoadOp, affine::AffineStoreOp>(op) &&
+        // Only the fresh canvas emitter introduces this signed nonzero OR.
+        // The original source stream profiles keep their existing whitelist.
+        !(provenRange && canvasMask && isa<arith::OrIOp>(op))) {
       error(op, "unsupported effect or operation in static C stream"); return;
     }
     if (op->hasAttr("adora.no_access") || op->hasAttr("adora.require_no_access"))
@@ -629,6 +645,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   return success();
 }
 
+#include "LowerCanvasMaskCEntry.inc"
 #include "LowerLargeCEntry.inc"
 
 std::unique_ptr<OperationPass<ModuleOp>> mlir::ADORA::createLowerCEntryPass() {

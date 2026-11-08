@@ -10,7 +10,9 @@ set(PYTHON_INSTALL_PATH ${CMAKE_INSTALL_PREFIX}/bin)
 set(ADORACC_FILES
   adoracc.py
   c_entry.py
-  prepared_xy.py)
+  prepared_xy.py
+  canvas_entry.py
+  prepared_canvas.py)
 
 set(ADORACC_TARGETS ${ADORACC_FILES})
 list(TRANSFORM ADORACC_TARGETS PREPEND ${PROJECT_BINARY_DIR}/bin/)
@@ -31,15 +33,15 @@ add_custom_target(adoracc.py ALL DEPENDS ${ADORACC_TARGETS})
 
 # This chicanery is necessary to ensure executable permissions.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/copy_adoracc.cmake"
-"file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/adoracc.py ${CMAKE_CURRENT_SOURCE_DIR}/c_entry.py ${CMAKE_CURRENT_SOURCE_DIR}/prepared_xy.py
+"file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/adoracc.py ${CMAKE_CURRENT_SOURCE_DIR}/c_entry.py ${CMAKE_CURRENT_SOURCE_DIR}/prepared_xy.py ${CMAKE_CURRENT_SOURCE_DIR}/canvas_entry.py ${CMAKE_CURRENT_SOURCE_DIR}/prepared_canvas.py
 DESTINATION ${PROJECT_BINARY_DIR}/bin
 FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_WRITE
 GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)")
 
 add_custom_command(OUTPUT ${ADORACC_TARGETS} COMMAND
 ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/copy_adoracc.cmake
-DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/adoracc.py ${CMAKE_CURRENT_SOURCE_DIR}/c_entry.py ${CMAKE_CURRENT_SOURCE_DIR}/prepared_xy.py)
+DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/adoracc.py ${CMAKE_CURRENT_SOURCE_DIR}/c_entry.py ${CMAKE_CURRENT_SOURCE_DIR}/prepared_xy.py ${CMAKE_CURRENT_SOURCE_DIR}/canvas_entry.py ${CMAKE_CURRENT_SOURCE_DIR}/prepared_canvas.py)
 
 # Install our python stuff too.
 install(PROGRAMS adoracc.py DESTINATION ${PYTHON_INSTALL_PATH})
-install(FILES c_entry.py prepared_xy.py DESTINATION ${PYTHON_INSTALL_PATH})
+install(FILES c_entry.py prepared_xy.py canvas_entry.py prepared_canvas.py DESTINATION ${PYTHON_INSTALL_PATH})

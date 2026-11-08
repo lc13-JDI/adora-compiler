@@ -22,10 +22,11 @@ _IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
 TARGET = 'x86_64-unknown-linux-gnu'
 
 
-def validate_contract(value: dict, *, allow_partial: bool = False, allow_large: bool = False) -> dict:
+def validate_contract(value: dict, *, allow_partial: bool = False, allow_large: bool = False,
+                      allow_canvas: bool = False) -> dict:
     if not isinstance(value, dict):
         raise ValueError('C entry contract must be a JSON object')
-    unknown = set(value) - ({'entry', 'defines', 'objects', 'source', 'id', 'host_plan'} if allow_large else {'entry', 'defines', 'objects', 'source', 'id'})
+    unknown = set(value) - ({'entry', 'defines', 'objects', 'source', 'id', 'host_plan'} if allow_large or allow_canvas else {'entry', 'defines', 'objects', 'source', 'id'})
     if unknown:
         raise ValueError(f'unsupported contract fields: {sorted(unknown)}')
     entry = value.get('entry')
@@ -62,15 +63,19 @@ def validate_contract(value: dict, *, allow_partial: bool = False, allow_large: 
     ordered.sort(key=lambda obj: obj['argument_position'])
     if [obj['argument_position'] for obj in ordered] != list(range(len(ordered))):
         raise ValueError('objects must cover consecutive argument positions exactly once')
-    if allow_large:
+    if allow_large or allow_canvas:
         plan = value.get('host_plan')
         if (not isinstance(plan, dict) or set(plan) != {'strategy', 'tile_items', 'bind_arguments', 'ownership'} or
                 plan.get('strategy') != 'per-query' or plan.get('tile_items') != 256 or plan.get('ownership') != 'copy'):
             raise ValueError('large C entry requires a per-query, 256-item, owned-copy host_plan')
         bound = plan.get('bind_arguments')
-        if (len(ordered) != 5 or not isinstance(bound, list) or len(bound) != 3 or
-                any(type(i) is not int or i < 0 or i >= 5 for i in bound) or len(set(bound)) != 3):
-            raise ValueError('large C entry requires five objects and three distinct bound arguments')
+        count = 6 if allow_canvas else 5
+        if (len(ordered) != count or not isinstance(bound, list) or len(bound) != 3 or
+                any(type(i) is not int or i < 0 or i >= count for i in bound) or len(set(bound)) != 3):
+            raise ValueError(f'large C entry requires {count} objects and three distinct bound arguments')
+        if allow_canvas and (sum(o['access_assertion'] == 'write' for o in ordered) != 1 or
+                             any(o['access_assertion'] == 'inout' for o in ordered)):
+            raise ValueError('canvas mask requires one write-only output and five read-only inputs')
         if any(obj['elements'] > 16777216 for obj in ordered):
             raise ValueError('large C entry resource bound is 16777216 elements per object')
     return dict(value, defines=dict(defines), objects=ordered)
@@ -209,7 +214,8 @@ def _walk(node):
         yield from _walk(child)
 
 
-def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False) -> None:
+def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False,
+                        allow_canvas: bool = False) -> None:
     """Check source properties lost by optimized MLIR, using Clang semantic AST."""
     # Clang JSON desugars scalar typedefs but may spell a pointer's pointee with
     # its typedef name. Resolve those names through actual TypedefDecl nodes.
@@ -264,14 +270,16 @@ def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False)
         # desugared above and the single-pointer base type was checked.
         if obj['access_assertion'] in ('write', 'inout') and 'const' in tokens[:tokens.index('*')]:
             raise ValueError('write assertion contradicts const-qualified C input')
-    if allow_large:
+    if allow_large or allow_canvas:
         loops = [node for node in _walk(function) if node.get('kind') == 'ForStmt']
-        if len(loops) != 1:
-            raise ValueError('large C entry requires one source for loop')
-        declarations = [node for node in loops[0].get('inner', [])[0].get('inner', [])
-                        if node.get('kind') == 'VarDecl']
-        if len(declarations) != 1 or source_type(declarations[0]) != 'int':
-            raise ValueError('large C entry requires a signed 32-bit source induction variable')
+        count = 2 if allow_canvas else 1
+        if len(loops) != count:
+            raise ValueError(f'large C entry requires {count} source for loop(s)')
+        for loop in loops:
+            declarations = [node for node in loop.get('inner', [])[0].get('inner', [])
+                            if node.get('kind') == 'VarDecl']
+            if len(declarations) != 1 or source_type(declarations[0]) != 'int':
+                raise ValueError('large C entry requires a signed 32-bit source induction variable')
     for node in _walk(function):
         kind = node.get('kind', '')
         spelling = source_type(node)

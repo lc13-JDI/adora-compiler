@@ -340,7 +340,7 @@ def parse_args() -> argparse.Namespace:
         description="Compile C/MLIR to CDFG using cgeist/mlir-opt/cgra-opt."
     )
     parser.add_argument("input", type=Path, help="Input .C or .MLIR file")
-    parser.add_argument("--profile", choices=["guarded-stream", "guarded-inplace", "guarded-inplace-large"], default=None,
+    parser.add_argument("--profile", choices=["guarded-stream", "guarded-inplace", "guarded-inplace-large", "guarded-canvas-mask"], default=None,
                         help="Opt in to checked ordinary-C compilation through mapper.")
     parser.add_argument("--kernel-cache", type=Path, help="Optional verified fixed-kernel cache for guarded-inplace-large.")
     parser.add_argument("--mapper-wall-timeout", type=float, default=120.0, help="Large profile mapper process-tree wall limit in seconds.")
@@ -386,8 +386,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.profile in ("guarded-stream", "guarded-inplace", "guarded-inplace-large"):
-        from c_entry import run_profile
+    if args.profile in ("guarded-stream", "guarded-inplace", "guarded-inplace-large", "guarded-canvas-mask"):
+        if args.profile == "guarded-canvas-mask":
+            from canvas_entry import run_profile
+        else:
+            from c_entry import run_profile
         try:
             if args.max_iters <= 0 or args.timeout <= 0 or not math.isfinite(args.mapper_wall_timeout) or args.mapper_wall_timeout <= 0:
                 raise ValueError("mapper iteration and timeout budgets must be positive")
