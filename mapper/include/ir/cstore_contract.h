@@ -1,6 +1,8 @@
 #ifndef __CSTORE_CONTRACT_H__
 #define __CSTORE_CONTRACT_H__
 
+#include "../../../lib/DFG/inc/cstore_ports.h"
+
 #include <map>
 #include <string>
 
@@ -26,6 +28,14 @@ inline std::string logicalPortViolation(const std::map<int, int> &portUse,
              " must be covered exactly once";
   }
   return "";
+}
+
+inline std::string connectedPortViolation(const std::map<int, int> &inputEdges,
+                                           bool trustedSequential) {
+  std::map<int, int> ports;
+  for (const auto &edge : inputEdges)
+    ++ports[edge.first];
+  return cstoreLogicalPortViolation(ports, trustedSequential, true);
 }
 
 inline std::string immediateViolation(int immediateCount) {

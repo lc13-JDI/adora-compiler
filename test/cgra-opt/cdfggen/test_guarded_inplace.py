@@ -42,12 +42,11 @@ def check_graph(dot, nonzero):
     byop = lambda op: [n for n, attrs in nodes.items() if attrs['opcode'].upper() == op]
     assert not byop('OUTPUT') and not byop('CLOAD') and 'undefined' not in dot
     assert 'operand = -1' not in dot, 'plain certified read/read pairs must not become unroutable physical operands'
-    assert len(byop('CSTORE')) == len(byop('LOAD')) == len(byop('ACC')) == 1
+    assert len(byop('CSTORE')) == len(byop('LOAD')) == 1
+    assert not byop('ACC'), 'exclusive sequential destination index must not consume a GPE'
     assert len(byop('INPUT')) == 2
-    load, store, acc = (byop(op)[0] for op in ('LOAD', 'CSTORE', 'ACC'))
-    assert nodes[acc]['loop_index_acc'] == nodes[acc]['skip_first'] == '1'
-    assert nodes[acc]['acc_params'] == '0,4,1,1'
-    assert set(edges[store]) == {0, 1, 2} and set(edges[load]) == {0}
+    load, store = (byop(op)[0] for op in ('LOAD', 'CSTORE'))
+    assert set(edges[store]) == {0, 2} and set(edges[load]) == {0}
     assert nodes[load]['pattern'] == '0,4'
     assert nodes[store]['pattern'] == '2,4'
     assert nodes[store]['cstore_address_mode'] == 'sequential'
@@ -63,7 +62,7 @@ def check_graph(dot, nonzero):
         return seen
     assert load not in ancestors(edges[load][0]), 'write guard must not control its own LOAD'
     assert (load in ancestors(edges[store][2])) == nonzero
-    assert acc in ancestors(edges[store][1])
+    assert nodes[edges[load][0]]['opcode'].upper() == 'MUL', 'safe source LOAD still needs byte addressing'
     datasets = [
         ([10,20,30,40], [2,-1,0,4], [1,1,1,1], [7,8,9,10]),
         ([0,32768,60000,65535], [3,1,0,4], [2,-1,1,1], [11,22,33,44]),
@@ -92,7 +91,8 @@ def check_graph(dot, nonzero):
                     reads.append(args[0] // 2)
                     value = objects[attrs['ref_name'].split(':')[-1]][args[0] // 2]
                 elif op == 'CSTORE':
-                    assert args[1] == 2*slot and args[2] in (0, 1)
+                    assert set(args) == {0, 2} and args[2] in (0, 1)
+                    # Slot addressing is proven above and performed by the IOB AGU.
                     if args[2]:
                         objects['dst'][slot] = args[0]
                         writes.append(slot)

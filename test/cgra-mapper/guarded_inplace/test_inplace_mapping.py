@@ -12,8 +12,8 @@ mapper, fixture, adg, operations, work = [Path(arg).resolve() for arg in sys.arg
 work.mkdir(parents=True, exist_ok=True)
 base = fixture.read_text()
 # Equivalent scalar constant placement changes graph IDs and routed placement.
-# This form exposes a late address path whose old scheduler shifted the
-# autonomous ACC instead of providing enough real route/RDU delay.
+# Both forms must retain safe source byte addressing and preserve sparse
+# destination operands through placement, route delay and config emission.
 late = base.replace('    %zero = arith.constant 0 : i16\n', '').replace(
     '    %n = arith.constant 4 : i16\n', '')
 late = late.replace('    %on =', '    %zero = arith.constant 0 : i16\n    %on =')
@@ -38,4 +38,4 @@ for name, source in [('b2', base), ('late-constants', late)]:
     assert completed.returncode == 0, (entry, completed.stdout[-3000:])
     report = audit(entry, adg, operations, 4)
     (entry / 'audit.json').write_text(json.dumps(report, indent=2) + '\n')
-print('initialized inout mapping: two independent-B2 packet/route/ACC launch audits passed')
+print('initialized inout mapping: two independent-B2 packet/sparse-route/idle-MUX audits passed')

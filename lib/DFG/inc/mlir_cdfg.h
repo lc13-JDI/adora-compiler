@@ -131,6 +131,11 @@ public:
 	void addEdge(LLVMCDFGEdge *edge);
     LLVMCDFGEdge* addEdge(LLVMCDFGNode *src, LLVMCDFGNode *dst, EdgeType type);
     LLVMCDFGEdge* addEdge(LLVMCDFGNode *src, LLVMCDFGNode *dst);
+    // Construct one logical data operand, including both adjacency records.
+    // Sequential CSTORE is assigned only by the proved graph-building path;
+    // its internal AGU has no external logical address operand.
+    LLVMCDFGEdge* addOperandEdge(LLVMCDFGNode *src, LLVMCDFGNode *dst,
+                                int logicalPort, bool isBackEdge = false);
     // delete edge and corresponding src->outEdge and dst->inEdge
     void delEdge(LLVMCDFGEdge *edge);
     void delEdge(int eid);

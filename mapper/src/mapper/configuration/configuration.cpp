@@ -1,5 +1,6 @@
 
 #include "mapper/configuration.h"
+#include "ir/cstore_contract.h"
 
 #include <limits>
 
@@ -344,6 +345,39 @@ std::map<int, CfgData> Configuration::getGpeCfgData(GPENode* node){
 }
 
 // get config data for IOB, return<LSB-location, CfgData>
+void Configuration::addSequentialCStoreIdleMuxCfg(
+    std::map<int, CfgData> &cfg, IOBNode *node, DFGIONode *io) {
+    if (!io->isSequentialCStore() || io->inputEdges().count(1)) return;
+    ADG *subAdg = node->subADG();
+    std::set<int> muxes;
+    for (int physicalInput : node->operandInputs(1)) {
+        const auto &sinks = subAdg->input(physicalInput);
+        for (const auto &sink : sinks) muxes.insert(sink.first);
+    }
+    if (muxes.empty()) {
+        std::cerr << "Invalid sequential CSTORE configuration: no address input mux\n";
+        exit(1);
+    }
+    for (int muxId : muxes) {
+        auto *mux = subAdg->node(muxId);
+        auto field = node->configInfo().find(muxId);
+        if (!mux || mux->inputs().empty() || field == node->configInfo().end()) {
+            std::cerr << "Invalid sequential CSTORE configuration: missing idle mux input or field\n";
+            exit(1);
+        }
+        // Choose a legal ADG selector, and explicitly cover its packet word.
+        // No DFG producer or physical route is allocated to the inactive lane.
+        int selector = mux->inputs().begin()->first;
+        int width = field->second.high - field->second.low + 1;
+        if (selector < 0 || width <= 0 || width > 32 ||
+            (width < 32 && uint64_t(selector) >= (uint64_t(1) << width))) {
+            std::cerr << "Invalid sequential CSTORE configuration: idle mux selector does not fit\n";
+            exit(1);
+        }
+        addCfgData(cfg, field->second, uint32_t(selector));
+    }
+}
+
 void Configuration::validateSequentialCStore(IOBNode *node, DFGIONode *io,
                                              int baseAddr, int latency, int isStore) {
     if (!io->isSequentialCStore()) return;
@@ -364,8 +398,7 @@ void Configuration::validateSequentialCStore(IOBNode *node, DFGIONode *io,
         io->reducedMemOffset() == 0 && io->additionalStartDelay() == 0 &&
         !io->isPingpong() && !IsADGNodeConfigVariable(node) &&
         io->pattern().size() == 1 && io->pattern()[0] == std::make_pair(2, slots) &&
-        io->inputEdges().size() == 3 && io->inputEdges().count(0) &&
-        io->inputEdges().count(1) && io->inputEdges().count(2) &&
+        CStoreContract::connectedPortViolation(io->inputEdges(), true).empty() &&
         bankWords > 0 && baseAddr >= 0 && baseAddr % bankWords + slots <= bankWords &&
         fits("BaseAddr", baseAddr) && fits("Latency", latency) && fits("II", 1) &&
         fits("UseAddr", 0) && fits("UseEn", 1) && fits("IsStore", 1) &&
@@ -420,6 +453,7 @@ std::map<int, CfgData> Configuration::getIobCfgData(IOBNode* node){
     int baseAddr = _dfgIoSpadAddrs[dfgNode->id()];
     int offset = dfgIONode->reducedMemOffset() / dataBytes;
     validateSequentialCStore(node, dfgIONode, baseAddr + offset, latency, isStore);
+    addSequentialCStoreIdleMuxCfg(cfg, node, dfgIONode);
     int baseAddrId = node->cfgIdMap["BaseAddr"];    
     // CfgDataLoc baseAddrCfgLoc = node->configInfo(baseAddrId);
     // int baseAddrCfgLen = baseAddrCfgLoc.high - baseAddrCfgLoc.low + 1;

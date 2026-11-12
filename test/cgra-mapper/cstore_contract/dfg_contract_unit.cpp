@@ -3,7 +3,9 @@
 #include "op/operations.h"
 
 #include <iostream>
+#include <map>
 #include <string>
+#include <vector>
 
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
@@ -95,11 +97,43 @@ int main(int argc, char **argv) {
     if (testCase == "sequential-record-missing") operation->removeAttr("adora.cstore_slots");
     if (testCase == "sequential-record-size") store->setMemrefSize(6);
     if (testCase == "sequential-record-offset") store->setInitAddr("2");
-    for (int port = 0; port < 3; ++port)
-      addEdge(cdfg, addNode(cdfg, context, "Input"), store, port);
+    std::vector<int> ports{0, 1, 2};
+    if (testCase == "sequential-record-sparse") ports = {0, 2};
+    if (testCase == "sequential-record-sparse-reordered") ports = {2, 0};
+    if (testCase == "sequential-record-sparse-shared") ports = {0, 2};
+    if (testCase == "sequential-record-sparse-predicate-constant") ports = {2, 0};
+    if (testCase == "sequential-record-sparse-value-constant") ports = {0, 2};
+    if (testCase == "sequential-record-sparse-wrong") ports = {0, 1};
+    if (testCase == "sequential-record-sparse-missing") ports = {0};
+    if (testCase == "sequential-record-sparse-duplicate") ports = {0, 2, 2};
+    auto *shared = addNode(cdfg, context, "Input");
+    std::map<int, int> expectedSourceIds;
+    for (int port : ports) {
+      bool constant = (port == 2 && testCase == "sequential-record-sparse-predicate-constant") ||
+                      (port == 0 && testCase == "sequential-record-sparse-value-constant");
+      auto *source = testCase == "sequential-record-sparse-shared" ? shared :
+                     addNode(cdfg, context, constant ? "CONST" : "Input");
+      if (!constant) expectedSourceIds[port] = source->id() + 1;
+      addEdge(cdfg, source, store, port);
+    }
     DFGIR dfg(&cdfg);
     auto *io = dynamic_cast<DFGIONode *>(dfg.getDFG()->node(store->id() + 1));
-    return io && io->isSequentialCStore() && io->sequentialCStoreSlots() == 4 ? 0 : 2;
+    if (!io || !io->isSequentialCStore() || io->sequentialCStoreSlots() != 4) return 2;
+    if (ports.size() == 2 && (io->inputEdges().size() != 2 || !io->inputEdges().count(0) || !io->inputEdges().count(2))) return 3;
+    // Preserve source identity independently of sparse-edge enumeration order.
+    for (const auto &expected : expectedSourceIds) {
+      auto edge = io->inputEdges().find(expected.first);
+      if (edge == io->inputEdges().end() ||
+          dfg.getDFG()->edge(edge->second)->srcId() != expected.second) return 6;
+    }
+    if (testCase == "sequential-record-sparse-shared" &&
+        dfg.getDFG()->edge(io->inputEdges().at(0))->srcId() != dfg.getDFG()->edge(io->inputEdges().at(2))->srcId()) return 4;
+    if (testCase.find("constant") != std::string::npos) {
+      int port = testCase == "sequential-record-sparse-value-constant" ? 0 : 2;
+      auto *pass = dfg.getDFG()->node(dfg.getDFG()->edge(io->inputEdges().at(port))->srcId());
+      if (pass->operation() != "PASS" || !pass->hasImm()) return 5;
+    }
+    return 0;
   }
   if (testCase.rfind("load-", 0) == 0) {
     Operations::Instance(argv[2]);

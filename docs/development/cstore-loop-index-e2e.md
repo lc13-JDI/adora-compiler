@@ -61,6 +61,35 @@ The CSTORE logical ports and controller fields remain:
 The loop-index specialization does not change the configuration semantics of
 ordinary accumulation ACC nodes.
 
+## Proven sequential destination mode
+
+The explicit-address path above remains the contract for ordinary CSTOREs.
+A separate guarded-inplace proof may establish a zero-offset, full contiguous
+16-bit destination and a fixed positive slot count, with one destination slot
+per iteration, including false predicates. For that proven mode, the CDFG
+connects data at logical port 0 and predicate at logical port 2; port 1 is absent.
+The MLIR destination/index and object/count proof remain available for rebuilding
+and validation. An address-only ACC/MUL is unnecessary when it has no surviving
+consumer; shared producers and explicit accesses retain their edges.
+
+This sparse connection set does not change the hardware operation catalog:
+CSTORE still requires three physical operands and zero results. The mapper
+accepts exact `{0,2}` connections only after its in-memory MLIR proof checks;
+it also accepts exact `{0,1,2}` for a trusted legacy sequential record.
+Serialized graph files remain explicit and require all three logical ports;
+annotations or missing address edges cannot grant sequential privileges.
+
+The sequential controller uses `IsStore/UseAddr/UseEn = 1/0/1`, word stride 1,
+and the proven slot count at II=1. Both configuration paths explicitly write
+an ADG-defined legal selector for the inactive address MUX, while packing its
+DelayPipe lane as zero; no constant producer or substitute address route is
+allocated. The emitter cross-checks the slot count against sequential INPUT
+traversals and the full destination footprint. It checks the timing and count
+of any surviving index ACC without requiring an address-only ACC to exist.
+The bank, zero-offset, fixed-field, no-ping-pong and completion checks continue
+to apply. Actual configuration words, routes and full-RTL execution must be
+verified separately from graph acceptance.
+
 ## Exact ACC contract
 
 The emitted configuration is decoded using configuration IDs and bit ranges

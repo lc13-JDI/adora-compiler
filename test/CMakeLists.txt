@@ -12,11 +12,22 @@ target_link_libraries(cstore-dfg-contract-test PRIVATE
   MLIRADORAKernelOp)
 llvm_update_compile_flags(cstore-dfg-contract-test)
 
+add_llvm_executable(cstore-operand-construction-test
+  cgra-opt/cdfggen/cstore_operand_construction_unit.cpp)
+target_include_directories(cstore-operand-construction-test PRIVATE
+  ${CMAKE_SOURCE_DIR}/lib/DFG/inc)
+target_link_libraries(cstore-operand-construction-test PRIVATE
+  GeneralCDFGGen
+  MLIRADORAOps
+  MLIRADORAKernelOp)
+llvm_update_compile_flags(cstore-operand-construction-test)
+
 set(ADORA_TEST_DEPENDS
   cgra-opt
   tensor-opt
   cgra-mapper
   cstore-dfg-contract-test
+  cstore-operand-construction-test
   FileCheck
 )
 

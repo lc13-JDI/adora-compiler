@@ -421,6 +421,7 @@ DFG* DFGIR::parseDFGJson(std::string filename){
     }
     // parse edges
     std::map<int, int> immediateCount;
+    std::map<int, std::map<int, int>> serializedCStorePorts;
     for(auto& edgeJson : dfgJson["edges"]){
         int srcId = edgeJson["tail"].get<int>() + 1;
         int dstId = edgeJson["head"].get<int>() + 1;
@@ -441,6 +442,8 @@ DFG* DFGIR::parseDFGJson(std::string filename){
         }else{ // default one output for each node
             srcPort = 0;
         }
+        if (dfg->node(dstId) && dfg->node(dstId)->operation() == "CSTORE")
+            ++serializedCStorePorts[dstId][dstPort];
         if(isConst(srcId)){ // merge const node into the node connected to it
             DFGNode* node = dfg->node(dstId);
             if(node && (node->operation() == "STORE" ||
@@ -478,6 +481,15 @@ DFG* DFGIR::parseDFGJson(std::string filename){
         DFGNode *node = elem.second;
         if(node->operation() != "STORE" && node->operation() != "CSTORE")
             continue;
+        if (node->operation() == "CSTORE") {
+            const auto portViolation = CStoreContract::cstoreLogicalPortViolation(
+                serializedCStorePorts[node->id()], false);
+            if (!portViolation.empty()) {
+                std::cerr << "Invalid serialized CSTORE DFG node " << node->id()
+                          << ": " << portViolation << '\n';
+                exit(1);
+            }
+        }
         const std::string violation =
             CStoreContract::immediateViolation(immediateCount[node->id()]);
         if(!violation.empty()){
@@ -925,8 +937,12 @@ DFG* DFGIR::parseDFGJFromMLIRCDFG(LLVMCDFG * CDFG){
             exit(1);
         }
         const std::string portViolation =
-            CStoreContract::logicalPortViolation(logicalPortUse[node->id()],
-                                                 expectedOperands);
+            isCStore
+                ? CStoreContract::cstoreLogicalPortViolation(
+                      logicalPortUse[node->id()],
+                      dynamic_cast<DFGIONode *>(node)->isSequentialCStore(), true)
+                : CStoreContract::logicalPortViolation(logicalPortUse[node->id()],
+                                                       expectedOperands);
         if(!portViolation.empty()){
             std::cout << prefix << portViolation << std::endl;
             exit(1);

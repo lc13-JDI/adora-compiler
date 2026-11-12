@@ -292,6 +292,14 @@ def run_dfg_contract_tests(mapper, operations):
     unit = mapper.with_name("cstore-dfg-contract-test")
     expected = {
         "sequential-record-valid": (0, ()),
+        "sequential-record-sparse": (0, ()),
+        "sequential-record-sparse-reordered": (0, ()),
+        "sequential-record-sparse-shared": (0, ()),
+        "sequential-record-sparse-predicate-constant": (0, ()),
+        "sequential-record-sparse-value-constant": (0, ()),
+        "sequential-record-sparse-wrong": (1, ("Invalid CSTORE DFG node", "logical operand 2")),
+        "sequential-record-sparse-missing": (1, ("Invalid CSTORE DFG node", "logical operand 2")),
+        "sequential-record-sparse-duplicate": (1, ("Invalid CSTORE DFG node", "logical operand 2")),
         "forged-sequential": (1, ("Invalid sequential CSTORE DFG",)),
         "forged-sequential-zero": (1, ("Invalid sequential CSTORE DFG",)),
         "forged-sequential-missing-mode": (1, ("Invalid sequential CSTORE DFG",)),
@@ -350,6 +358,16 @@ def run_dfg_contract_tests(mapper, operations):
         assert result.returncode == status, (name, result.stdout)
         if status:
             assert 'Invalid serialized CSTORE access metadata' in result.stdout, (name, result.stdout)
+        if name in ('legacy', 'explicit'):
+            graph['edges'] = [edge for edge in graph['edges'] if edge['operand'] != '1']
+            with tempfile.TemporaryDirectory(prefix='adora-cstore-json-sparse-') as directory:
+                path = Path(directory)/'graph.json'
+                path.write_text(json.dumps(graph))
+                sparse = subprocess.run([str(unit), 'json', str(operations), str(path)],
+                                        text=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, timeout=60)
+            assert sparse.returncode == 1, (name, sparse.stdout)
+            assert 'logical operand 1' in sparse.stdout, (name, sparse.stdout)
 
 
 def run_cstore_immediate_mapper_test(workdir, mapper, adg, operations,

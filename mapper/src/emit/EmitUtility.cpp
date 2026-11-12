@@ -1,4 +1,5 @@
 #include "emit/Emit.h"
+#include "ir/cstore_contract.h"
 #include "mlir/Dialect/Affine/Utils.h"
 //===----------------------------------------------------------------------===//
 // Some tool functions
@@ -465,6 +466,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
   // route stays live throughout; only the OUTPUT controller's start is delayed.
   int reductionCycles = 0, reductionCount = 0;
   int indexCycles = 0, indexCount = 0;
+  std::vector<int> liveIndexAccs;
   if (boundedLoads) {
     for (auto entry : dfg->nodes()) {
       auto *node = entry.second;
@@ -473,6 +475,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       if (node->isLoopIndexAcc()) {
         ++indexCount;
         indexCycles = node->cycles();
+        liveIndexAccs.push_back(entry.first);
         // The established index-ACC configuration uses slot-gated WI=1,
         // Latency=0 and SkipFirst=1, independent of reduction scheduling.
         if (node->operation() != "ACC" || node->initVal() != 0 || node->interval() != 1 ||
@@ -516,13 +519,16 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       }
     }
     if (streamCycles) {
-      unsigned outputs = 0, conditionalOutputs = 0;
+      unsigned outputs = 0, conditionalOutputs = 0, sequentialOutputs = 0;
       for (int id : dfg->ioNodes()) {
         auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
         if (!io) { reject(id, "stream requires I/O nodes"); continue; }
         const auto role = io->operation();
         if (role == "OUTPUT" || role == "CSTORE") ++outputs;
-        if (role == "CSTORE") ++conditionalOutputs;
+        if (role == "CSTORE") {
+          ++conditionalOutputs;
+          if (io->isSequentialCStore()) ++sequentialOutputs;
+        }
         if ((role != "INPUT" && role != "OUTPUT" && role != "LOAD" && role != "CSTORE") ||
             io->additionalStartDelay() != 0 || io->reducedMemOffset() != 0 ||
             ((role == "OUTPUT" || role == "CSTORE") && io->memSize() != int64_t(streamCycles) * 2) ||
@@ -530,9 +536,21 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
           reject(id, "stream requires full sequential input/output objects and ordinary LOAD roles");
       }
       if (!outputs) reject(0, "stream requires a complete output array");
-      if ((conditionalOutputs && (conditionalOutputs != 1 || outputs != 1 || indexCount != 1 || indexCycles != streamCycles)) ||
+      // Proven sequential stores get their complete slot count from the proof
+      // and INPUT traversals. An index ACC is required only when still live;
+      // old explicit conditional streams retain their established requirement.
+      const bool provenSequential = conditionalOutputs == 1 && sequentialOutputs == 1;
+      if ((conditionalOutputs && (conditionalOutputs != 1 || outputs != 1 ||
+           (!provenSequential && (indexCount != 1 || indexCycles != streamCycles)))) ||
           (!conditionalOutputs && indexCount))
         reject(0, "conditional stream requires one full-length CSTORE and matching index ACC");
+      if (provenSequential) {
+        for (int id : liveIndexAccs) {
+          auto *index = dfg->node(id);
+          if (index->cycles() != streamCycles || index->outputEdges().empty())
+            reject(id, "live index ACC requires a consumer and matching stream count");
+        }
+      }
     }
   }
   // Validate before indexing topology or allocating any SRAM objects.
@@ -589,9 +607,9 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
         reject(id, "initialized conditional stream lost its proven sequential address mode");
       if (io->operation() == "CSTORE" &&
           (!fitsField(iob, "UseEn", 1) || !fitsField(iob, "IsStore", 1) ||
-           io->inputEdges().size() != 3 || !io->inputEdges().count(0) ||
-           !io->inputEdges().count(1) || !io->inputEdges().count(2)))
-        reject(id, "conditional stream requires data/address/predicate ports and physical write-enable fields");
+           !CStoreContract::connectedPortViolation(io->inputEdges(),
+                                                    io->isSequentialCStore()).empty()))
+        reject(id, "conditional stream requires mode-specific logical ports and physical write-enable fields");
       if (io->pattern().size() != 1 || io->pattern()[0] != expected ||
           !fitsField(iob, "Cycles0", expected.second) ||
           !fitsField(iob, "Stride0", expected.first / 2))

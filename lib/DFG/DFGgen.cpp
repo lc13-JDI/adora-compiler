@@ -33,6 +33,7 @@
 // #include "ADORA/Dialect/ADORA/Transforms/Passes.h"
 #include "ADORA/Dialect/ADORA/Transforms/SimplifyLoadStore.h"
 #include "inc/mlir_cdfg.h"
+#include "inc/cstore_ports.h"
 #include "ADORA/Misc/DFG.h"
 
 // For Block handle 
@@ -2547,6 +2548,8 @@ static void InsertMemrefByteOffsetMul(LLVMCDFG *CDFG, bool verbose = false) {
     llvm::StringRef typeName = node->getTypeName();
     if (typeName != "load" && typeName != "store" && typeName != "CSTORE")
       continue;
+    if (typeName == "CSTORE" && node->isSequentialCStore())
+      continue;
 
     Operation *op = node->operation();
     if (!op)
@@ -2974,6 +2977,12 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     if (!forOp)
       continue;
 
+    // Sequential CSTORE does not consume the IV as a physical address. If
+    // nothing else consumes this loop node, leave it for isolated-for cleanup
+    // rather than manufacturing an ACC and a step constant with no consumer.
+    if (node->inputNodes().empty() && node->outputNodes().empty())
+      continue;
+
     llvm::DenseSet<mlir::Value> visiting;
     CStoreIVUseFacts facts =
         ClassifyCStoreIVUses(forOp.getInductionVar(), visiting);
@@ -3050,8 +3059,7 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
     node->setACCrepeat("1");
 
     // Preserve one slot per iteration. Proven initialized inout stores use
-    // the internal two-byte traversal, while retaining the address route;
-    // legacy stores use the explicit address and zero internal stride.
+    // internal two-byte traversal; legacy stores keep their explicit address.
     forOp.walk([&](ADORA::CondStoreOp store) {
       if (store.getIndices().size() != 1)
         return;
@@ -3995,9 +4003,9 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     node->setLinearAccess("0," + (loop ? getTripCountAsStr(loop) : std::string("1")));
   }
 
-  // CSTORE retains all three routed operands. Only the complete initialized
-  // inout proof permits internal sequential addressing; otherwise the pattern
-  // describes explicit addresses and preserves the legacy zero stride.
+  // Only the complete initialized inout proof permits internal sequential
+  // addressing and omission of the external address operand. Other stores
+  // preserve their explicit address and legacy zero stride.
   for (auto &nodePair : CDFG->nodes()) {
     LLVMCDFGNode *node = nodePair.second;
     auto store = dyn_cast_or_null<ADORA::CondStoreOp>(node->operation());
@@ -4035,7 +4043,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
       auto slots = store->getAttrOfType<IntegerAttr>("adora.cstore_slots");
       auto object = store->getAttrOfType<StringAttr>("adora.cstore_object");
       auto mode = store->getAttrOfType<StringAttr>("adora.cstore_address_mode");
-      if (!slots || !object || !mode || mode.getValue() != "sequential" ||
+      if (!slots || !slots.getType().isInteger(64) || !object || !mode || mode.getValue() != "sequential" ||
           slots.getInt() < 1 || slots.getInt() > 4095 ||
           object.getValue() != refName || node->getMemrefSize() != slots.getInt() * 2) {
         store.emitError("sequential CSTORE lost its validated count or object binding");
@@ -4129,9 +4137,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
             AnceNode = inputIt->second;
           }
 
-          AnceNode->addOutputNode(SuccNode, false);
-          SuccNode->addInputNode(AnceNode, edgeidx, false);
-          CDFG->addEdge(AnceNode, SuccNode);
+          CDFG->addOperandEdge(AnceNode, SuccNode, edgeidx, false);
           continue;
         }
 
@@ -4162,9 +4168,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
             }
             else{
               AnceNode = CDFG->node(parentop);
-              AnceNode->addOutputNode(SuccNode, isBackEdge);
-              SuccNode->addInputNode(AnceNode, edgeidx, isBackEdge);
-              CDFG->addEdge(AnceNode, SuccNode); //To fix: Edge Type
+              CDFG->addOperandEdge(AnceNode, SuccNode, edgeidx, isBackEdge);
             }
           }
         }
@@ -4173,9 +4177,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
           parentop = _v.getParentBlock()->getParentOp();
           if(isa<affine::AffineForOp>(parentop)){
             AnceNode = CDFG->node(parentop);
-            AnceNode->addOutputNode(SuccNode, isBackEdge);
-            SuccNode->addInputNode(AnceNode, edgeidx, isBackEdge);
-            CDFG->addEdge(AnceNode, SuccNode); //To fix: Edge Type            
+            CDFG->addOperandEdge(AnceNode, SuccNode, edgeidx, isBackEdge);
           }
         }
         continue;
@@ -4315,9 +4317,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
         }
       }
 
-      AnceNode->addOutputNode(SuccNode, isBackEdge);
-      SuccNode->addInputNode(AnceNode, edgeidx, isBackEdge);
-      CDFG->addEdge(AnceNode, SuccNode); //To fix: Edge Type
+      CDFG->addOperandEdge(AnceNode, SuccNode, edgeidx, isBackEdge);
     }
   }
 
@@ -4552,38 +4552,78 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     return accs.size() == 1 ? accs.front() : nullptr;
   };
 
-  // Fail closed rather than serializing a CSTORE whose required value,
-  // explicit byte address, enable, or memory identity was lost while building
-  // and simplifying the graph.
+  // Validate actual logical keys, without using connection enumeration or a
+  // removed address producer as the witness for sequential execution count.
   bool malformedCStore = false;
   kernel.walk([&](ADORA::CondStoreOp store) {
     LLVMCDFGNode *node = CDFG->node(store.getOperation());
-    unsigned portCounts[3] = {0, 0, 0};
+    std::map<int, int> portCounts;
     if (node) {
       for (const auto &inputAndInfo : node->inputInfoMap()) {
         for (const NodeInfo &info : inputAndInfo.second) {
-          if (info.idx >= 0 && info.idx < 3)
-            ++portCounts[info.idx];
+          // Memory ordering is not a logical data operand. Preserve its
+          // negative sentinel and edge; reject negative data-port keys.
+          if (info.idx < 0 && llvm::any_of(node->inputEdges(), [&](int id) {
+                auto *edge = CDFG->edge(id);
+                return edge->src() == inputAndInfo.first &&
+                       edge->type() == EDGE_TYPE_MEM;
+              }))
+            continue;
+          ++portCounts[info.idx];
         }
       }
     }
-    LLVMCDFGNode *loopIndexAcc = node
+    const bool sequential = node && node->isSequentialCStore();
+    LLVMCDFGNode *loopIndexAcc = node && !sequential
         ? findLoopIndexAddressAcc(node->getInputPort(1))
         : nullptr;
-    const std::string expectedPattern = loopIndexAcc
-        ? (node->isSequentialCStore() ? "2," : "0,") + loopIndexAcc->getACCcount()
-        : "0,1";
-    if (!node || portCounts[0] != 1 || portCounts[1] != 1 ||
-        portCounts[2] != 1 || node->getMemrefName().empty() ||
+    const std::string expectedPattern = sequential
+        ? "2," + std::to_string(node->sequentialCStoreSlots())
+        : loopIndexAcc ? "0," + loopIndexAcc->getACCcount() : "0,1";
+    bool invalidSequentialProof = false;
+    if (sequential) {
+      const int64_t count = node->sequentialCStoreSlots();
+      auto slots = store->getAttrOfType<IntegerAttr>("adora.cstore_slots");
+      auto object = store->getAttrOfType<StringAttr>("adora.cstore_object");
+      auto mode = store->getAttrOfType<StringAttr>("adora.cstore_address_mode");
+      auto loop = store->getParentOfType<affine::AffineForOp>();
+      auto block = store.getMemref().getDefiningOp<ADORA::DataBlockLoadOp>();
+      invalidSequentialProof = !certifiedBoundedInout || !slots ||
+          !slots.getType().isInteger(64) || slots.getInt() != count ||
+          count < 1 || count > 4095 || !object ||
+          object.getValue() != node->sequentialCStoreObject() || !mode ||
+          mode.getValue() != "sequential" || !block ||
+          std::string(kernel.getKernelName()) + ":" + std::string(block.getId()) !=
+              node->sequentialCStoreObject() ||
+          node->sequentialCStoreObject() != node->getMemrefName() ||
+          node->getMemrefSize() != count * 2 || !loop ||
+          !loop.hasConstantLowerBound() || !loop.hasConstantUpperBound() ||
+          loop.getConstantLowerBound() != 0 ||
+          loop.getConstantUpperBound() != count ||
+          loop.getStep().getSExtValue() != 1 || store.getIndices().size() != 1 ||
+          store.getIndices().front() != loop.getInductionVar();
+      bool hasTraversal = false;
+      for (const auto &entry : CDFG->nodes()) {
+        auto *input = entry.second;
+        auto load = dyn_cast_or_null<affine::AffineLoadOp>(input->operation());
+        if (!load || load->getParentOfType<affine::AffineForOp>() != loop)
+          continue;
+        hasTraversal = true;
+        if (input->getLinearAccess() != expectedPattern ||
+            input->getMemrefSize() != count * 2)
+          invalidSequentialProof = true;
+      }
+      invalidSequentialProof |= !hasTraversal;
+    }
+    const std::string portViolation = CStoreContract::cstoreLogicalPortViolation(
+        portCounts, sequential);
+    if (!node || !portViolation.empty() || node->getMemrefName().empty() ||
         node->getMemrefSize() <= 0 || node->getInitAddr() != "0" ||
-        node->getLinearAccess() != expectedPattern ||
-        (node->isSequentialCStore() &&
-         (!certifiedBoundedInout || !loopIndexAcc ||
-          std::to_string(node->sequentialCStoreSlots()) != loopIndexAcc->getACCcount() ||
-          node->sequentialCStoreObject() != node->getMemrefName()))) {
+        node->getLinearAccess() != expectedPattern || invalidSequentialProof) {
       store.emitError(
-          "malformed CSTORE CDFG node: requires exactly connected ports 0, "
-          "1, and 2 and valid memory metadata");
+          "malformed CSTORE CDFG node: requires exactly connected logical "
+          "ports (0 and 2 for proven sequential; 0, 1, and 2 for explicit) "
+          "and valid memory metadata");
       malformedCStore = true;
     }
   });

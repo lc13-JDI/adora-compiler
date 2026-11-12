@@ -107,6 +107,17 @@ LLVMCDFGNode* LLVMCDFG::addNode(mlir::Block* block, int level)
 //     return node;
 // }
 
+LLVMCDFGEdge *LLVMCDFG::addOperandEdge(LLVMCDFGNode *src,
+                                     LLVMCDFGNode *dst, int logicalPort,
+                                     bool isBackEdge) {
+  if (dst->getTypeName() == "CSTORE" && dst->isSequentialCStore() &&
+      logicalPort == 1 && !isBackEdge)
+    return nullptr;
+  src->addOutputNode(dst, isBackEdge);
+  dst->addInputNode(src, logicalPort, isBackEdge);
+  return addEdge(src, dst);
+}
+
 LLVMCDFGEdge* LLVMCDFG::addEdge(LLVMCDFGNode *src, LLVMCDFGNode *dst)
 {
   int eid = 0;

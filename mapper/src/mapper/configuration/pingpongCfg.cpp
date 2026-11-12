@@ -43,6 +43,7 @@ std::map<int, CfgData> Configuration::getIobPingpongCfgData(IOBNode* node, bool 
     int baseAddr = _dfgIoSpadAddrs[dfgNode->id()];
     int offset = dfgIONode->reducedMemOffset() / dataBytes;
     validateSequentialCStore(node, dfgIONode, baseAddr + offset, latency, isStore);
+    addSequentialCStoreIdleMuxCfg(cfg, node, dfgIONode);
     if (dfgIONode->isSequentialCStore() && en_pingpong) {
         std::cerr << "Sequential CSTORE does not support pingpong relocation\n";
         exit(1);
