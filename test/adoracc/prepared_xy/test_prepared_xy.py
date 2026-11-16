@@ -261,10 +261,19 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
         compiler = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(compiler)
         raw = ('import numpy as np\n'
+               'def apply_writeback_tasks(tasks):\n'
+               '    pass\n'
                'async def _adora_large_tile(runtime, arg_0, arg_1, arg_2, arg_3):\n'
+               '    stream = runtime.create_stream()\n'
+               '    writeback_tasks = []\n'
                '    runtime.append(tuple(b.copy() for b in (arg_0,arg_1,arg_2,arg_3)))\n'
                '    valid = (arg_1 >= 0) & (arg_2 != 0)\n'
-               '    arg_3[valid] = arg_0[arg_1[valid]]\n')
+               '    arg_3[valid] = arg_0[arg_1[valid]]\n'
+               '    await stream.synchronize()\n'
+               '    try:\n'
+               '        apply_writeback_tasks(writeback_tasks)\n'
+               '    except NameError:\n'
+               '        pass\n')
         for name in ('overlay', 'globals', 'compile', 'exec', 'len', 'np'):
             source, _ = compiler.large_checked_module(raw, dict(descriptor(), entry=name))
             namespace = {'__name__': 'generated_' + name, '__file__': '<standalone generated>'}
@@ -274,7 +283,19 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
             src = np.arange(8193, dtype=np.uint16)
             src[8192] = 65535
             dst = np.full(4, 77, np.uint16)
-            runtime = []
+            class Runtime(list):
+                PRIVATE_STREAM_OWNERSHIP_VERSION = 1
+
+                def create_stream(self):
+                    class Stream:
+                        async def synchronize(self):
+                            pass
+                    return Stream()
+
+                async def retire_completed_stream(self, stream):
+                    pass
+
+            runtime = Runtime()
             await plan.execute(runtime, src, dst)
             np.testing.assert_array_equal(dst, [65535, 0, 77, 77])
             self.assertTrue(all(b.dtype == np.int16 for b in runtime[0]))

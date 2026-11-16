@@ -1,0 +1,996 @@
+--- a/server/test_runif.py
++++ b/server/test_runif.py
+@@ -3,6 +3,9 @@
+ from enum import Enum, auto
+ import cocotb, logging, threading, struct, numpy, heapq, json, copy
+ import dataclasses
++import cocotb.queue
++
++PRIVATE_STREAM_OWNERSHIP_VERSION = 1
+ from operator import attrgetter
+ 
+ 
+@@ -16,6 +19,7 @@
+     EVENT_SET = auto()
+     RELEASE = auto()
+     APPLY = auto()
++    SYNCHRONIZE = auto()
+ 
+ 
+ @dataclass
+@@ -302,14 +306,22 @@
+     def __init__(self):
+         # self._event = asyncio.Event()
+         self._event = cocotb.triggers.Event()
++        self._error = None
+ 
+     def set(self):
+         """Record the event on a stream"""
+         self._event.set()
+ 
++    def fail(self, error):
++        """Wake waiters with the original asynchronous work error."""
++        self._error = error
++        self._event.set()
++
+     async def wait(self):
+-        """Wait for the event to complete"""
++        """Wait for successful completion or propagate the work error."""
+         await self._event.wait()
++        if self._error is not None:
++            raise self._error
+ 
+     def is_set(self) -> bool:
+         """Check if event has occurred"""
+@@ -317,6 +329,7 @@
+ 
+     def clear(self):
+         """Clear the event state"""
++        self._error = None
+         self._event.clear()
+ 
+ 
+@@ -437,6 +450,13 @@
+         self._in_processing_event.set()
+ 
+ 
++class _StreamCompletion(DeviceEvent):
++    """Stable evidence for work accepted through a particular sequence."""
++    def __init__(self, target):
++        super().__init__()
++        self.target = target
++
++
+ class DeviceStream:
+     # 当不输入I/O depend_type(默认为0)时，即强制按任务提交顺序完成
+     # execution_finish已删除，会自动在EXE与D2H/下个EXE之间插入
+@@ -452,6 +472,13 @@
+         self.runtime = runtime
+         self.id = stream_id
+         self.priority = priority
++        self._accepted = 0
++        self._completed = 0
++        self._error = None
++        self._fences = []
++        self._retired = False
++        self._retiring = False
++        self._retirement_lock = cocotb.triggers.Lock()
+         # self._queue = asyncio.Queue(maxsize=task_queue_size)
+         # self._queue = cocotb.queue.Queue(maxsize=task_queue_size)
+         self._queue = cocotb.queue.Queue()
+@@ -470,12 +497,12 @@
+     async def apply(self, configs: List[DeviceConfig]):
+         """Apply enough resource for bunch of configs, each time only one config can be running"""
+         configs_new = copy.deepcopy(configs)
+-        await self._queue.put((StreamFunction.APPLY, configs_new))
++        self._enqueue((StreamFunction.APPLY, configs_new))
+         self._start_processing()
+ 
+     async def config(self, config_id: int = 0):
+         """Switch a configuration on device, ignore if it is the same as the previous time"""
+-        await self._queue.put((StreamFunction.CONFIG, config_id))
++        self._enqueue((StreamFunction.CONFIG, config_id))
+         self._start_processing()
+ 
+     async def memcpyHostToDevice(
+@@ -514,7 +541,7 @@
+ 
+         if depend_type not in [0, 1, 2]:
+             depend_type = 0
+-        await self._queue.put(
++        self._enqueue(
+             (
+                 StreamFunction.MEMCPY_HOSTTODEVICE,
+                 (d_data, h_data, size, dtype, depend_type),
+@@ -557,7 +584,7 @@
+ 
+         if depend_type not in [0, 1]:
+             depend_type = 0
+-        await self._queue.put(
++        self._enqueue(
+             (
+                 StreamFunction.MEMCPY_DEVICETOHOST,
+                 (d_data, h_data, size, dtype, depend_type),
+@@ -568,65 +595,97 @@
+ 
+     async def execution_start(self):
+         """Add an execution start task to the stream"""
+-        await self._queue.put((StreamFunction.EXECUTION_START, None))
++        self._enqueue((StreamFunction.EXECUTION_START, None))
+         self._start_processing()
+ 
+     async def memcpyFence(self):
+         """Wait for execution to finish"""
+-        await self._queue.put((StreamFunction.MEMCPY_FENCE, None))
++        self._enqueue((StreamFunction.MEMCPY_FENCE, None))
+         self._start_processing()
+ 
+     async def release(self):
+         """Release apply the applied resources, invalidate the handler"""
+-        await self._queue.put((StreamFunction.RELEASE, None))
++        self._enqueue((StreamFunction.RELEASE, None))
+         self._start_processing()
+ 
+     async def wait_event(self, event: DeviceEvent):
+         """Wait for an event before proceeding"""
+-        await self._queue.put((StreamFunction.EVENT_WAIT, event))
++        self._enqueue((StreamFunction.EVENT_WAIT, event))
+         self._start_processing()
+ 
+     async def set_event(self, event: DeviceEvent):
+         """Set an event at this point in the stream"""
+-        await self._queue.put((StreamFunction.EVENT_SET, event))
++        self._enqueue((StreamFunction.EVENT_SET, event))
+         self._start_processing()
+ 
++    def _enqueue(self, task):
++        # This queue is unbounded. Acceptance and sequence assignment cannot
++        # suspend, so global snapshots precisely delimit earlier submissions.
++        if self._retired or self._retiring:
++            raise RuntimeError("cannot submit to a retiring or retired stream")
++        if self._error is not None:
++            raise self._error
++        self._accepted += 1
++        self._queue.put_nowait((*task, self._accepted))
++
+     def _start_processing(self):
+-        """Start processing the queue if not already running"""
+-        if not self._running and self._current_task is None:
+-            # self._current_task = self.runtime.loop.create_task(self._process_queue())
++        """Start a worker only when actual accepted work is queued."""
++        if (not self._queue.empty() and not self._retired
++                and self._error is None and self._current_task is None):
++            self._completion_event.clear()
+             self._current_task = cocotb.start_soon(self._process_queue())
+-            self._completion_event.clear()  # 重置完成事件
++
++    def _snapshot_completion(self):
++        """Capture accepted work synchronously, before a caller's first await."""
++        fence = _StreamCompletion(self._accepted)
++        if self._error is not None:
++            fence.fail(self._error)
++        elif self._completed >= fence.target:
++            fence.set()
++        else:
++            self._fences.append(fence)
++            self._queue.put_nowait((StreamFunction.SYNCHRONIZE, fence, fence.target))
++            self._start_processing()
++        return fence
++
++    def _mark_completed(self, sequence):
++        self._completed = max(self._completed, sequence)
++        pending = []
++        for fence in self._fences:
++            if fence.target <= self._completed:
++                fence.set()
++            else:
++                pending.append(fence)
++        self._fences = pending
++
++    async def _flush_work(self):
++        await self._reorder_queue.clear()
++        if self._handler.running:
++            await self.runtime.finish_execution(self._handler)
+ 
+     async def synchronize(self):
+-        """Wait for all tasks in the stream to complete"""
+-        # await self._queue.join()
+-
+-        if self._current_task is not None:
+-            await self._completion_event.wait()
+-        # print("task len", self._queue.qsize())
+-        # 可能有新任务加入队列
+-        self._start_processing()
+-        if self._current_task is not None:
+-            await self._completion_event.wait()
++        """Wait for work accepted at entry, preserving original worker errors."""
++        await self._snapshot_completion().wait()
+ 
+     async def _process_queue(self):
+         """Process tasks in the queue"""
+         self._running = True
+         try:
+-            while not self._queue.empty():
+-                try:
+-                    # 添加超时防止永久阻塞
+-                    task_type, task_data = await cocotb.triggers.with_timeout(
+-                        self._queue.get(), timeout_time=10, timeout_unit="ns"
+-                    )
+-                except TimeoutError:
+-                    # 队列空且超时则退出
+-                    break
+-
+-                if task_type == StreamFunction.APPLY:
++            processed = self._completed
++            while True:
++                if self._queue.empty():
++                    await self._flush_work()
++                    self._mark_completed(processed)
++                    if self._queue.empty():
++                        break
++                task_type, task_data, sequence = self._queue.get_nowait()
++
++                if task_type == StreamFunction.SYNCHRONIZE:
++                    await self._flush_work()
++                    self._mark_completed(sequence)
++                elif task_type == StreamFunction.APPLY:
+                     # avoid resources leaks
+-                    await self._reorder_queue.clear()
++                    await self._flush_work()
+                     if self._handler.valid:
+                         await self.runtime.release_config(self._handler)
+ 
+@@ -634,7 +693,7 @@
+ 
+                 elif task_type == StreamFunction.RELEASE:
+                     # release applied resource
+-                    await self._reorder_queue.clear()
++                    await self._flush_work()
+                     await self.runtime.release_config(self._handler)
+                 elif task_type == StreamFunction.EVENT_WAIT:
+                     await self._reorder_queue.clear()
+@@ -666,11 +725,19 @@
+                     await self._reorder_queue.add_task(task_type, task_data)
+                     # await self.runtime.start_execution(self._handler)
+ 
+-                # self._queue.task_done()
++                processed = sequence
++        except BaseException as error:
++            # No successful completion or speculative cleanup after work fails.
++            # Keep the stream and its queue rooted in the runtime for its owner.
++            self._error = error
++            for fence in self._fences:
++                fence.fail(error)
++            self._fences.clear()
++            self._completion_event.fail(error)
++        else:
++            self._completion_event.set()
+         finally:
+-            await self._reorder_queue.clear()
+             self._running = False
+-            self._completion_event.set()  # 标记处理完成
+             self._current_task = None
+ 
+ 
+@@ -891,7 +958,13 @@
+ 
+             flag = False
+             for id, state in self._device_state.items():
+-                if state.func(*task_param):
++                try:
++                    fitted = state.func(*task_param)
++                except Exception as error:
++                    task_event.fail(error)
++                    flag = True
++                    break
++                if fitted:
+                     task_event.set()
+                     flag = True
+                     break
+@@ -932,14 +1005,25 @@
+         self._running = False
+         self._current_task = None
+         self._completion_event = DeviceEvent()
++        self._error = None
+ 
+     def size(self) -> int:
+         return self._queue.qsize()
+ 
+     async def add_task(self, param: Tuple[Any]) -> DeviceEvent:
+         """Add task to queue and return a event"""
++        if self._error is not None:
++            raise self._error
+         event = DeviceEvent()
+         await self._queue.put((param, event))
++        # A bounded put may have suspended before the worker failed. Admission
++        # must recheck poison without another await. Draining also wakes the
++        # next blocked producer, which follows this same rejection path.
++        if self._error is not None:
++            while not self._queue.empty():
++                _, pending = self._queue.get_nowait()
++                pending.fail(self._error)
++            raise self._error
+         self._start_processing()
+         return event
+ 
+@@ -947,25 +1031,39 @@
+         """Wait for all tasks in the queue to complete"""
+         if self._current_task is not None:
+             await self._completion_event.wait()
++        if self._error is not None:
++            raise self._error
+ 
+     def _start_processing(self):
+         """Start processing the queue if not already running"""
+-        if not self._running and self._current_task is None:
++        if (self._error is None and not self._queue.empty()
++                and not self._running and self._current_task is None):
+             self._current_task = cocotb.start_soon(self._process_queue())
+             self._completion_event.clear()
+ 
+     async def _process_queue(self):
+         """Process tasks in the queue"""
+         self._running = True
++        event = None
+         try:
+             while not self._queue.empty():
+                 param, event = await self._queue.get()
+                 await self._func(*param)
+                 event.set()
++                event = None
++        except BaseException as error:
++            self._error = error
++            if event is not None:
++                event.fail(error)
++            while not self._queue.empty():
++                _, pending = self._queue.get_nowait()
++                pending.fail(error)
++            self._completion_event.fail(error)
++        else:
++            self._completion_event.set()
+         finally:
+             self._running = False
+             self._current_task = None
+-            self._completion_event.set()
+ 
+ 
+ @dataclass
+@@ -976,6 +1074,7 @@
+ 
+ 
+ class DeviceRuntime:
++    PRIVATE_STREAM_OWNERSHIP_VERSION = PRIVATE_STREAM_OWNERSHIP_VERSION
+ 
+     def __init__(
+         self,
+@@ -1019,13 +1118,45 @@
+     def is_device_busy(self) -> bool:
+         return self._streams.__len__() > 0
+ 
++    def _validate_stream(self, stream):
++        if not isinstance(stream, DeviceStream) or stream.runtime is not self:
++            raise ValueError("stream does not belong to this runtime")
++        if not stream._retired and self._streams.get(stream.id) is not stream:
++            raise ValueError("stream identity does not match the registered object")
++
++    async def retire_completed_stream(self, stream: DeviceStream):
++        """Owner-only, exact-object retirement after confirmed successful work.
++
++        Idempotence lives on the object, not in a history registry. A failed
++        cleanup leaves the registered stream discoverable for safe retry.
++        """
++        self._validate_stream(stream)
++        async with stream._retirement_lock:
++            self._validate_stream(stream)
++            if stream._retired:
++                return
++            if stream._error is not None:
++                raise stream._error
++            if stream._completed != stream._accepted or stream._handler.running:
++                raise RuntimeError("stream completion is not confirmed")
++            stream._retiring = True
++            try:
++                if stream._handler.valid:
++                    await self.release_config(stream._handler)
++                # Never remove another object, even if a caller reuses an ID.
++                if self._streams.get(stream.id) is not stream:
++                    raise ValueError("stream registration changed during retirement")
++                del self._streams[stream.id]
++                stream._retired = True
++            finally:
++                stream._retiring = False
++
+     async def destory_stream(self, stream: DeviceStream):
+-        stream_id = stream.id
+-        if stream_id in self._streams:
+-            await self._streams[stream_id].synchronize()
+-            await self.release_config(self._streams[stream_id]._handler)
+-            del self._streams[stream_id]
+-        del stream
++        """Compatibility owner close; wait successfully, then retire exactly it."""
++        self._validate_stream(stream)
++        if not stream._retired:
++            await stream.synchronize()
++        await self.retire_completed_stream(stream)
+ 
+     def create_stream(
+         self,
+@@ -1411,19 +1542,23 @@
+         reg = self._device_exereg[handler.device_id]
+         reg.need_count += 1
+ 
+-        count = 10000
+-        while count > 0:
+-            if reg.resp_time > cur_time:
+-                cur_time = cocotb.utils.get_sim_time(units="ns")
+-                if byte_include(reg.exe_reg, en_tile):
+-                    break
+-                count -= 1
+-                if count == 0:
+-                    self.log.debug(f"EXE time out")
+-                    break
+-            await cocotb.triggers.Timer(self._device_fetch_exereg_interval, units="ns")
+-
+-        reg.need_count -= 1
++        deadline = cur_time + 10000 * self._device_fetch_exereg_interval
++        try:
++            while True:
++                now = cocotb.utils.get_sim_time(units="ns")
++                if reg.resp_time > cur_time:
++                    cur_time = now
++                    if byte_include(reg.exe_reg, en_tile):
++                        break
++                if now >= deadline:
++                    raise TimeoutError(
++                        f"stream {handler.stream_id} execution completion timed out"
++                    )
++                await cocotb.triggers.Timer(
++                    self._device_fetch_exereg_interval, units="ns"
++                )
++        finally:
++            reg.need_count -= 1
+ 
+         handler.exef_time = cocotb.utils.get_sim_time(units="ns")
+         self.log.debug(
+@@ -1440,28 +1575,33 @@
+         if not handler.valid:
+             return
+ 
+-        # 在device manager中释放已占用资源
+-        self._device_managers[handler.device_id].release_config(handler)
++        # Invalidate the lease immediately after its actual return. Notification
++        # or logging failure must not make a retry return the same lease twice.
++        device_id = handler.device_id
++        manager = self._device_managers[device_id]
++        manager.release_config(handler)
++        handler.clear()
+ 
+         # 通知scheduler有任务释放
+-        self._stream_scheduler.device_state_update(handler.device_id)
++        self._stream_scheduler.device_state_update(device_id)
+ 
+         self.log.debug(
+-            f"RELEASE task, stream {handler.stream_id}, device {handler.device_id}"
++            f"RELEASE task, stream {handler.stream_id}, device {device_id}"
+         )
+         self.log.debug(
+-            f"device {handler.device_id}: tile free list {self._device_managers[handler.device_id].tile_free_list}"
++            f"device {device_id}: tile free list {manager.tile_free_list}"
+         )
+         self.log.debug(
+-            f"device {handler.device_id}:  cfg free list {self._device_managers[handler.device_id].cfg_free_list}"
+-        )
+-        handler.clear()
++            f"device {device_id}:  cfg free list {manager.cfg_free_list}"
++        )
+         return
+ 
+     async def synchronize_all(self):
+-        """Wait for all streams to complete"""
+-        for stream in self._streams.values():
+-            await stream.synchronize()
++        """Wait for members and their accepted work at entry, before any await."""
++        fences = tuple(stream._snapshot_completion()
++                       for stream in tuple(self._streams.values()))
++        for fence in fences:
++            await fence.wait()
+ 
+ 
+ ## @jhlou
+--- /dev/null
++++ b/server/test_stream_ownership.py
+@@ -0,0 +1,429 @@
++"""Real cocotb queues/tasks; hardware resource/status interfaces are minimal doubles."""
++import logging
++import os
++import sys
++from types import SimpleNamespace
++
++import cocotb
++import cocotb.queue
++from cocotb.triggers import Timer, with_timeout
++from cocotb.result import SimTimeoutError
++if os.environ.get("RUNTIME_UNDER_TEST"):
++    sys.path.insert(0, os.path.dirname(os.path.abspath(os.environ["RUNTIME_UNDER_TEST"])))
++import test_runif as rt
++
++
++def runtime():
++    obj = rt.DeviceRuntime.__new__(rt.DeviceRuntime)
++    obj._streams = {}
++    obj._stream_ids = 0
++    obj._stream_scheduler_queue_num = 3
++    obj.log = logging.getLogger("runtime-unit")
++    obj.releases = []
++    class Manager:
++        tile_free_list = []
++        cfg_free_list = []
++        def release_config(self, handler):
++            assert handler.valid
++            obj.releases.append(handler)
++    obj._device_managers = [Manager()]
++    obj._stream_scheduler = SimpleNamespace(device_state_update=lambda _: None)
++    return obj
++
++
++async def tick():
++    await Timer(1, units="ns")
++
++
++async def expect_error(awaitable, expected):
++    # Catch inside the task so cocotb 1.9's immediate-error scheduling cannot
++    # classify a deliberately asserted API error as an unhandled worker error.
++    async def capture():
++        try:
++            await awaitable
++        except Exception as error:
++            return error
++        return None
++    error = await with_timeout(capture(), 20000, "ns")
++    assert error is not None, "operation incorrectly succeeded"
++    assert not isinstance(error, SimTimeoutError)
++    assert isinstance(error, expected), repr(error)
++    return error
++
++
++@cocotb.test()
++async def existing_owner_close_during_global_wait_does_not_mutate_iteration(dut):
++    """H's normal tail retirement reproduced through the existing owner API."""
++    r = runtime()
++    external, private = r.create_stream(), r.create_stream()
++    gate = rt.DeviceEvent()
++    await external.wait_event(gate)
++    await private.set_event(rt.DeviceEvent())
++    g = cocotb.start_soon(r.synchronize_all())
++    await tick()
++    assert not g.done()
++    await r.destory_stream(private)
++    assert not gate.is_set() and not g.done()
++    gate.set()
++    await with_timeout(g, 50, "ns")
++    await r.destory_stream(external)
++
++
++@cocotb.test()
++async def snapshot_members_and_work_before_first_await(dut):
++    r = runtime()
++    e, e2, private = (r.create_stream() for _ in range(3))
++    gate, gate2, later = (rt.DeviceEvent() for _ in range(3))
++    await e.wait_event(gate)
++    await e2.wait_event(gate2)
++    await private.set_event(rt.DeviceEvent())
++    g = cocotb.start_soon(r.synchronize_all())
++    await tick()
++    assert not g.done()
++    await e2.wait_event(later)  # same member, accepted AFTER G's first suspension
++    late = r.create_stream()
++    await late.wait_event(later)  # new member likewise excluded
++    await r.destory_stream(private)  # normal retirement during G's stable snapshot
++    gate.set()
++    await tick()
++    assert not g.done(), "G omitted entry work on E2"
++    gate2.set()
++    await with_timeout(g, 50, "ns")
++    assert not later.is_set()
++    assert e2._current_task is not None
++    later.set()
++    await e.set_event(rt.DeviceEvent())  # explicit external stream remains reusable
++    await r.destory_stream(e)
++    await r.destory_stream(e2)
++    await r.destory_stream(late)
++    assert not r.is_device_busy()
++
++
++@cocotb.test()
++async def idle_synchronize_does_not_restart_worker(dut):
++    r = runtime()
++    stream = r.create_stream()
++    starts = []
++    original = stream._process_queue
++    async def counted():
++        starts.append(True)
++        await original()
++    stream._process_queue = counted
++    await stream.synchronize()
++    await tick()
++    assert starts == [], "empty synchronize started a worker"
++    await r.destory_stream(stream)
++    await stream.synchronize()  # already retired, completion remains stable
++    await tick()
++    assert starts == []
++
++
++@cocotb.test()
++async def original_worker_error_propagates_without_cleanup_or_restart(dut):
++    r = runtime()
++    stream = r.create_stream()
++    cause = ValueError("original worker failure")
++    class BrokenEvent:
++        async def wait(self):
++            raise cause
++    await stream.wait_event(BrokenEvent())
++    error = await expect_error(stream.synchronize(), ValueError)
++    assert error is cause
++    error = await expect_error(r.synchronize_all(), ValueError)
++    assert error is cause
++    assert r._streams[stream.id] is stream
++    await expect_error(r.retire_completed_stream(stream), ValueError)
++    assert r.releases == []
++
++
++@cocotb.test()
++async def retire_rejects_inflight_and_exact_identity_mismatch(dut):
++    r, other = runtime(), runtime()
++    stream, foreign = r.create_stream(), other.create_stream()
++    assert stream.id == foreign.id
++    await expect_error(r.destory_stream(foreign), ValueError)
++    impostor = rt.DeviceStream(r, stream.id)
++    await expect_error(r.destory_stream(impostor), ValueError)
++    assert r._streams[stream.id] is stream
++    gate = rt.DeviceEvent()
++    await stream.wait_event(gate)
++    await tick()
++    await expect_error(r.retire_completed_stream(stream), RuntimeError)
++    assert r._streams[stream.id] is stream
++    gate.set()
++    await stream.synchronize()
++    await r.retire_completed_stream(stream)
++    await expect_error(stream.set_event(rt.DeviceEvent()), RuntimeError)
++    assert r.PRIVATE_STREAM_OWNERSHIP_VERSION == 1
++
++
++@cocotb.test()
++async def concurrent_retirement_releases_valid_resource_once(dut):
++    r = runtime()
++    stream = r.create_stream()
++    stream._handler.valid = True
++    stream._handler.device_id = 0
++    await stream.set_event(rt.DeviceEvent())
++    await stream.synchronize()
++    original = r.release_config
++    entered, permit = rt.DeviceEvent(), rt.DeviceEvent()
++    async def release(handler):
++        entered.set()
++        await permit.wait()
++        await original(handler)
++    r.release_config = release
++    first = cocotb.start_soon(r.retire_completed_stream(stream))
++    await entered.wait()
++    second = cocotb.start_soon(r.retire_completed_stream(stream))
++    await tick()
++    permit.set()
++    await with_timeout(first, 50, "ns")
++    await with_timeout(second, 50, "ns")
++    await r.retire_completed_stream(stream)
++    assert len(r.releases) == 1
++    assert not r._streams
++    # An old close cannot touch a later object accidentally reusing the ID.
++    replacement = rt.DeviceStream(r, stream.id)
++    r._streams[stream.id] = replacement
++    await r.destory_stream(stream)
++    assert r._streams[stream.id] is replacement
++    await r.destory_stream(replacement)
++
++
++@cocotb.test()
++async def cleanup_failure_can_retry_after_release_has_taken_effect(dut):
++    r = runtime()
++    stream = r.create_stream()
++    stream._handler.valid, stream._handler.device_id = True, 0
++    original = r.release_config
++    cause = OSError("post-release return failure")
++    async def failed_return(handler):
++        await original(handler)
++        raise cause
++    r.release_config = failed_return
++    error = await expect_error(r.retire_completed_stream(stream), OSError)
++    assert error is cause
++    assert r._streams[stream.id] is stream
++    r.release_config = original
++    await r.retire_completed_stream(stream)
++    assert len(r.releases) == 1
++    assert not r._streams
++
++
++@cocotb.test()
++async def transport_queue_error_reaches_stream_fence(dut):
++    r = runtime()
++    cause = OSError("D2H original failure")
++    async def broken_copy(*args):
++        raise cause
++    queue = rt.AsyncTaskQueue(broken_copy)
++    r.add_read_task = lambda *args: queue.add_task(args)
++    stream = r.create_stream()
++    await stream.memcpyDeviceToHost(rt.DeviceData(0, 4), bytearray(), 4)
++    error = await expect_error(stream.synchronize(), OSError)
++    assert error is cause
++    assert stream._handler.valid is False
++    assert r._streams[stream.id] is stream
++
++
++@cocotb.test()
++async def scheduler_fit_error_reaches_stream_fence(dut):
++    r = runtime()
++    scheduler = rt.StreamScheduler()
++    cause = ValueError("invalid configuration in allocator")
++    def broken_fit(*args):
++        raise cause
++    scheduler.add_device(0, broken_fit)
++    class ScheduledWork:
++        async def wait(self):
++            event = await scheduler.put(0, ())
++            await event.wait()
++    stream = r.create_stream()
++    await stream.wait_event(ScheduledWork())
++    error = await expect_error(stream.synchronize(), ValueError)
++    assert error is cause
++
++
++@cocotb.test()
++async def notification_error_after_allocator_release_does_not_release_twice(dut):
++    r = runtime()
++    stream = r.create_stream()
++    stream._handler.valid, stream._handler.device_id = True, 0
++    cause = OSError("scheduler notification failure after free")
++    def broken_notify(*args):
++        raise cause
++    r._stream_scheduler.device_state_update = broken_notify
++    error = await expect_error(r.retire_completed_stream(stream), OSError)
++    assert error is cause
++    assert len(r.releases) == 1
++    assert r._streams[stream.id] is stream
++    r._stream_scheduler.device_state_update = lambda _: None
++    await r.retire_completed_stream(stream)
++    assert len(r.releases) == 1, "valid lease returned a second time"
++
++
++@cocotb.test()
++async def queued_transport_errors_wake_all_accepted_waiters(dut):
++    cause = OSError("queued DMA failed")
++    gate = rt.DeviceEvent()
++    async def transfer(*args):
++        await gate.wait()
++        raise cause
++    queue = rt.AsyncTaskQueue(transfer, task_queue_size=3)
++    events = [await queue.add_task((index,)) for index in range(3)]
++    await tick()
++    gate.set()
++    for event in events:
++        assert await expect_error(event.wait(), OSError) is cause
++    assert await expect_error(queue.wait_all(), OSError) is cause
++    assert await expect_error(queue.add_task((4,)), OSError) is cause
++
++
++@cocotb.test()
++async def blocked_transport_producers_cannot_bypass_poison(dut):
++    cause = OSError("active DMA failed with blocked producers")
++    gate = rt.DeviceEvent()
++    calls, starts = [], []
++    async def transfer(label):
++        calls.append(label)
++        if label == "A":
++            await gate.wait()
++            raise cause
++    queue = rt.AsyncTaskQueue(transfer, task_queue_size=1)
++    original_worker = queue._process_queue
++    async def counted_worker():
++        starts.append(True)
++        await original_worker()
++    queue._process_queue = counted_worker
++    a = await queue.add_task(("A",))
++    await tick()  # A has been removed from the queue and is running behind gate.
++    b = await queue.add_task(("B",))
++    async def blocked_submit(label):
++        try:
++            return await queue.add_task((label,))
++        except Exception as error:
++            return error
++    c = cocotb.start_soon(blocked_submit("C"))
++    d = cocotb.start_soon(blocked_submit("D"))
++    await tick()
++    assert calls == ["A"] and queue.size() == 1
++    assert not c.done() and not d.done()
++    assert len(queue._queue._putters) == 2, "C and D must both suspend in bounded put"
++    gate.set()
++    assert await expect_error(a.wait(), OSError) is cause
++    assert await expect_error(b.wait(), OSError) is cause
++    c_result = await with_timeout(c, 50, "ns")
++    d_result = await with_timeout(d, 50, "ns")
++    await tick()
++    cocotb.log.info("bounded poison: DMA=%s worker_starts=%d queued=%d C_original_error=%s D_original_error=%s",
++                    calls, len(starts), queue.size(), c_result is cause, d_result is cause)
++    assert c_result is cause and d_result is cause
++    assert await expect_error(queue.wait_all(), OSError) is cause
++    await tick()
++    assert calls == ["A"], "poisoned queue launched additional DMA"
++    assert len(starts) == 1, "poisoned queue restarted a worker"
++    assert queue.size() == 0 and not queue._queue._putters
++    assert queue._current_task is None and not queue._running
++
++
++@cocotb.test()
++async def queued_release_waits_for_true_execution_completion(dut):
++    r = runtime()
++    stream = r.create_stream()
++    handler = stream._handler
++    handler.valid, handler.device_id, handler.running = True, 0, True
++    entered, done = rt.DeviceEvent(), rt.DeviceEvent()
++    async def finish(h):
++        entered.set()
++        await done.wait()
++        h.running = False
++    r.finish_execution = finish
++    await stream.release()
++    await tick()
++    assert entered.is_set(), "release skipped running execution"
++    assert r.releases == [], "resource freed before confirmed done"
++    done.set()
++    await stream.synchronize()
++    assert len(r.releases) == 1
++    await r.retire_completed_stream(stream)
++    assert len(r.releases) == 1
++
++
++@cocotb.test()
++async def execution_timeout_without_fresh_status_is_failure(dut):
++    r = runtime()
++    r._device_managers[0].device = SimpleNamespace(reg_cfg_en_tile_reglength=1)
++    r._device_exereg = [rt.DeviceExeRegInfo()]
++    r._device_fetch_exereg_interval = 1
++    handler = rt.ResourceMappingHandler(0)
++    handler.device_id, handler.total_tiles, handler.running = 0, 1, True
++    await expect_error(r.finish_execution(handler), TimeoutError)
++    assert handler.running, "unknown execution incorrectly marked completed"
++    assert r._device_exereg[0].need_count == 0
++
++
++@cocotb.test()
++async def execution_timeout_with_fresh_but_absent_done_is_failure(dut):
++    r = runtime()
++    r._device_managers[0].device = SimpleNamespace(reg_cfg_en_tile_reglength=1)
++    reg = rt.DeviceExeRegInfo(exe_reg=b"\x00")
++    r._device_exereg = [reg]
++    r._device_fetch_exereg_interval = 1
++    handler = rt.ResourceMappingHandler(0)
++    handler.device_id, handler.total_tiles, handler.running = 0, 1, True
++    async def poll():
++        while True:
++            await Timer(1, units="ns")
++            reg.resp_time = cocotb.utils.get_sim_time(units="ns")
++    poller = cocotb.start_soon(poll())
++    await expect_error(r.finish_execution(handler), TimeoutError)
++    poller.kill()
++    assert handler.running
++    assert reg.need_count == 0
++
++
++@cocotb.test()
++async def completed_stream_is_collectible_without_history_registry(dut):
++    import weakref
++    import gc
++    r = runtime()
++    references = []
++    for _ in range(128):
++        stream = r.create_stream()
++        await stream.set_event(rt.DeviceEvent())
++        await stream.synchronize()
++        references.append(weakref.ref(stream))
++        await r.retire_completed_stream(stream)
++    del stream
++    # GC here is only measuring roots; retirement above must already be done.
++    gc.collect()
++    assert not r._streams
++    assert all(ref() is None for ref in references)
++
++
++if __name__ == "__main__":
++    # Run in a disposable directory: no RTL changes or source-tree build output.
++    import pathlib
++    import subprocess
++    import tempfile
++    import xml.etree.ElementTree as ET
++    source_dir = pathlib.Path(__file__).resolve().parent
++    with tempfile.TemporaryDirectory(prefix="stream-ownership-unit-") as build:
++        build_dir = pathlib.Path(build)
++        top = build_dir / "unit_top.v"
++        top.write_text("`timescale 1ns/1ps\nmodule unit_top; endmodule\n")
++        makefiles = subprocess.check_output(
++            ["cocotb-config", "--makefiles"], text=True).strip()
++        env = dict(os.environ)
++        env["PYTHONPATH"] = str(source_dir) + os.pathsep + env.get("PYTHONPATH", "")
++        env["PYTHONDONTWRITEBYTECODE"] = "1"
++        command = ["make", "-f", str(pathlib.Path(makefiles) / "Makefile.sim"),
++                   "SIM=icarus", "TOPLEVEL_LANG=verilog", "TOPLEVEL=unit_top",
++                   "MODULE=test_stream_ownership", "VERILOG_SOURCES=" + str(top)]
++        result = subprocess.run(command, cwd=build, env=env)
++        report = build_dir / "results.xml"
++        if result.returncode or not report.is_file():
++            raise SystemExit(result.returncode or 1)
++        tree = ET.parse(report)
++        # cocotb 1.9 make can return zero even when a regression fails.
++        raise SystemExit(1 if tree.findall(".//failure") or tree.findall(".//error") else 0)
+--- /dev/null
++++ b/server/STREAM_OWNERSHIP.md
+@@ -0,0 +1,62 @@
++# Stream ownership and completion
++
++`DeviceRuntime.PRIVATE_STREAM_OWNERSHIP_VERSION == 1` advertises this contract.
++The module exports the same constant. New generated private callers check the
++capability before creating a stream or submitting work.
++
++An owner keeps the exact object returned by `runtime.create_stream()`. After
++`await stream.synchronize()` and successful generated host writeback, the caller
++may publish its valid output range, then call
++`await runtime.retire_completed_stream(stream)`. Retirement never waits for
++unknown work: it requires successful completion of all accepted commands and
++rejects the stream's original work error. Cross-runtime objects and same-ID
++impostors raise `ValueError`. New submissions during or after retirement raise
++`RuntimeError`. Concurrent retirement serializes on a per-stream lock; repeated
++retirement of that same object is harmless. Idempotence is held on the stream
++object, with no runtime tombstone/history registry.
++
++The existing misspelled `await runtime.destory_stream(stream)` remains an owner
++close operation. It validates exact identity, waits for accepted work, and then
++retires. A user-owned explicit stream remains reusable until its owner closes
++it. `is_device_busy()` keeps its existing meaning: at least one stream remains
++registered, including an idle stream owned by an external caller.
++
++`synchronize()` waits for work accepted when its coroutine begins execution.
++`synchronize_all()` snapshots every current member and every member's accepted
++work before its first suspension. Each snapshot holds independent completion
++evidence, so concurrent retirement is safe. Later submissions, including later
++work on an existing member, are excluded. Internal FIFO completion markers flush
++reordered transfers and confirm any running execution. Empty/retired streams do
++not start workers. `_accepted`, `_completed`, `_error`, `_retired`, `_retiring`
++and transient `_fences` are diagnostic state, not public APIs.
++
++Work, transfer and allocator errors wake waiters with the original exception.
++Bounded transfer admission rechecks failure after its suspended queue put:
++newly inserted entries are failed and removed synchronously, waking every other
++blocked producer to reject with the same original error. A failed transfer
++queue cannot restart a worker or launch another DMA; rejected entries do not
++remain queued. This includes producers already blocked when the error arose.
++Execution completion requires a fresh matching done response; absent done or
++stale status raises `TimeoutError` after 10000 polling intervals and leaves
++`handler.running` true. Failure does not retire a stream, release a running
++resource, mark completion, or restart a failed worker. The owner must preserve
++the stream and its borrowed buffers when completion is unknown; retirement is
++not a recovery API for failed work. Cleanup failures leave the exact registered
++object available for retry. A returned valid allocation is invalidated before
++notification/logging so a cleanup retry cannot return it twice.
++
++Run the software regression with the production cocotb Python environment and
++Icarus Verilog available on `PATH`:
++
++```sh
++python server/test_stream_ownership.py
++```
++
++The self-launcher creates and removes a temporary empty Verilog top. Tests run
++real cocotb 1.9 queues/events/tasks and the real runtime methods; hardware
++allocation/status interfaces use minimal doubles. Exit status is derived from
++the XML results because cocotb 1.9's make target can return zero for test failure.
++Set `RUNTIME_UNDER_TEST=/absolute/path/to/test_runif.py` to test a frozen older
++source; the same assertions are expected to fail there. These software tests do
++not establish RTL or generated-entry correctness; the complete RTL gates and
++private-call publication/borrowing checks must be run separately.

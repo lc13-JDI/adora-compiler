@@ -34,6 +34,32 @@ _registry = sys.modules.setdefault(_new_registry.__name__, _new_registry)
 del _new_registry
 _POISONED_PLANS = _registry.poisoned
 _INFLIGHT_PLANS = _registry.inflight
+# Pending cleanup is safe completed work, distinct from unknown completion.
+# The shared module also roots once-entry plans after callers drop exceptions.
+_PENDING_CLEANUP_PLANS = _registry.__dict__.setdefault('cleanup_pending', set())
+
+
+class PlanCleanupError(RuntimeError):
+    """Confirmed output is published; stream ownership still needs cleanup."""
+
+    def __init__(self, plan, cause):
+        super().__init__(f'prepared plan: stream cleanup failed for {plan._cleanup[2]}: {cause}')
+        self.phase = 'retire_completed_stream'
+        self.block = plan._cleanup[2]
+        self.completed_ranges = plan.completed_ranges
+        self.cursor = plan._cursor
+        self.cause = cause
+        self.plan = plan
+        self._cleanup_identity = plan._cleanup
+        self.poisoned = False
+
+    async def retry_cleanup(self):
+        # A saved error belongs to one ownership lease, even after plan reuse.
+        # Identity is checked before suspension; stale handles never target a
+        # newer stream or inspect that newer execution's lifecycle state.
+        if self.plan._cleanup is not self._cleanup_identity:
+            return
+        return await self.plan.retry_cleanup()
 
 
 class PlanExecutionError(RuntimeError):
@@ -113,10 +139,12 @@ class _PreparedPlan:
     __slots__ = ('_identity', '_descriptor', '_tile', '_snapshots', '_offsets',
                  '_active', '_scratch', '_positions', '_closed', '_busy',
                  '_poisoned', '_retained', '_stats', '_last_report', '_completed_ranges',
-                 '_windows', '_ranges', '_cursor', '_preparation', '_bookkeeping', '_probes')
+                 '_windows', '_ranges', '_cursor', '_preparation', '_bookkeeping', '_probes',
+                 '_owns_stream', '_stream', '_cleanup', '_cleanup_busy')
 
     def __init__(self, identity, descriptor, tile, x, y, enabled, *,
-                 preparation='window', window_tiles=32, bookkeeping='cursor', probes=True):
+                 preparation='window', window_tiles=32, bookkeeping='cursor', probes=True,
+                 private_stream_ownership=False):
         start = time.perf_counter_ns()
         items = descriptor['items']
         if preparation not in ('window', 'tile') or bookkeeping not in ('cursor', 'eager'):
@@ -138,6 +166,9 @@ class _PreparedPlan:
         self._identity = identity
         self._descriptor = descriptor
         self._tile = tile
+        self._owns_stream = private_stream_ownership
+        self._stream = self._cleanup = None
+        self._cleanup_busy = False
         self._preparation, self._bookkeeping, self._probes = preparation, bookkeeping, probes
         # bytes owns an immutable copy, unlike ndarray writeable=False on an
         # owned allocation (which can be toggled back). No public mutable view.
@@ -231,6 +262,40 @@ class _PreparedPlan:
         return self._busy
 
     @property
+    def pending_stream(self):
+        return self._stream
+
+    @property
+    def cleanup_pending(self):
+        return self._cleanup is not None
+
+    async def retry_cleanup(self):
+        """Retry only retirement; never dispatch or publish a block again."""
+        if self._poisoned:
+            raise ValueError('prepared plan: completion unknown; cleanup is unsafe')
+        if self._cleanup_busy:
+            raise ValueError('prepared plan: cleanup already pending')
+        if self._cleanup is None:
+            return
+        runtime, stream, block = self._cleanup
+        self._cleanup_busy = True
+        try:
+            try:
+                await runtime.retire_completed_stream(stream)
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    error.phase = 'retire_completed_stream'
+                    error.block = block
+                    error.completed_ranges = self.completed_ranges
+                    error.plan = self
+                    raise
+                raise PlanCleanupError(self, error) from error
+            self._cleanup = self._stream = self._retained = None
+            _PENDING_CLEANUP_PLANS.discard(self)
+        finally:
+            self._cleanup_busy = False
+
+    @property
     def completed_ranges(self):
         if self._closed or self._bookkeeping == 'eager':
             return self._completed_ranges
@@ -245,6 +310,8 @@ class _PreparedPlan:
     def close(self):
         if self._busy:
             raise ValueError('prepared plan: execution pending; close cannot release borrowed storage')
+        if self.cleanup_pending:
+            raise ValueError('prepared plan: stream cleanup pending; retry cleanup before close')
         if self._poisoned:
             raise ValueError('prepared plan: completion unknown; poisoned storage retained until runtime/process teardown')
         if self._closed:
@@ -311,11 +378,16 @@ class _PreparedPlan:
         reports completed output ranges and retains uncertain in-flight storage.
         """
         start = time.perf_counter_ns()
-        if self._closed or self._poisoned or self._busy:
-            raise ValueError('prepared plan: closed, poisoned, or already executing')
+        if self._closed or self._poisoned or self._busy or self.cleanup_pending:
+            raise ValueError('prepared plan: closed, poisoned, cleanup pending, or already executing')
         _array(src, self._descriptor['source_elements'], 'uint16', 'src')
         _array(dst, self._descriptor['items'], 'uint16', 'dst', writable=True)
         _disjoint((src, dst))
+        if self._owns_stream and (
+                getattr(runtime, 'PRIVATE_STREAM_OWNERSHIP_VERSION', None) != 1 or
+                not callable(getattr(runtime, 'create_stream', None)) or
+                not callable(getattr(runtime, 'retire_completed_stream', None))):
+            raise ValueError('prepared plan: runtime private stream ownership version 1 is required')
         probes = self._probes
         times = dict.fromkeys(('precheck', 'pack', 'prepare', 'device', 'copyback'),
                               0 if probes else None)
@@ -335,13 +407,23 @@ class _PreparedPlan:
                 failed_range = (begin, end)
                 if probes:
                     stamp = time.perf_counter_ns()
+                if self._owns_stream:
+                    self._stream = runtime.create_stream()
                 in_flight = True
-                self._retained = (runtime, src, dst)
+                self._retained = (runtime, src, dst, self._stream)
                 _INFLIGHT_PLANS.add(self)
-                await self._tile(runtime, packed, idx, enabled, old_dst)
+                if self._owns_stream:
+                    await self._tile(runtime, packed, idx, enabled, old_dst,
+                                     _adora_stream=self._stream)
+                else:
+                    await self._tile(runtime, packed, idx, enabled, old_dst)
                 in_flight = False
                 _INFLIGHT_PLANS.discard(self)
-                self._retained = None
+                if self._owns_stream:
+                    self._cleanup = (runtime, self._stream, (begin, end))
+                    _PENDING_CLEANUP_PLANS.add(self)
+                else:
+                    self._retained = None
                 if probes:
                     times['device'] += time.perf_counter_ns() - stamp
                     stamp = time.perf_counter_ns()
@@ -354,6 +436,8 @@ class _PreparedPlan:
                     self._completed_ranges = tuple(completed)
                 if probes:
                     times['copyback'] += time.perf_counter_ns() - stamp
+                if self._owns_stream:
+                    await self.retry_cleanup()
             self._stats['executions'] += 1
             times['total'] = time.perf_counter_ns() - start
             report = dict(completed_ranges=(tuple(completed) if completed is not None
@@ -363,13 +447,19 @@ class _PreparedPlan:
             self._last_report = report
             return self.last_report
         except BaseException as error:
+            if isinstance(error, PlanCleanupError):
+                raise
+            if self.cleanup_pending and not isinstance(error, Exception):
+                # Cancellation during retirement is safe pending cleanup, not
+                # an unknown device result. Preserve its control-flow class.
+                raise
             # Preparation can raise while advancing the generator, before it
             # yields the next tile. The cursor identifies that uncopied range.
             if not in_flight:
                 failed_range = self._ranges[self._cursor] if self._cursor < len(self._ranges) else None
             if in_flight:
                 self._poisoned = True
-                self._retained = (runtime, src, dst)
+                self._retained = (runtime, src, dst, self._stream)
                 _POISONED_PLANS.append(self)
                 _INFLIGHT_PLANS.discard(self)
             # Preserve cancellation/control-flow exception type for both asyncio
@@ -381,12 +471,13 @@ class _PreparedPlan:
                 raise
             failure = PlanExecutionError(str(error), self.completed_ranges, failed_range)
             failure.poisoned = self._poisoned
+            failure.plan = self
             raise failure from error
         finally:
             self._busy = False
 
 
-def bind_prepared_entry(unchecked, descriptor):
+def bind_prepared_entry(unchecked, descriptor, *, private_stream_ownership=False):
     """Compiler-internal binding, not a public descriptor/proof import API.
 
     Generated modules embed this version and an identity derived from their
@@ -404,7 +495,8 @@ def bind_prepared_entry(unchecked, descriptor):
         try:
             return _PreparedPlan(identity, descriptor, unchecked, x, y, enabled,
                                  preparation=preparation, window_tiles=window_tiles,
-                                 bookkeeping=bookkeeping, probes=probes)
+                                 bookkeeping=bookkeeping, probes=probes,
+                                 private_stream_ownership=private_stream_ownership)
         except MemoryError as error:
             raise MemoryError('prepared plan: allocation failed within checked resource bounds; reduce query count or window_tiles') from error
 
@@ -429,10 +521,18 @@ def bind_prepared_entry(unchecked, descriptor):
         _disjoint(buffers)
         plan = make_plan(x, y, enabled)
         try:
-            return await execute_plan(runtime, plan, src, dst)
-        finally:
-            if not plan.poisoned:
-                plan.close()
+            result = await execute_plan(runtime, plan, src, dst)
+        except BaseException as error:
+            if not plan.poisoned and not plan.cleanup_pending and not plan.pending:
+                try:
+                    plan.close()
+                except BaseException as close_error:
+                    # Cleanup must not replace the frame's original failure.
+                    error.close_error = close_error
+            raise
+        else:
+            plan.close()
+            return result
 
     once_entry.__name__ = descriptor['entry']
     return make_plan, execute_plan, once_entry

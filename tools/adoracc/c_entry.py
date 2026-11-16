@@ -109,15 +109,17 @@ def validate_hardware(adg: dict, operations: dict, contract: dict) -> int:
 
 
 def checked_wrapper(contract: dict, factory_name: str = '_adora_make_checked_entry',
-                    *, allow_partial: bool = False) -> str:
+                    *, allow_partial: bool = False, private_stream_parameter: str | None = None) -> str:
     """Wrap a successfully verified/emitted function without copying pixel data."""
     contract = validate_contract(contract, allow_partial=allow_partial)
     specs = [(o['elements'], o['host_dtype'], o['access_assertion']) for o in contract['objects']]
     entry = contract['entry']
+    stream_signature = ', _adora_stream' if private_stream_parameter else ''
+    stream_call = f', {private_stream_parameter}=_adora_stream' if private_stream_parameter else ''
     return f'''
 # Public checked ABI. Validation completes before the generated entry creates a stream.
 def {factory_name}(_unchecked):
-    async def _checked(runtime, *buffers):
+    async def _checked(runtime, *buffers{stream_signature}):
         specs = {specs!r}
         if len(buffers) != len(specs):
             raise ValueError('C entry: incorrect number of buffers')
@@ -135,7 +137,7 @@ def {factory_name}(_unchecked):
                 if np.shares_memory(buffers[left], buffers[right]):
                     raise ValueError('C entry: buffers must not alias')
         transport = tuple(buffer.view(np.int16) for buffer in buffers)
-        return await _unchecked(runtime, *transport)
+        return await _unchecked(runtime, *transport{stream_call})
     _checked.__name__ = {entry!r}
     _checked.__doc__ = 'Checked fixed-shape C entry; uint16 transport uses an equal-width view.'
     return _checked
@@ -144,7 +146,8 @@ del {factory_name}
 '''
 
 
-def checked_module(mapper_source: str, contract: dict, *, allow_partial: bool = False) -> tuple[str, str]:
+def checked_module(mapper_source: str, contract: dict, *, allow_partial: bool = False,
+                   private_stream_ownership: bool = False) -> tuple[str, str]:
     """Isolate emitter globals from arbitrary valid public C entry names.
 
     Only the selected async definition is renamed. C calls/recursion are
@@ -186,10 +189,47 @@ def checked_module(mapper_source: str, contract: dict, *, allow_partial: bool = 
 
     private_entry = fresh('_adora_private_entry')
     matches[0].name = private_entry
+    stream_parameter = None
+    if private_stream_ownership:
+        # The large host plan owns the exact stream before dispatch. Rewrite
+        # only the verified entry, leaving helpers and other profiles intact.
+        stream_parameter = fresh('_adora_owned_stream')
+        entry_node = matches[0]
+        creates = [node for node in ast.walk(entry_node)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and isinstance(node.func.value, ast.Name) and node.func.value.id == 'runtime'
+                   and node.func.attr == 'create_stream']
+        assignments = [node for node in entry_node.body if isinstance(node, ast.Assign)
+                       and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                       and node.targets[0].id == 'stream' and node.value in creates]
+        if (len(creates) != 1 or len(assignments) != 1 or
+                creates[0].args or creates[0].keywords):
+            raise ValueError('large mapper entry must create exactly one private stream')
+        # A return is completion evidence only if final generated writeback
+        # succeeded. The emitter's compatibility guard also swallows NameError
+        # raised *inside* the helper. Require its known tail and remove that
+        # guard only for owned large entries, so missing/failed writeback cannot
+        # turn unknown output into a successful public publication.
+        expected_tail = ast.parse('''await stream.synchronize()
+try:
+    apply_writeback_tasks(writeback_tasks)
+except NameError:
+    pass
+''').body
+        if (len(entry_node.body) < 2 or
+                any(ast.dump(actual) != ast.dump(expected)
+                    for actual, expected in zip(entry_node.body[-2:], expected_tail))):
+            raise ValueError('large mapper entry must end with verified synchronize/writeback tail')
+        entry_node.body[-1:] = entry_node.body[-1].body
+        assignments[0].value = ast.Name(id=stream_parameter, ctx=ast.Load())
+        entry_node.args.kwonlyargs.append(ast.arg(arg=stream_parameter))
+        entry_node.args.kw_defaults.append(None)
+        ast.fix_missing_locations(tree)
     factory = fresh('_adora_private_checked_factory')
     private_contract = dict(contract, entry=private_entry)
     private_source = ast.unparse(tree) + '\n' + checked_wrapper(
-        private_contract, factory, allow_partial=allow_partial)
+        private_contract, factory, allow_partial=allow_partial,
+        private_stream_parameter=stream_parameter)
     compile(private_source, '<adora private implementation>', 'exec')
     # The implementation is embedded so the final .py is independently usable.
     # Its readable companion is retained alongside the unmodified mapper output.
@@ -385,7 +425,8 @@ def large_local_contract() -> dict:
 
 def large_checked_module(mapper_source: str, descriptor: dict) -> tuple[str, str]:
     """Embed the proven tile and versioned host support into one public module."""
-    tile_source, private_source = checked_module(mapper_source, large_local_contract(), allow_partial=True)
+    tile_source, private_source = checked_module(mapper_source, large_local_contract(),
+                                                allow_partial=True, private_stream_ownership=True)
     support = Path(__file__).with_name('prepared_xy.py').read_text()
     entry = descriptor['entry']
     if entry in {'make_plan', 'execute_plan', '_tile', '_adora_create_large_entry'}:
@@ -399,9 +440,10 @@ def _adora_create_large_entry():
     globals()['_tile'] = tile_namespace['_adora_large_tile']
     support_namespace = {{'__name__': __name__ + '._support', '__file__': __file__}}
     exec(compile({support!r}, __file__, 'exec'), support_namespace)
-    async def dispatch(runtime, *buffers):
-        return await public_namespace['_tile'](runtime, *buffers)
-    make_plan, execute_plan, once = support_namespace['bind_prepared_entry'](dispatch, {descriptor!r})
+    async def dispatch(runtime, *buffers, _adora_stream):
+        return await public_namespace['_tile'](runtime, *buffers, _adora_stream=_adora_stream)
+    make_plan, execute_plan, once = support_namespace['bind_prepared_entry'](
+        dispatch, {descriptor!r}, private_stream_ownership=True)
     public_namespace['make_plan'] = make_plan
     public_namespace['execute_plan'] = execute_plan
     public_namespace[{entry!r}] = once
