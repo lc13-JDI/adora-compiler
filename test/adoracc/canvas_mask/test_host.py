@@ -15,7 +15,8 @@ MODULE = ROOT / 'tools/adoracc/prepared_canvas.py'
 
 
 def descriptor(items=353):
-    return dict(schema='adora.guarded-canvas-mask.v1', support_version=1,
+    return dict(schema='adora.guarded-canvas-mask.v1', support_version=2,
+                canvas_variant='A', packing_layout='indexed', value_logic='canvas',
                 module_identity='a' * 64, entry='canvas', width=8193, height=1,
                 items=items, source_elements=8193, tile_items=256,
                 range_lo=32768, range_hi=60000, source_argument=0, x_argument=1,
@@ -51,6 +52,71 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
             self.calls.append(('old', (previous.copy(), mask.copy())))
             mask[:] = np.where(previous != 0, 255, 0)
         return self.module.bind_canvas_entry(normal or regular, old_only or old, desc or descriptor())
+
+    async def test_private_same_slot_packing_and_regular_tail(self):
+        # Two active, non-adjacent slots span the depth threshold. Swapping
+        # their values and supplying matching indices preserves indexed reads
+        # but changes both streaming reads. The plan constructs its own layout.
+        x, y, en = (np.zeros(353, np.int16) for _ in range(3))
+        x[[0, 255, 352]] = [8192, 0, 8192]
+        en[[0, 255, 352]] = [-1, 1, -32768]
+        src = np.zeros(8193, np.uint16)
+        src[8192] = 32768
+        old = np.full(353, 65535, np.uint16)
+        old[1::2] = 0
+        public = np.full(355, 181, np.uint16)
+        seen = []
+        async def streamed(runtime, packed, enabled, previous, output):
+            seen.append((packed.copy(), enabled.copy(), previous.copy()))
+            self.assertEqual(packed.dtype, np.uint16)
+            self.assertEqual(enabled.dtype, np.int16)
+            output[:] = 255 * np.where(enabled != 0, (packed >= 32768) & (packed <= 60000), previous != 0)
+        for variant in ('C', 'D'):
+            seen.clear()
+            desc = dict(descriptor(), canvas_variant=variant, packing_layout='same-slot',
+                        value_logic='canvas' if variant == 'C' else 'predicate')
+            plan = self.bind(desc=desc, normal=streamed)[0](x, y, en)
+            self.assertIsNone(plan._index)
+            await plan.execute(None, src, old, public[1:-1])
+            expected = np.where(old != 0, 255, 0)
+            expected[[0, 255, 352]] = [255, 0, 255]
+            np.testing.assert_array_equal(public[1:-1], expected)
+            np.testing.assert_array_equal(public[[0,-1]], 181)
+            self.assertEqual(len(seen), 2)
+            np.testing.assert_array_equal(np.flatnonzero(seen[0][1]), [0, 255])
+            np.testing.assert_array_equal(np.flatnonzero(seen[1][1]), [96])
+            for buffer in seen[1]:
+                self.assertTrue(np.all(buffer[97:] == 0))
+            plan.close()
+
+    async def test_sparse_same_slot_plan_handles_last_window_slot_and_wide_offset(self):
+        items = 65537
+        desc = dict(descriptor(items), height=9, source_elements=8193 * 9,
+                    canvas_variant='C', packing_layout='same-slot')
+        x, y, en = (np.zeros(items, np.int16) for _ in range(3))
+        x[[65535, 65536]], y[[65535, 65536]], en[[65535, 65536]] = 8192, 8, -3
+        source = np.zeros(desc['source_elements'], np.uint16)
+        source[-1] = 47612
+        writes = []
+
+        async def capture(runtime, packed, enabled, previous, out):
+            slots = np.flatnonzero(enabled)
+            writes.append((slots.tolist(), packed[slots].tolist()))
+            out[:] = packed
+
+        async def empty(runtime, previous, out):
+            out.fill(0)
+
+        make, _, _ = self.bind(desc=desc, normal=capture, old_only=empty)
+        plan = make(x, y, en, window_tiles=256, probes=False)
+        # Two active slot/offset pairs suffice beside snapshots and tile roles.
+        self.assertLess(plan.stats['plan_bytes'], 7 * items)
+        en[:] = 0
+        mask = np.empty(items, np.uint16)
+        await plan.execute(None, source, np.zeros_like(mask), mask)
+        self.assertEqual(writes, [([255], [47612]), ([0], [47612])])
+        np.testing.assert_array_equal(np.flatnonzero(mask), [65535, 65536])
+        plan.close()
 
     async def test_owned_geometry_fresh_frames_and_old_only_tail(self):
         make, _, _ = self.bind()
@@ -133,8 +199,10 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
             await execute(None, foreign, source, old, mask)
         with self.assertRaises(ValueError):
             await once(None, source, *coords, old, coords[0].view(np.uint16))
-        for changes in [dict(schema='adora.guarded-inplace-large.v1'), dict(support_version=2),
+        for changes in [dict(schema='adora.guarded-inplace-large.v1'), dict(support_version=1),
                         dict(support_version=True), dict(module_identity='stale'),
+                        dict(canvas_variant='C'), dict(packing_layout='permuted'),
+                        dict(value_logic='predicate'),
                         dict(width=8192), dict(items=0), dict(items=2**63),
                         dict(tile_items=128), dict(old_argument=5), dict(range_lo=0),
                         dict(range_hi=65536), dict(range_lo=True), dict(range_lo=60001),
@@ -207,14 +275,19 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(ref() is not None for ref in references))
 
     async def test_cancellation_preserves_type_prefix_and_untouched_output(self):
+        for variant, layout in [('A', 'indexed'), ('C', 'same-slot')]:
+            with self.subTest(variant=variant):
+                await self.cancel_second_tile(dict(descriptor(), canvas_variant=variant, packing_layout=layout))
+
+    async def cancel_second_tile(self, desc):
         entered = asyncio.Event()
-        async def normal(runtime, src, idx, en, old, mask):
-            mask[:] = 11
+        async def normal(runtime, *buffers):
+            buffers[-1][:] = 11
         async def old_only(runtime, old, mask):
             mask[:] = 19
             entered.set()
             await asyncio.Event().wait()
-        make, _, _ = self.bind(normal=normal, old_only=old_only)
+        make, _, _ = self.bind(desc=desc, normal=normal, old_only=old_only)
         plan = make(*self.arrays())
         mask = np.full(353, 71, np.uint16)
         task = asyncio.create_task(plan.execute(None, np.zeros(8193, np.uint16), np.ones(353, np.uint16), mask))
@@ -225,6 +298,7 @@ class HostProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.completed_ranges, ((0, 256),))
         self.assertEqual(caught.exception.failed_range, (256, 353))
         self.assertTrue(caught.exception.poisoned)
+        self.assertIs(plan._retained[-1], mask)
         np.testing.assert_array_equal(mask[:256], np.full(256, 11))
         np.testing.assert_array_equal(mask[256:], np.full(97, 71))
 

@@ -8,12 +8,17 @@ and skip wholly inactive tiles.
 The producer initializes a private `uint16_t canvas[T]` from an independent
 read-only `old`, then updates valid enabled coordinates with a depth in a
 positive inclusive uint16 range or zero. The consumer fully defines an
-independent uint16 mask as `canvas[i] != 0 ? 255 : 0`. The typed bridge proves
+independent uint16 mask as `canvas[i] != 0 ? 255 : 0`. The equivalent
+`(uint32_t)canvas[i] > 0u ? 255 : 0` is accepted after the same uint16
+full-domain check. The typed bridge proves
 the two equal static iteration domains, complete initialization, unique
 same-slot consumption, every allocation use, absence of observable intermediate
 effects, the guarded wide source address and both uint16 value functions.
 Parameter names and contract macros do not establish these facts. Renaming and
 an equivalent SSA merge with an unconditional final private store are supported.
+The consumer may also compare the widened unsigned canvas value to zero using
+`(uint32_t)canvas[i] > 0u ? 255 : 0`. The typed proof enumerates all 65,536
+canvas codes, including the upper half of the uint16 domain.
 Views, escapes, additional consumers, altered indices, incomplete initialization,
 volatile accesses and unproved effects are rejected.
 
@@ -38,10 +43,27 @@ promotion normalization and cgeist raw MLIR. `regular/` and `old-only/` each
 retain their typed proof, local contract, IR, DFG, map and generated call.
 `host-proof.json` and `provenance.json` record the checked public ABI and hashes.
 
-The regular tile reads packed source/index/enable and independent old values,
-then writes all 256 device mask slots. The old-only tile reads only old and
-writes all mask slots. Classification uses only the immutable geometry and
-enable snapshot; zero or out-of-range pixels never make a valid tile old-only.
+The default regular tile (C) has three 512-byte inputs in private argument
+order: packed uint16 depth, normalized int16 enable, and uint16 old. For each
+valid slot `s`, the host copies `src[wide_offset[s]]` into `packed[s]`.
+Invalid slots and tail padding are zero initialized. The compiled device reads
+all 256 slots in order and chooses the updated value only when enabled.
+The old-only tile reads old and writes all 256 mask slots. Classification uses
+the immutable geometry and enable snapshot, so zero or out-of-range pixels in a
+valid tile still dispatch the regular kernel.
+
+| `--canvas-variant` | Regular packed depth addressing | Mask calculation |
+| --- | --- | --- |
+| A | Explicit local int16 index with bounds and safe-address selection | Test merged canvas |
+| B | Same indexed ABI as A | Form mask from range and old nonzero |
+| C (default) | Sequential same-slot input | Test merged canvas |
+| D | Sequential same-slot input | Form mask from range and old nonzero |
+
+The original six-buffer public API applies to every variant. The checked
+compiler binds the private layout, value logic, selected kernel, positive
+range, mapping settings and both kernel identities before publishing the
+generated module. The internal lowering pass accepts an explicit
+`canvas-variant` and retains indexed A as its direct-pass default.
 The unsigned depth range uses a proven 16-bit bias and signed comparisons.
 The final nonzero select uses its proven-zero value as the false operand, so
 only one literal is needed. The driver rejects multiple immediate inputs and
@@ -64,6 +86,11 @@ module identity. Original coordinate arrays may change after plan creation;
 execution uses owned snapshots. Source and old are fresh borrowed read-only
 inputs, and callers must not mutate their aliases until completion.
 
+The same-slot plan stores active positions as uint16 offsets within each window
+and validated original-image offsets as uint32. Each window gathers from the
+current source frame once and refreshes old values for every tile. Original-image
+address calculation uses 64-bit arithmetic before conversion.
+
 One serial device call completes each logical tile, including wholly inactive
 ones. A bounded window (32 tiles by default) holds packed buffers; there is no
 host-sized intermediate canvas. Only valid tail elements are copied back.
@@ -75,13 +102,14 @@ scratch buffers for runtime/process teardown; `close()` cannot release them.
 No automatic cancellation recovery or general buffer ownership is claimed.
 
 Optional `--kernel-cache` entries have a separate canvas namespace and include
-role, geometry, range, proof, tools, hardware, compiler/support and mapping
-options. Both kernels and their inventories must validate; missing, changed or
+role, layout, value logic, geometry, range, proof, tools, hardware,
+compiler/support and mapping options. Both kernels and their inventories must validate; missing, changed or
 mixed components are rejected. Publishing the public module happens only after
 both mappings and final provenance are complete, without overwriting an existing
 output. Shared runtime, ADG/operations and VITRA are unchanged.
 
 Software tests under `test/adoracc/canvas_mask/` cover typed proof boundaries,
 operand preservation, publication, cache identity, owned plans and failure
-lifetimes. Fake transport tests establish host protocol only; hardware claims
-require the separate R014 original-RTL transaction and readback evidence.
+lifetimes. The graph tests exercise interval boundaries, high-bit old values and a
+permutation of private slots whose explicit indices undo the swap. The optional
+`canvas-mask` RTL launcher executes generated calls and checks device readback.

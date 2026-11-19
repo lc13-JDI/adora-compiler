@@ -86,7 +86,8 @@ LogicalResult LowerCEntryPass::lowerCanvas(func::FuncOp function,
     if (isa<arith::ConstantOp>(op)) return constant(value).has_value();
     if (!isa<arith::ExtUIOp,arith::ExtSIOp,arith::TruncIOp,arith::CmpIOp,arith::SelectOp>(op)) return false;
     if (auto cmp = dyn_cast<arith::CmpIOp>(op))
-      if (cmp.getPredicate() != arith::CmpIPredicate::eq && cmp.getPredicate() != arith::CmpIPredicate::ne) return false;
+      if (cmp.getPredicate() != arith::CmpIPredicate::eq && cmp.getPredicate() != arith::CmpIPredicate::ne &&
+          cmp.getPredicate() != arith::CmpIPredicate::sgt) return false;
     return llvm::all_of(op->getOperands(), [&](Value operand) { return tree(operand); });
   };
   if (!tree(output.getValue())) return reject("mask consumer is not a supported typed nonzero selection");
@@ -107,8 +108,11 @@ LogicalResult LowerCEntryPass::lowerCanvas(func::FuncOp function,
     if (auto ext = dyn_cast<arith::ExtSIOp>(op)) return evaluate(ext.getIn(),code).sext(bits);
     if (auto trunc = dyn_cast<arith::TruncIOp>(op)) return evaluate(trunc.getIn(),code).trunc(bits);
     if (auto cmp = dyn_cast<arith::CmpIOp>(op)) {
-      bool equal = evaluate(cmp.getLhs(),code) == evaluate(cmp.getRhs(),code);
-      return llvm::APInt(1,cmp.getPredicate() == arith::CmpIPredicate::eq ? equal : !equal);
+      auto lhs = evaluate(cmp.getLhs(),code);
+      auto rhs = evaluate(cmp.getRhs(),code);
+      if (cmp.getPredicate() == arith::CmpIPredicate::sgt)
+        return llvm::APInt(1,lhs.sgt(rhs));
+      return llvm::APInt(1,cmp.getPredicate() == arith::CmpIPredicate::eq ? lhs == rhs : lhs != rhs);
     }
     auto select = cast<arith::SelectOp>(op);
     return evaluate(evaluate(select.getCondition(),code).isZero() ? select.getFalseValue() : select.getTrueValue(),code);
@@ -203,7 +207,10 @@ LogicalResult LowerCEntryPass::emitCanvas(func::FuncOp function, int64_t rangeLo
   auto type = MemRefType::get({256},b.getI16Type());
   auto build = [&](bool regular) -> LogicalResult {
     b.setInsertionPoint(function);
-    SmallVector<Type> types(regular ? 5 : 2,type);
+    const bool stream = regular && (canvasVariant == "C" || canvasVariant == "D");
+    const bool predicate = regular && (canvasVariant == "B" || canvasVariant == "D");
+    const unsigned arity = regular ? (stream ? 4 : 5) : 2;
+    SmallVector<Type> types(arity,type);
     auto tile = b.create<func::FuncOp>(loc,regular ? "_adora_canvas_regular_tile" : "_adora_canvas_old_tile",b.getFunctionType(types,{}));
     auto *body = tile.addEntryBlock(); b.setInsertionPointToStart(body);
     auto zero = b.create<arith::ConstantIntOp>(loc,0,16);
@@ -211,21 +218,51 @@ LogicalResult LowerCEntryPass::emitCanvas(func::FuncOp function, int64_t rangeLo
     auto loop = b.create<affine::AffineForOp>(loc,0,256);
     b.setInsertionPoint(loop.getBody()->getTerminator());
     auto iv = loop.getInductionVar();
-    auto old = b.create<memref::LoadOp>(loc,tile.getArgument(regular ? 3 : 0),ValueRange{iv});
-    Value canvas = old;
+    auto old = b.create<memref::LoadOp>(loc,tile.getArgument(arity-2),ValueRange{iv});
+    auto select = [&](Value cond, Value yes, Value no) -> Value {
+      auto op = b.create<scf::IfOp>(loc,TypeRange{b.getI16Type()},cond,true);
+      b.setInsertionPointToStart(&op.getThenRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{yes});
+      b.setInsertionPointToStart(&op.getElseRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{no});
+      b.setInsertionPointAfter(op);
+      return op.getResult(0);
+    };
+    auto nonzeroMask = [&](Value value) -> Value {
+      auto negative = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,value,zero);
+      auto positive = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,zero,value);
+      auto nonzero = b.create<arith::OrIOp>(loc,negative,positive);
+      // The false operand is known to be zero. Use the routed input so
+      // the hardware SELECT only needs one immediate.
+      return select(nonzero,white,value);
+    };
+    Value result = old;
     if (regular) {
-      auto idx = b.create<memref::LoadOp>(loc,tile.getArgument(1),ValueRange{iv});
-      auto en = b.create<memref::LoadOp>(loc,tile.getArgument(2),ValueRange{iv});
-      auto limit = b.create<arith::ConstantIntOp>(loc,256,16);
-      auto active = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ne,en,zero);
-      auto lo = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sge,idx,zero);
-      auto hi = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,idx,limit);
-      auto bound = b.create<arith::AndIOp>(loc,lo,hi);
-      auto guard = b.create<arith::AndIOp>(loc,active,bound);
-      auto branch = b.create<scf::IfOp>(loc,TypeRange{b.getI16Type()},guard,true);
-      b.setInsertionPointToStart(&branch.getThenRegion().front());
-      auto address = b.create<arith::IndexCastOp>(loc,b.getIndexType(),idx);
-      auto pixel = b.create<memref::LoadOp>(loc,tile.getArgument(0),ValueRange{address});
+      Value idx, pixel, guard;
+      if (!stream) idx = b.create<memref::LoadOp>(loc,tile.getArgument(1),ValueRange{iv});
+      auto en = b.create<memref::LoadOp>(loc,tile.getArgument(arity-3),ValueRange{iv});
+      if (stream) {
+        // Private enabled is normalized to 0/1 after the original signed
+        // geometry and nonzero-enable checks. Every packed slot is initialized.
+        guard = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,zero,en);
+        pixel = b.create<memref::LoadOp>(loc,tile.getArgument(0),ValueRange{iv});
+      } else {
+        auto limit = b.create<arith::ConstantIntOp>(loc,256,16);
+        auto active = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ne,en,zero);
+        auto lo = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sge,idx,zero);
+        auto hi = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,idx,limit);
+        auto bound = b.create<arith::AndIOp>(loc,lo,hi);
+        guard = b.create<arith::AndIOp>(loc,active,bound);
+      }
+      // A false direct-mask predicate implies zero when enabled and old=0
+      // otherwise. This routed fallback avoids two immediate SELECT operands.
+      Value fallback;
+      if (predicate) fallback = select(guard,zero,nonzeroMask(old));
+      scf::IfOp branch;
+      if (!stream) {
+        branch = b.create<scf::IfOp>(loc,TypeRange{b.getI16Type()},guard,true);
+        b.setInsertionPointToStart(&branch.getThenRegion().front());
+        auto address = b.create<arith::IndexCastOp>(loc,b.getIndexType(),idx);
+        pixel = b.create<memref::LoadOp>(loc,tile.getArgument(0),ValueRange{address});
+      }
       auto bias = b.create<arith::ConstantIntOp>(loc,-32768,16);
       auto biased = b.create<arith::AddIOp>(loc,pixel,bias);
       auto low = b.create<arith::ConstantIntOp>(loc,rangeLo-32768,16);
@@ -233,31 +270,28 @@ LogicalResult LowerCEntryPass::emitCanvas(func::FuncOp function, int64_t rangeLo
       auto above = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sge,biased,low);
       auto below = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sle,biased,high);
       auto inside = b.create<arith::AndIOp>(loc,above,below);
-      auto selection = b.create<scf::IfOp>(loc,TypeRange{b.getI16Type()},inside,true);
-      b.setInsertionPointToStart(&selection.getThenRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{pixel});
-      b.setInsertionPointToStart(&selection.getElseRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{zero});
-      b.setInsertionPointAfter(selection); b.create<scf::YieldOp>(loc,selection.getResults());
-      b.setInsertionPointToStart(&branch.getElseRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{old});
-      b.setInsertionPointAfter(branch); canvas = branch.getResult(0);
+      if (stream && predicate) {
+        auto hit = b.create<arith::AndIOp>(loc,guard,inside);
+        result = select(hit,white,fallback);
+      } else {
+        result = predicate ? select(inside,white,fallback) : select(inside,pixel,zero);
+        Value otherwise = predicate ? fallback : Value(old);
+        if (stream) result = select(guard,result,otherwise);
+        else {
+          b.create<scf::YieldOp>(loc,ValueRange{result});
+          b.setInsertionPointToStart(&branch.getElseRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{otherwise});
+          b.setInsertionPointAfter(branch);
+          result = branch.getResult(0);
+        }
+      }
     }
-    // NE is not an operation on the supported device. Unlike a guarded LOAD,
-    // a pure old-only consumer need not pass through predicate legalization.
-    // Signed less-than in both directions covers every nonzero 16-bit value,
-    // including old labels with the high bit set.
-    auto negative = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,canvas,zero);
-    auto positive = b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,zero,canvas);
-    auto nonzero = b.create<arith::OrIOp>(loc,negative,positive);
-    auto mask = b.create<scf::IfOp>(loc,TypeRange{b.getI16Type()},nonzero,true);
-    b.setInsertionPointToStart(&mask.getThenRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{white});
-    // The false operand is proven zero by the predicate. Keeping the value
-    // avoids a two-immediate SELECT on hardware with one immediate register.
-    b.setInsertionPointToStart(&mask.getElseRegion().front()); b.create<scf::YieldOp>(loc,ValueRange{canvas});
-    b.setInsertionPointAfter(mask);
-    b.create<memref::StoreOp>(loc,mask.getResult(0),tile.getArgument(regular ? 4 : 1),ValueRange{iv});
+    if (!predicate) result = nonzeroMask(result);
+    b.create<memref::StoreOp>(loc,result,tile.getArgument(arity-1),ValueRange{iv});
     b.setInsertionPointToEnd(body); b.create<func::ReturnOp>(loc);
     SmallVector<Object> local;
     if (regular) local = {{256,"uint16",false},{256,"int16",false},{256,"int16",false},{256,"uint16",false},{256,"uint16",true}};
     else local = {{256,"uint16",false},{256,"uint16",true}};
+    if (stream) local.erase(local.begin()+1);
     return lower(tile,local,true);
   };
   if (canvasKernel != "old-only" && failed(build(true))) return failure();

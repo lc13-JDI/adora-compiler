@@ -19,7 +19,7 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("cstore", "intvecadd")
-CASES = {"short-tail": "cstore", "ownership": "cstore",
+CASES = {"short-tail": "cstore", "ownership": "cstore", "canvas-mask": "cstore",
          "vector-add": "intvecadd", "tcp-client": "intvecadd", "tcp-server": "intvecadd"}
 VERILATOR_FLAGS = ["--cc", "--exe", "--threads", "1", "--timescale", "1ns/1ns",
                    "--vpi", "--public-flat-rw", "--prefix", "Vtop", "-o", "Vtop",
@@ -71,7 +71,7 @@ def command_version(exe):
     return subprocess.check_output([exe, "--version"], text=True).splitlines()[0]
 
 
-def build_model(spec, paths, cache, jobs):
+def build_model(spec, paths, cache, jobs, optimize=False):
     import cocotb.config
     if not cocotb.__version__.startswith("1.9."):
         raise ValueError(f"cocotb 1.9.x required, found {cocotb.__version__}")
@@ -81,15 +81,25 @@ def build_model(spec, paths, cache, jobs):
     verilator, make, cxx, ar = (which(name) for name in ("verilator", "make", os.environ.get("CXX", "c++"), "ar"))
     ldflags = f"-Wl,-rpath,{libs} -L{libs} -lcocotbvpi_verilator"
     vflags = [*VERILATOR_FLAGS, "--top-module", spec["top"], "-LDFLAGS", ldflags]
+    visibility = None
+    if optimize and spec["target"] == "cstore":
+        # Expose the unchanged wrapper ports and the read-only regression probes.
+        # Marking every datapath wire writable prevents Verilator optimizations.
+        visibility = ROOT / "test/rtl/canvas/observe.vlt"
+        vflags.remove("--public-flat-rw")
+        vflags.append(str(visibility))
     vflags += [f"-G{k}={v}" for k, v in spec["parameters"].items()]
-    mflags = [*MAKE_FLAGS, f"CXX={cxx}", f"LINK={cxx}", f"AR={ar}"]
-    env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LD_LIBRARY_PATH",
+    optimization = ["OPT_FAST=-O2", "OPT_SLOW=-O0", "OPT_GLOBAL=-O2"] if optimize else MAKE_FLAGS
+    mflags = [*optimization, f"CXX={cxx}", f"LINK={cxx}", f"AR={ar}"]
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LD_LIBRARY_PATH", "CCACHE_DIR",
                                         "SYSTEMROOT") if k in os.environ}
     identity = {"format": 1, "spec": spec, "verilator_flags": vflags, "make_flags": mflags,
                 "tools": {p: command_version(p) for p in (verilator, make, cxx, ar)},
                 "machine": platform.machine(), "python": sys.executable,
                 "cocotb": cocotb.__version__, "driver_sha256": sha256(driver),
                 "plugin_sha256": sha256(plugin)}
+    if visibility:
+        identity["vpi_visibility_sha256"] = sha256(visibility)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
     destination = cache / key
@@ -163,7 +173,12 @@ def run(args, target, paths, binary, receipt, hit, case_env=None):
     vector = target == "intvecadd"
     bench = ROOT / "test/rtl" / ("vector" if vector else "tail")
     module = "vector_bench" if vector else "tail_bench"
-    if case_env is None and vector:
+    if args.case == "canvas-mask":
+        bench = ROOT / "test/rtl/canvas"
+        module = "canvas_bench"
+        sys.path.insert(0, str(bench))
+        case_env = importlib.import_module("canvas_prepare").prepare(paths, work, args)
+    elif case_env is None and vector:
         case_env = {"TESTCASE": args.case.replace("-", "_")}
     elif case_env is None:
         sys.path.insert(0, str(bench))
@@ -202,6 +217,13 @@ def run(args, target, paths, binary, receipt, hit, case_env=None):
     if (sorted(executed) != sorted(env["TESTCASE"].split(",")) or
             any(any(child.tag in ("skipped", "failure", "error") for child in tc) for tc in cases)):
         raise ValueError(f"incomplete or failed RTL tests {executed}, see {xml} and {log.name}")
+    if args.case == "canvas-mask":
+        decoder = [sys.executable, "-B", str(bench / "decode_wires.py"), "--run", str(work),
+                   "--tamper-test"]
+        if args.canvas_frames:
+            decoder += ["--frames", str(args.canvas_frames)]
+        with (work / "decoded.json").open("w") as decoded:
+            subprocess.run(decoder, check=True, stdout=decoded)
     print(f"PASS {args.case}: {', '.join(executed)}")
 
 
@@ -222,6 +244,9 @@ def main():
             dest.add_argument("--output-root", type=absolute, help="parent of a unique run directory")
             cmd.add_argument("--build-dir", type=absolute, default=ROOT / "build")
             cmd.add_argument("--cgeist", type=absolute)
+            cmd.add_argument("--canvas-variant", choices=("A", "B", "C", "D"))
+            cmd.add_argument("--canvas-mapped", type=absolute, help="checked canvas module from an existing compile")
+            cmd.add_argument("--canvas-frames", type=absolute, help="NPZ inputs and independent expected masks")
             cmd.add_argument("--port", type=int, default=0)
         else:
             cmd.add_argument("--target", choices=TARGETS, required=True)
@@ -231,6 +256,7 @@ def main():
         if name in ("build", "run"):
             cmd.add_argument("--cache", type=absolute, default=ROOT / "build/rtl-models")
             cmd.add_argument("--jobs", type=int, default=2)
+            cmd.add_argument("--optimize", action="store_true", help="optimize hot RTL model code for long runs")
     args = parser.parse_args()
     target = CASES[args.case] if args.command == "run" else args.target
     if args.command == "import":
@@ -242,7 +268,7 @@ def main():
         return
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
-    binary, receipt, hit = build_model(spec, paths, args.cache, args.jobs)
+    binary, receipt, hit = build_model(spec, paths, args.cache, args.jobs, args.optimize)
     if args.command == "run":
         run(args, target, paths, binary, receipt, hit)
     else:

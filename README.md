@@ -114,7 +114,7 @@ If you only need to run small existing models in experiments, or only use C kern
 You can download and install the CGRA from the appropriate repository:  
 [CGRA Repository](https://github.com/MIONkb/VITRA-CGRA)
 
-A lightweight Python API (cocotb) will be released soon.
+The optional RTL launcher runs generated Python calls against the pinned CSTORE target. See [Optional full RTL simulation](#optional-full-rtl-simulation).
 
 ### 5 Other dependencies you may need
 
@@ -198,13 +198,24 @@ rtl=(python -B "$ROOT/build_tools/rtl_sim.py")
 "${rtl[@]}" verify --target cstore --assets "$RTL_ASSETS"
 "${rtl[@]}" run --case short-tail --assets "$RTL_ASSETS" --cache "$RTL_WORK/models" \
   --output "$RTL_WORK/tail" --build-dir "$BUILD" --cgeist "$CGEIST"
+"${rtl[@]}" run --case canvas-mask --assets "$RTL_ASSETS" --cache "$RTL_WORK/models" \
+  --output "$RTL_WORK/canvas" --build-dir "$BUILD" --cgeist "$CGEIST"
+python -B "$ROOT/test/rtl/canvas/decode_wires.py" --run "$RTL_WORK/canvas" --tamper-test
 for case_name in vector-add tcp-client; do
   "${rtl[@]}" run --case "$case_name" --assets "$RTL_ASSETS" \
     --cache "$RTL_WORK/models" --output "$RTL_WORK/$case_name"
 done
 ```
 
-To run those three cases through CMake with artifacts under
+The canvas case starts from the ordinary two-loop C fixture, maps both the
+regular and old-only kernels and runs 353-slot frames on the CSTORE model.
+The decoder reads the captured bus handshakes and checks the returned values
+and transfer counts. For long canvas runs, `--optimize` builds a distinct model
+with optimized hot code and the required VPI probes. Use the tested Verilator
+5.044 on PATH when building it. For the layout proof, A/B/C/D switches and reusable Python
+plan, see [Checked private canvas-to-mask C entry](docs/development/guarded-canvas-mask.md).
+
+To run those four cases through CMake with artifacts under
 `$BUILD/rtl-results/`, enable the optional target in the configured build.
 
 ```bash

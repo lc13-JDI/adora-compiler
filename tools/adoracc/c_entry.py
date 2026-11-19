@@ -356,7 +356,8 @@ def normalize_unsigned_promotions(ast: dict, text: str) -> tuple[str, list]:
         target = node.get('type', {})
         child = node['inner'][0]
         source = child.get('type', {})
-        if (target.get('desugaredQualType', target.get('qualType')) != 'int' or
+        target_type = target.get('desugaredQualType', target.get('qualType'))
+        if (target_type not in ('int', 'unsigned int') or
                 source.get('desugaredQualType', source.get('qualType')) != 'unsigned short' or
                 source.get('qualType') == 'unsigned short'):
             continue
@@ -368,7 +369,7 @@ def normalize_unsigned_promotions(ast: dict, text: str) -> tuple[str, list]:
         if not 0 <= first < last <= len(raw):
             raise ValueError('unsigned C promotion AST range is outside the preprocessed input')
         edits[first, last] = dict(begin=first, end=last, from_type=source['qualType'],
-                                  to_type='int', value_type='unsigned short')
+                                  to_type=target_type, value_type='unsigned short')
     ordered = [edits[key] for key in sorted(edits)]
     if any(left['end'] > right['begin'] for left, right in zip(ordered, ordered[1:])):
         raise ValueError('overlapping unsigned C promotions are unsupported')

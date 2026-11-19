@@ -321,6 +321,10 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
     for (const char *key : {"source_argument", "destination_argument", "x_argument", "y_argument", "enable_argument"})
       proof[key] = int64_t(canvas->originalPositions[*proof.getInteger(key)]);
     proof["schema"] = "adora.guarded-canvas-mask.v1";
+    proof["canvas_variant"] = canvasVariant.getValue();
+    proof["selected_kernel"] = canvasKernel.getValue();
+    proof["packing_layout"] = (canvasVariant == "C" || canvasVariant == "D") ? "same-slot" : "indexed";
+    proof["value_logic"] = (canvasVariant == "B" || canvasVariant == "D") ? "predicate" : "canvas";
     proof["old_argument"] = int64_t(canvas->oldArgument);
     proof["regular_entry"] = "_adora_canvas_regular_tile";
     proof["old_only_entry"] = "_adora_canvas_old_tile";

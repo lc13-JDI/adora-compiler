@@ -22,8 +22,10 @@ SCHEMA = 'adora.guarded-canvas-mask.v1'
 ENTRIES = {'regular': '_adora_canvas_regular_tile', 'old-only': '_adora_canvas_old_tile'}
 
 
-def local_contract(role):
+def local_contract(role, variant="A"):
     types = ('uint16', 'int16', 'int16', 'uint16', 'uint16') if role == 'regular' else ('uint16', 'uint16')
+    if role == "regular" and variant in ("C", "D"):
+        types = ("uint16", "int16", "uint16", "uint16")
     return dict(entry=ENTRIES[role], objects=[dict(argument_position=i, elements=256,
                 host_dtype=dtype, access_assertion='write' if i == len(types)-1 else 'read',
                 contiguous=True) for i, dtype in enumerate(types)])
@@ -118,6 +120,11 @@ def verify_cache(directory, manifest, key):
 def validate_proof(proof):
     if not isinstance(proof, dict) or proof.get('schema') != SCHEMA:
         raise ValueError('canvas entry: incompatible compiler proof')
+    variant = proof.get('canvas_variant')
+    if (variant not in ('A', 'B', 'C', 'D') or
+            proof.get('packing_layout') != ('same-slot' if variant in ('C', 'D') else 'indexed') or
+            proof.get('value_logic') != ('predicate' if variant in ('B', 'D') else 'canvas')):
+        raise ValueError('canvas entry: inconsistent private kernel variant proof')
     if (proof.get('regular_entry') != ENTRIES['regular'] or proof.get('old_only_entry') != ENTRIES['old-only'] or
             type(proof.get('range_lo')) is not int or type(proof.get('range_hi')) is not int or
             not 0 < proof['range_lo'] <= proof['range_hi'] <= 65535):
@@ -141,7 +148,7 @@ def checked_module(sources, descriptor):
         raise ValueError('canvas entry name conflicts with checked public API')
     checked, private = {}, {}
     for role in ENTRIES:
-        checked[role], private[role] = common.checked_module(sources[role], local_contract(role))
+        checked[role], private[role] = common.checked_module(sources[role], local_contract(role, descriptor['canvas_variant']))
     support = Path(__file__).with_name('prepared_canvas.py').read_text()
     generated = f'''# Compiler-proved private two-loop canvas elimination; no host canvas.
 def _adora_create_canvas_entry():
@@ -190,7 +197,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs):
         raise ValueError('checked canvas output must be a new .py file')
     contract = common.validate_contract(json.loads(args.contract.read_text()), allow_canvas=True)
     adg, ops = json.loads(args.adg_path.read_text()), json.loads(args.op_file.read_text())
-    bank = common.validate_hardware(adg, ops, local_contract('regular'))
+    bank = common.validate_hardware(adg, ops, local_contract('regular', args.canvas_variant))
     root = args.work_dir.resolve()/'adora-c-entry'
     root.mkdir(parents=True, exist_ok=False)
     frontend = root/'frontend'; frontend.mkdir()
@@ -247,11 +254,13 @@ def run_profile(args, require_tool, require_local, strip_module_attrs):
         sources={};common_proof=None
         for role in ENTRIES:
             directory=root/role;directory.mkdir();maps=directory/'map';maps.mkdir();graphs=directory/'dfg';graphs.mkdir()
-            local=local_contract(role);(directory/'local-contract.json').write_text(json.dumps(local,indent=2)+'\n')
+            local=local_contract(role, args.canvas_variant);(directory/'local-contract.json').write_text(json.dumps(local,indent=2)+'\n')
             proof_path=directory/'host-proof.json';ir=directory/'bridged.mlir'
-            run([tools['cgra-opt'],bridge,f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank} large-objects=true canvas-mask=true canvas-kernel={role} descriptor={proof_path}',
+            run([tools['cgra-opt'],bridge,f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank} large-objects=true canvas-mask=true canvas-kernel={role} canvas-variant={args.canvas_variant} descriptor={proof_path}',
                  '--verify-each','-o',ir],role+'-proof')
             proof=json.loads(proof_path.read_text());validate_proof(proof);common.validate_large_source_address(source_ast,proof)
+            if proof['canvas_variant'] != args.canvas_variant or proof.get('selected_kernel') != role:
+                raise ValueError('canvas entry: mismatched lowering variant or role')
             semantic={k:v for k,v in proof.items() if k not in ('selected_kernel',)}
             if common_proof is not None and semantic!=common_proof:
                 raise ValueError('canvas kernels have inconsistent source proofs')
@@ -265,7 +274,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs):
                  json.dumps(proof,sort_keys=True).encode()+json.dumps(provenance['tools'],sort_keys=True).encode()+
                  json.dumps(provenance['production_python'],sort_keys=True).encode()+normalized.read_bytes()+
                  (root/'adg.json').read_bytes()+(root/'operations.json').read_bytes()+(root/'GeneralOpName.txt').read_bytes()+
-                 repr((args.seed,args.max_iters,args.timeout)).encode()).hexdigest()
+                 repr((args.seed,args.max_iters,args.timeout,args.mapper_wall_timeout)).encode()).hexdigest()
             cache=args.kernel_cache.resolve()/('canvas-v1-'+key) if args.kernel_cache else None
             hit=False
             if cache is not None and (cache==root or root in cache.parents):raise ValueError('canvas cache must be outside compilation artifacts')
@@ -287,7 +296,8 @@ def run_profile(args, require_tool, require_local, strip_module_attrs):
             sources[role]=unchecked.read_text()
             provenance['kernels'][role]=dict(entry=ENTRIES[role],map_directory=str(mapdirs[0].relative_to(root)),cache_key=key,cache_hit=hit)
             if cache is not None and not hit:pending_caches.append((cache,maps,key))
-        proof=common_proof;proof['support_version']=1
+        proof=common_proof;proof['support_version']=2
+        proof['kernel_keys'] = {role: record['cache_key'] for role, record in provenance['kernels'].items()}
         proof['module_identity']=hashlib.sha256(frontend.joinpath('input.c').read_bytes()+normalized.read_bytes()+
             json.dumps(proof,sort_keys=True).encode()+json.dumps(sources,sort_keys=True).encode()+
             json.dumps(provenance['tools'],sort_keys=True).encode()+json.dumps(provenance['production_python'],sort_keys=True).encode()).hexdigest()

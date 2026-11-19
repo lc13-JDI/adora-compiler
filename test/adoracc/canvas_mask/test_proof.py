@@ -6,19 +6,21 @@ import subprocess
 import sys
 import tempfile
 
+from test_variant_graph import check_regular_graph
+
 opt = str(Path(shutil.which(sys.argv[1]) or sys.argv[1]).resolve())
 here = Path(__file__).resolve().parent
 source = (here / 'two_loops.mlir').read_text()
 contract = json.loads((here / 'contract.json').read_text())
 with tempfile.TemporaryDirectory(prefix='adora-canvas-proof-') as temporary:
     work = Path(temporary)
-    def run(text, accept=True, c=None, role='both'):
+    def run(text, accept=True, c=None, role='both', variant='A'):
         (work/'in.mlir').write_text(text)
         (work/'contract.json').write_text(json.dumps(c or contract))
         proof = work/'proof.json'
         proof.unlink(missing_ok=True)
         p = subprocess.run([opt, str(work/'in.mlir'),
-            f'--adora-lower-c-entry=contract={work}/contract.json large-objects=true canvas-mask=true canvas-kernel={role} descriptor={proof}',
+            f'--adora-lower-c-entry=contract={work}/contract.json large-objects=true canvas-mask=true canvas-kernel={role} canvas-variant={variant} descriptor={proof}',
             '--verify-each', '-o', str(work/'out.mlir')], capture_output=True, text=True)
         assert p.returncode == (0 if accept else 1), p.stderr
         if not accept:
@@ -33,7 +35,18 @@ with tempfile.TemporaryDirectory(prefix='adora-canvas-proof-') as temporary:
             assert ('@_adora_canvas_regular_tile' in output) == (role != 'old-only')
             assert ('@_adora_canvas_old_tile' in output) == (role != 'regular')
         return p
+    for variant in 'ABCD':
+        for lo, hi in [(5000, 10000), (32768, 60000)]:
+            fixture = source.replace('5000 : i32', f'{lo} : i32').replace('10000 : i32', f'{hi} : i32')
+            run(fixture, role='regular', variant=variant)
+            lowered = subprocess.run([opt, str(work/'out.mlir'), '--adora-kernel-dfg-gen',
+                '--verify-each', '-o', str(work/'dfg.mlir')], cwd=work, capture_output=True, text=True)
+            assert lowered.returncode == 0, lowered.stderr
+            check_regular_graph((work/'_adora_canvas_regular_tile_CDFG.dot').read_text(), variant, lo, hi)
     run(source)
+    positive = source.replace('arith.cmpi ne, %1, %c0_i32', 'arith.cmpi sgt, %1, %c0_i32')
+    run(positive)
+    run(positive.replace('arith.extui %0 : i16', 'arith.extsi %0 : i16'), accept=False)
     run(source.replace('arith.constant 5000 : i32', 'arith.constant 32768 : i32').replace('arith.constant 10000 : i32', 'arith.constant 60000 : i32'))
     run((here / 'ssa_equivalent.mlir.in').read_text())
     for role in ['regular', 'old-only']:

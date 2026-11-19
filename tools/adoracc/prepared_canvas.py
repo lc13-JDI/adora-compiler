@@ -13,7 +13,7 @@ import types
 
 import numpy as np
 
-SUPPORT_VERSION = 1
+SUPPORT_VERSION = 2
 SCHEMA = 'adora.guarded-canvas-mask.v1'
 MAX_ELEMENTS = 16 * 1024 * 1024
 MAX_PLAN_BYTES = 768 * 1024 * 1024
@@ -56,6 +56,11 @@ def _validate_descriptor(value):
             raise ValueError(f'canvas entry: invalid {key} identity')
     if result['regular_entry'] == result['old_only_entry']:
         raise ValueError('canvas entry: kernel roles must be distinct')
+    variant = result.get('canvas_variant')
+    if (variant not in ('A', 'B', 'C', 'D') or
+            result.get('packing_layout') != ('same-slot' if variant in ('C', 'D') else 'indexed') or
+            result.get('value_logic') != ('predicate' if variant in ('B', 'D') else 'canvas')):
+        raise ValueError('canvas entry: incompatible private kernel variant')
     if result.get('ownership') != 'copy':
         raise ValueError('canvas entry: map ownership must be copy')
     for key in ('width', 'height', 'items', 'source_elements'):
@@ -98,8 +103,8 @@ def _immutable(array):
 
 
 class _CanvasPlan:
-    __slots__ = ('_identity', '_descriptor', '_normal', '_old_only', '_snapshots',
-                 '_offsets', '_active', '_scratch', '_ranges', '_capacity', '_probes',
+    __slots__ = ('_index', '_identity', '_descriptor', '_normal', '_old_only', '_snapshots',
+                 '_offsets', '_windows', '_active', '_scratch', '_ranges', '_capacity', '_probes',
                  '_cursor', '_closed', '_busy', '_poisoned', '_retained', '_stats',
                  '_last_report', '_completed_ranges')
 
@@ -128,20 +133,39 @@ class _CanvasPlan:
         # Widen only after coordinate bounds are proved. A global address is
         # never narrowed into the device's signed 16-bit local index domain.
         offsets[valid] = y[valid].astype(np.int64) * descriptor['width'] + x[valid].astype(np.int64)
-        self._offsets = _immutable(offsets)
         self._ranges = tuple((begin, min(begin + _TILE, items)) for begin in range(0, items, _TILE))
         self._active = _immutable(np.array([np.any(valid[begin:end]) for begin, end in self._ranges], np.bool_))
         self._capacity = min(window_tiles, tiles)
-        self._scratch = tuple(np.zeros((self._capacity, _TILE), dtype) for dtype in
-                              (np.uint16, np.int16, np.int16, np.uint16, np.uint16))
+        shape = (self._capacity, _TILE)
+        self._index = np.empty(shape, np.int16) if descriptor['packing_layout'] == 'indexed' else None
+        self._windows = None
+        self._offsets = None
+        if self._index is None:
+            # A window contains at most 65,536 slots, and source_elements is
+            # bounded by MAX_ELEMENTS (2**24). Both casts are lossless after
+            # computing validated source offsets in int64.
+            window_items = self._capacity * _TILE
+            windows = []
+            for first in range(0, items, window_items):
+                section = slice(first, first + window_items)
+                slots = np.flatnonzero(valid[section])
+                windows.append((_immutable(slots.astype(np.uint16)),
+                                _immutable(offsets[section][slots].astype(np.uint32))))
+            self._windows = tuple(windows)
+            geometry_bytes = sum(a.nbytes for pair in windows for a in pair)
+        else:
+            self._offsets = _immutable(offsets)
+            geometry_bytes = self._offsets.nbytes
+        self._scratch = tuple(np.zeros(shape, dtype) for dtype in
+                              (np.uint16, np.int16, np.uint16, np.uint16))
         self._probes = probes
         self._cursor = 0
         self._closed = self._busy = self._poisoned = False
         self._retained = self._last_report = None
         self._completed_ranges = ()
         regular = int(np.count_nonzero(self._active))
-        self._stats = dict(plan_bytes=sum(a.nbytes for a in self._snapshots) + self._offsets.nbytes + self._active.nbytes,
-                           scratch_bytes=sum(a.nbytes for a in self._scratch),
+        self._stats = dict(plan_bytes=sum(a.nbytes for a in self._snapshots) + geometry_bytes + self._active.nbytes,
+                           scratch_bytes=sum(a.nbytes for a in self._scratch) + (self._index.nbytes if self._index is not None else 0),
                            execution_scratch_bound_bytes=32 * self._capacity * _TILE,
                            regular_tiles=regular, old_only_tiles=tiles - regular,
                            logical_tiles=tiles, window_tiles=self._capacity, probes=probes,
@@ -187,35 +211,45 @@ class _CanvasPlan:
             return
         self._completed_ranges = self.completed_ranges
         self._closed = True
-        self._snapshots = self._offsets = self._active = self._scratch = None
+        self._snapshots = self._offsets = self._windows = self._active = self._scratch = self._index = None
         self._ranges = ()
 
     def _prepared_tiles(self, src, old, times):
-        packed, index, enabled, previous, output = self._scratch
+        packed, enabled, previous, output = self._scratch
         for first in range(0, len(self._ranges), self._capacity):
             if self._probes:
                 stamp = time.perf_counter_ns()
             ranges = self._ranges[first:first + self._capacity]
             packed.fill(0)
-            index.fill(-1)
+            if self._index is not None:
+                self._index.fill(-1)
             enabled.fill(0)
             previous.fill(0)
             # This initializes private output storage, never reads caller mask.
             output.fill(0)
-            for row, (begin, end) in enumerate(ranges):
-                previous[row, :end - begin] = old[begin:end]
-                if self._active[first + row]:
-                    slots = np.flatnonzero(self._offsets[begin:end] >= 0)
-                    index[row, slots] = slots
-                    enabled[row, slots] = 1
+            if self._windows is not None:
+                slots, offsets = self._windows[first // self._capacity]
+                begin, end = ranges[0][0], ranges[-1][1]
+                previous.ravel()[:end - begin] = old[begin:end]
+                enabled.ravel()[slots] = 1
+            else:
+                for row, (begin, end) in enumerate(ranges):
+                    previous[row, :end - begin] = old[begin:end]
+                    if self._active[first + row]:
+                        slots = np.flatnonzero(self._offsets[begin:end] >= 0)
+                        self._index[row, slots] = slots
+                        enabled[row, slots] = 1
             if self._probes:
                 times['prepare'] += time.perf_counter_ns() - stamp
                 stamp = time.perf_counter_ns()
             # Gathering depends only on the immutable G/address snapshot.
-            for row, (begin, end) in enumerate(ranges):
-                if self._active[first + row]:
-                    slots = np.flatnonzero(enabled[row])
-                    packed[row, slots] = src[self._offsets[begin:end][slots]]
+            if self._windows is not None:
+                packed.ravel()[slots] = src[offsets]
+            else:
+                for row, (begin, end) in enumerate(ranges):
+                    if self._active[first + row]:
+                        slots = np.flatnonzero(enabled[row])
+                        packed[row, slots] = src[self._offsets[begin:end][slots]]
             if self._probes:
                 times['pack'] += time.perf_counter_ns() - stamp
             for row, (begin, end) in enumerate(ranges):
@@ -242,7 +276,7 @@ class _CanvasPlan:
         self._cursor = 0
         self._last_report = None
         failed_range, in_flight = None, False
-        packed, index, enabled, previous, output = self._scratch
+        packed, enabled, previous, output = self._scratch
         try:
             for begin, end, regular, row in self._prepared_tiles(src, old, times):
                 failed_range = (begin, end)
@@ -252,7 +286,10 @@ class _CanvasPlan:
                 _INFLIGHT_PLANS.add(self)
                 in_flight = True
                 if regular:
-                    await self._normal(runtime, packed[row], index[row], enabled[row], previous[row], output[row])
+                    if self._index is None:
+                        await self._normal(runtime, packed[row], enabled[row], previous[row], output[row])
+                    else:
+                        await self._normal(runtime, packed[row], self._index[row], enabled[row], previous[row], output[row])
                 else:
                     await self._old_only(runtime, previous[row], output[row])
                 in_flight = False

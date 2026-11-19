@@ -14,6 +14,7 @@ endif()
 set(rtl_runner "${ADORA_RTL_PYTHON}" -I "${PROJECT_SOURCE_DIR}/build_tools/rtl_sim.py" run)
 add_custom_target(check-adora-rtl
   COMMAND ${rtl_runner} --case short-tail ${rtl_args}
+  COMMAND ${rtl_runner} --case canvas-mask ${rtl_args}
   COMMAND ${rtl_runner} --case vector-add ${rtl_args}
   COMMAND ${rtl_runner} --case tcp-client ${rtl_args}
   DEPENDS cgra-opt cgra-mapper

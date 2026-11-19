@@ -3,11 +3,17 @@ from pathlib import Path
 import sys,tempfile,unittest
 sys.path.insert(0,str(Path(sys.argv.pop(1))/'tools/adoracc'))
 import c_entry
+import adoracc
+from unittest.mock import patch
 import canvas_entry as m
 
 class Driver(unittest.TestCase):
  def contract(self):
   return dict(entry='renamed',objects=[dict(argument_position=i,elements=256,host_dtype='int16' if i in (1,2,3) else 'uint16',access_assertion='write' if i==5 else 'read',contiguous=True) for i in range(6)],host_plan=dict(strategy='per-query',tile_items=256,bind_arguments=[1,2,3],ownership='copy'))
+ def test_canvas_cli_defaults_to_same_slot_with_indexed_fallback(self):
+  for extra, expected in (([], 'C'), (['--canvas-variant', 'A'], 'A')):
+   with patch.object(sys, 'argv', ['adoracc.py', 'input.c', '--profile', 'guarded-canvas-mask', *extra]):
+    self.assertEqual(adoracc.parse_args().canvas_variant, expected)
  def test_opt_in_six_objects(self):
   c=self.contract();self.assertEqual(len(c_entry.validate_contract(c,allow_canvas=True)['objects']),6)
   with self.assertRaises(ValueError):c_entry.validate_contract(c,allow_large=True)

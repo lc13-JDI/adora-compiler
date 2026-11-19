@@ -19,6 +19,10 @@ assert edits == [dict(begin=1,end=2,from_type='uint16_t',to_type='int',value_typ
 assert m.normalize_unsigned_promotions(ast('unsigned short'), '(v)') == ('(v)', [])
 assert m.normalize_unsigned_promotions(ast('int16_t','short'), '(v)') == ('(v)', [])
 assert m.normalize_unsigned_promotions(ast(kind='CStyleCastExpr'), '(v)')[0] == text
+wide = ast(kind='CStyleCastExpr')
+wide['type'] = {'qualType':'uint32_t', 'desugaredQualType':'unsigned int'}
+normalized, records = m.normalize_unsigned_promotions(wide, '(v)')
+assert normalized == text and records[0]['to_type'] == 'unsigned int'
 bad = ast(); bad['inner'][0]['range']['begin'] = {'spellingLoc':{'offset':1}}
 try:
     m.normalize_unsigned_promotions(bad, '(v)')

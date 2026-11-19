@@ -177,6 +177,8 @@ void LowerCEntryPass::runOnOperation() {
   for (auto other : module.getOps<func::FuncOp>())
     if (other != function) return reject("only the selected C entry is supported");
   if (canvasMask) {
+    if (canvasVariant != "A" && canvasVariant != "B" && canvasVariant != "C" && canvasVariant != "D")
+      return reject("unknown private canvas variant");
     if (!largeObjects || bankBytes < 512 || descriptor.empty() ||
         (canvasKernel != "both" && canvasKernel != "regular" && canvasKernel != "old-only"))
       return reject("canvas-mask requires large-objects, a 512-byte bank, descriptor and a valid canvas-kernel role");

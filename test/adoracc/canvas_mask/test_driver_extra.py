@@ -18,7 +18,8 @@ import canvas_entry as m
 
 
 def proof(entry='canvas'):
-    return dict(schema=m.SCHEMA, support_version=1, module_identity='a' * 64,
+    return dict(schema=m.SCHEMA, support_version=2,
+                canvas_variant='A', packing_layout='indexed', value_logic='canvas', module_identity='a' * 64,
                 entry=entry, width=16, height=16, source_elements=256, items=353,
                 tile_items=256, range_lo=5000, range_hi=10000, source_argument=0,
                 x_argument=1, y_argument=2, enable_argument=3, old_argument=4,
@@ -81,13 +82,25 @@ class Boundaries(unittest.TestCase):
     def test_incomplete_or_wrong_geometry_proof_rejected(self):
         for changes in (dict(ownership='borrow'), dict(tile_items=256.0),
                         dict(width=True), dict(height=17), dict(old_argument=5),
-                        dict(range_lo=0), dict(range_hi=65536), dict(entry=None)):
+                        dict(range_lo=0), dict(range_hi=65536), dict(entry=None),
+                        dict(canvas_variant='D'), dict(packing_layout='permuted'), dict(value_logic='predicate')):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 m.validate_proof(dict(proof(), **changes))
         missing = proof()
         del missing['ownership']
         with self.assertRaises(ValueError):
             m.validate_proof(missing)
+
+    def test_indexed_call_module_cannot_bind_to_same_slot_descriptor(self):
+        desc = dict(proof(), canvas_variant='C', packing_layout='same-slot')
+        with self.assertRaisesRegex(ValueError, 'ABI signature'):
+            m.checked_module(sources(), desc)
+
+    def test_private_argument_order_is_checked_before_binding(self):
+        kernels = sources()
+        kernels['regular'] = kernels['regular'].replace('arg_1, arg_2', 'arg_2, arg_1')
+        with self.assertRaisesRegex(ValueError, 'ABI signature'):
+            m.checked_module(kernels, proof())
 
     def test_cache_exact_inventory_hash_role_key_and_symlink_rejection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,7 +163,7 @@ class Publication(unittest.TestCase):
                                                           iob_mode_names={'1': 'SRAM_MODE'}))),
                     op_file=put('operations.json', json.dumps(dict(Operations=[dict(name='LOAD', numOperands=1, numRes=1)]))),
                     output=self.root / 'public.py', work_dir=self.root / 'work',
-                    enable_unroll=False, seed=7, max_iters=1, timeout=1,
+                    canvas_variant="A", enable_unroll=False, seed=7, max_iters=1, timeout=1,
                     mapper_wall_timeout=2, kernel_cache=None)
         self.tools = {name: put(name, 'mock executable') for name in ('clang', 'cgeist', 'cgra-opt', 'cgra-mapper')}
         environment = patch.dict(os.environ, {'GeneralOpNameFile': str(put('GeneralOpName.txt', 'LOAD'))})

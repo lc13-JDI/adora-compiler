@@ -342,6 +342,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", type=Path, help="Input .C or .MLIR file")
     parser.add_argument("--profile", choices=["guarded-stream", "guarded-inplace", "guarded-inplace-large", "guarded-canvas-mask"], default=None,
                         help="Opt in to checked ordinary-C compilation through mapper.")
+    parser.add_argument("--canvas-variant", choices=("A", "B", "C", "D"), default="C",
+                        help="Private canvas kernel: A indexed canvas, B indexed predicate, C same-slot canvas (default), D same-slot predicate.")
     parser.add_argument("--kernel-cache", type=Path, help="Optional verified fixed-kernel cache for guarded-inplace-large.")
     parser.add_argument("--mapper-wall-timeout", type=float, default=120.0, help="Large profile mapper process-tree wall limit in seconds.")
     parser.add_argument("--contract", type=Path, help="Fixed object/host ABI JSON for checked C profiles.")
