@@ -54,6 +54,18 @@ add_lit_testsuite(check-adora "Running the ADORA regression tests"
 )
 
 
-add_lit_testsuites(ADORA ${ADORA_TEST_DIR}
-  DEPENDS ${ADORA_TEST_DEPENDS}
-)
+# LLVM's recursive helper creates a target for every directory, including
+# directories without lit tests. Reserve test/rtl for the optional cocotb suite.
+if(NOT LLVM_ENABLE_IDE)
+  file(GLOB suite_dirs RELATIVE "${ADORA_TEST_DIR}" "${ADORA_TEST_DIR}/*")
+  foreach(suite IN LISTS suite_dirs)
+    set(suite_path "${ADORA_TEST_DIR}/${suite}")
+    if(IS_DIRECTORY "${suite_path}" AND NOT suite STREQUAL "rtl"
+       AND NOT suite MATCHES "Inputs|Output")
+      string(TOLOWER "ADORA-${suite}" suite_name)
+      add_lit_target("check-${suite_name}" "Running lit suite ${suite_path}"
+        "${suite_path}" DEPENDS ${ADORA_TEST_DEPENDS})
+      add_lit_testsuites("${suite_name}" "${suite_path}" DEPENDS ${ADORA_TEST_DEPENDS})
+    endif()
+  endforeach()
+endif()

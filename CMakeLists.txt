@@ -51,6 +51,11 @@ add_subdirectory(runtime) # PR3: adora_async_rt shared/static library
 
 add_subdirectory(tools)
 add_subdirectory(test)
+
+option(ADORA_ENABLE_RTL_SIM "Enable optional Verilator/cocotb regression targets" OFF)
+if(ADORA_ENABLE_RTL_SIM)
+  include(build_tools/rtl_sim.cmake)
+endif()
 # add_subdirectory(cmake)
 
 ##############################

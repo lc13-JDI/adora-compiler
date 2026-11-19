@@ -1,31 +1,43 @@
-# Shared Python runtime compatibility patch
+# Python runtime for full RTL simulation
 
-`private-stream-ownership.patch` updates the external CGRA Cocotb server runtime
-used by compiler-generated `guarded-inplace-large` calls. It also adds its
-standalone regression test and ownership API documentation under `server/`.
-The external simulation tree is not maintained as an ADORA submodule; this
-applicable delta records the runtime half of the compiler change.
+The generated mapper module, the cocotb bench and the TCP server import
+`test_runif` from this directory. Keep this module on the simulator's Python
+path under that name so all three users share the same DeviceData, DeviceStream
+and DeviceRuntime classes. Use the repository launcher to select the interpreter,
+target and module path. The CPU asynchronous C library is built separately.
 
-Apply from the root of the shared simulation tree after reviewing its local
-changes:
+The initial source import is from `lc13-JDI/CGRA-Cocotb-Sim` at
+`c48135347c8ea98b4c5b5da28ecdd16a67d5fef8`. The files
+`test_runif.py`, `test_stream_ownership.py` and `STREAM_OWNERSHIP.md`
+correspond to the same basenames under `server/` at that revision. The original
+history includes zevick's simulation runtime and lc13-JDI's ownership changes.
+Subsequent runtime maintenance belongs here. Consult the source notices for
+individual files. The pinned simulator tree contains no project-wide license
+file. Redistribution of material without an applicable grant requires
+confirmation from its rights holders.
 
-```sh
-git apply --check /path/to/adora/runtime/python/private-stream-ownership.patch
-git apply /path/to/adora/runtime/python/private-stream-ownership.patch
-```
+From the ADORA root with the simulation environment active, run the original
+software regressions with `python -B runtime/python/test_stream_ownership.py`.
+The suite runs 16 tests on an Icarus timer-only top. Full device cases and
+hardware inputs are described in the [project README](../../README.md#optional-full-rtl-simulation).
 
-The patch expects the original `server/test_runif.py` SHA-256
+## Existing generated modules
+
+Regenerate a large-plan Python module to enable private-stream ownership.
+Existing modules can run with this runtime using their original lifetime rules.
+New modules check for ownership v1 before creating a stream or transferring
+data. Publication and unknown-completion rules are documented in
+[private stream ownership](../../docs/development/private-stream-ownership.md).
+
+The historical `private-stream-ownership.patch` was issued for an external
+`server/test_runif.py` with SHA-256
 `0421394a6c1292bb859b18c7c7021acc9cb27703550167dee5e0e89ea0de0ca0`.
-Do not overwrite a different local runtime; reconcile that change first.
-The patch does not modify RTL, wrappers or hardware specifications.
+The repository runtime already includes that protocol.
 
-Run `python -B server/test_stream_ownership.py` with cocotb 1.9.2, NumPy,
-Icarus Verilog and `cocotb-config` available in that Python environment's PATH.
-It creates a temporary minimal simulation for software concurrency tests;
-these tests do not substitute for full VITRA hardware validation.
-
-New large-plan modules require runtime ownership protocol version 1 before
-creating a stream. Existing generated modules remain supported, but retain
-their previous ownership behavior until regenerated. See
-`docs/development/private-stream-ownership.md` for publication, cleanup retry,
-and unknown-completion borrowing rules.
+The IntVecAdd reference module comes from `workspace/IntVecAdd.py`. The C++
+example in `test/rtl/vector/intvecadd.cpp` is based on `workspace/test.cpp`.
+The public C++ client sources in `runtime/cpp/` correspond to `client/` at the
+same revision. The dispatcher in `adora_tcp/commands.py` is based on
+`server/CommandHandler.py`. Those original client and example sources are
+attributed to zevick. Use the named `vector-add` and `tcp-client` cases to run
+the two paths with the locked IntVecAdd hardware.

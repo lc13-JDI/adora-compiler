@@ -102,3 +102,8 @@ The Python regressions in `test/adoracc/private_stream_ownership/` exercise the
 host protocol using synthetic transport; they do not establish hardware
 execution correctness. End-to-end validation additionally requires the actual
 shared runtime, paired hardware configuration, real done/D2H, and public arrays.
+
+Run the shared runtime software regressions with
+`python -B runtime/python/test_stream_ownership.py` in the simulation
+environment. For real device execution and host readback use the named
+short-tail and ownership cases in the [full RTL instructions](../../README.md#optional-full-rtl-simulation).

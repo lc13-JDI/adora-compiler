@@ -101,17 +101,22 @@ read guard. Therefore the source must be nonempty, initialized, ordinary memory;
 volatile/MMIO, atomic and strong no-access contracts are rejected. Conditional
 writing uses the existing CSTORE with internal sequential addresses. Its slot
 count is independent of the number of true predicates; false slots still
-advance and complete normally. The old external index ACC and route may remain
-in the mapping, but the sequential destination does not select their address.
+advance and complete normally. For a trusted zero-offset, full contiguous
+destination proof, the in-memory graph connects value port 0 and predicate
+port 2, without an external address edge at port 1. Address-only producers with
+no surviving consumer can be omitted; source LOAD addressing, shared
+computations and explicit-address accesses still consume their required
+resources. This does not remove every ACC from the generated mapping.
 
 The compiler carries the proven address mode, slot count and destination object
-through IR and DFG. The mapper generates `IsStore=1`, `UseEn=1`, `UseAddr=0`,
-`Stride0=1` **word**, `Cycles0=M` and `II=1`. Other loop dimensions are inactive.
-The initialized target, conditional writes and final readback share the same
-allocation; legal BaseAddr relocation remains part of normal emission. The
-explicit CSTORE input address still uses **bytes**. These units are different.
-Conflicting or unverifiable mode/count/object claims are rejected rather than
-silently selecting an unsafe explicit-address fallback.
+through IR and DFG. See [Proven sequential destination mode](cstore-loop-index-e2e.md#proven-sequential-destination-mode)
+for the controller fields, word-address units, legal inactive address-MUX
+selection and emitter checks. That section also distinguishes the three physical
+hardware operands from sparse in-memory connections, trusted legacy three-input
+records and explicit serialized graphs. Unproven inputs retain their own legal
+contracts; conflicting or unverifiable sequential claims are rejected. The
+initialized target, conditional writes and final readback share the same
+allocation; legal BaseAddr relocation remains part of normal emission.
 
 The bridge proves signed coordinate promotions and every address intermediate
 before narrowing. General int32 coordinates, unproven wide arithmetic, floating

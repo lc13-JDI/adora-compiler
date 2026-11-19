@@ -1,0 +1,45 @@
+{
+  "target": "cstore",
+  "top": "test_cgra_cstore",
+  "parameters": {
+    "DATA_WIDTH": 128,
+    "ADDR_WIDTH": 19,
+    "STRB_WIDTH": 16,
+    "ID_WIDTH": 6,
+    "AWUSER_WIDTH": 1,
+    "WUSER_WIDTH": 1,
+    "BUSER_WIDTH": 1,
+    "ARUSER_WIDTH": 1,
+    "RUSER_WIDTH": 1,
+    "AXIL_DATA_WIDTH": 32,
+    "AXIL_ADDR_WIDTH": 10,
+    "AXIL_STRB_WIDTH": 4
+  },
+  "files": {
+    "rtl": {
+      "asset": "CGRAWithAXI.v",
+      "sha256": "3dfdfe954ae2b6614d7e3a7e3b08c3feb9d899f0fef9d4f4e1eee230d24fbbc0",
+      "source": "MIONkb/VITRA-CGRA@da03f4ab0cf696466147ac9210518e7ead6c9589:tram.vitra.CStoreVerilogGen"
+    },
+    "wrapper": {
+      "repository_path": "test/spec/rtl_sim/cstore/test_cgra_cstore.v",
+      "sha256": "de7283b381465ab02f702a467949fbeda0b3ae59001edc5b2aae2307059f8845",
+      "source": "Alex Forencich (MIT), CSTORE validation wrapper, byte-locked local hardware handoff"
+    },
+    "axil": {
+      "repository_path": "test/spec/rtl_sim/cstore/axilite_spec.json",
+      "sha256": "9c53819cad98bd2f3074eaeb26fba8ef9b2e7452703bdba064cd97acafa87502",
+      "source": "MIONkb/VITRA-CGRA@da03f4ab0cf696466147ac9210518e7ead6c9589:cgra-mg/src/main/vitra_spec/cstore/axilite_spec.json"
+    },
+    "adg": {
+      "repository_path": "test/spec/cgra_cstore_vitra/artifacts/adg.json",
+      "sha256": "e34fcef5b15f47718762812513d3cd7db35f06e60a17097e50429dfc41e26cf7",
+      "source": "test/spec/cgra_cstore_vitra/manifest.json"
+    },
+    "operations": {
+      "repository_path": "test/spec/cgra_cstore_vitra/artifacts/operations.json",
+      "sha256": "0eee215afdbed65fed6bd7773f40a783189d67a66accb6e7bc86aaac582bae8d",
+      "source": "test/spec/cgra_cstore_vitra/manifest.json"
+    }
+  }
+}

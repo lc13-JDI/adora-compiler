@@ -1,0 +1,40 @@
+{
+  "target": "intvecadd",
+  "top": "test_cgra",
+  "parameters": {
+    "DATA_WIDTH": 128,
+    "ADDR_WIDTH": 19,
+    "STRB_WIDTH": 16,
+    "ID_WIDTH": 6,
+    "AWUSER_WIDTH": 1,
+    "WUSER_WIDTH": 1,
+    "BUSER_WIDTH": 1,
+    "ARUSER_WIDTH": 1,
+    "RUSER_WIDTH": 1,
+    "AXIL_DATA_WIDTH": 32,
+    "AXIL_ADDR_WIDTH": 10,
+    "AXIL_STRB_WIDTH": 4
+  },
+  "files": {
+    "rtl": {
+      "asset": "CGRAWithAXI.v",
+      "sha256": "ab69976b40b12d6cbef0c8c1014f02a3d2ef391f8298024a61d30786550eefcc",
+      "source": "lc13-JDI/CGRA-Cocotb-Sim@c48135347c8ea98b4c5b5da28ecdd16a67d5fef8:circuits/CGRAWithAXI.v"
+    },
+    "wrapper": {
+      "repository_path": "test/spec/rtl_sim/intvecadd/test_cgra.v",
+      "sha256": "2a774e08abf8304eb9412cf020a356d56b806f40f2ac93b4079b611bf0ff1e1d",
+      "source": "lc13-JDI/CGRA-Cocotb-Sim@c48135347c8ea98b4c5b5da28ecdd16a67d5fef8:circuits/test_cgra.v"
+    },
+    "axil": {
+      "asset": "axilite_spec.json",
+      "sha256": "7674de54396d27be4afce57b04c3cb79daa3db47a74ccedcbc25efd4d6196aed",
+      "source": "lc13-JDI/CGRA-Cocotb-Sim@c48135347c8ea98b4c5b5da28ecdd16a67d5fef8:circuits/axilite_spec.json"
+    },
+    "adg": {
+      "asset": "vitra_cgra_adg.json",
+      "sha256": "47e21c476cf32061d4b0d6e5c2c74d035395c1d2b6341b0803d31739982cf46a",
+      "source": "lc13-JDI/CGRA-Cocotb-Sim@c48135347c8ea98b4c5b5da28ecdd16a67d5fef8:circuits/vitra_cgra_adg.json"
+    }
+  }
+}

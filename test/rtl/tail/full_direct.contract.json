@@ -1,0 +1,61 @@
+{
+  "entry": "large_overlay",
+  "defines": {
+    "W": 640,
+    "H": 480,
+    "T": 307200,
+    "VALUE_NONZERO": 0
+  },
+  "objects": [
+    {
+      "argument_position": 0,
+      "name": "src",
+      "elements": 307200,
+      "host_dtype": "uint16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 1,
+      "name": "x",
+      "elements": 307200,
+      "host_dtype": "int16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 2,
+      "name": "y",
+      "elements": 307200,
+      "host_dtype": "int16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 3,
+      "name": "enabled",
+      "elements": 307200,
+      "host_dtype": "int16",
+      "contiguous": true,
+      "access_assertion": "read"
+    },
+    {
+      "argument_position": 4,
+      "name": "dst",
+      "elements": 307200,
+      "host_dtype": "uint16",
+      "contiguous": true,
+      "access_assertion": "inout"
+    }
+  ],
+  "host_plan": {
+    "strategy": "per-query",
+    "tile_items": 256,
+    "bind_arguments": [
+      1,
+      2,
+      3
+    ],
+    "ownership": "copy"
+  }
+}

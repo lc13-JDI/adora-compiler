@@ -134,6 +134,101 @@ You can find the Polygeist repository here:
 
 ---
 
+## Optional full RTL simulation
+
+The default build uses LLVM/MLIR and runs the ordinary regression suite with
+`cmake --build "$BUILD" --target check-adora`. Full RTL simulation is opt-in.
+The commands below use Bash. Set `ROOT` to the checkout, `LLVM` to the LLVM
+build containing `lib/cmake/mlir`, and `BUILD` to a new build directory.
+
+```bash
+cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DLLVM_BUILD_DIR="$LLVM" -DLLVM_INSTALL_DIR="$LLVM" \
+  -DMLIR_DIR="$LLVM/lib/cmake/mlir" -DADORA_ENABLE_RTL_SIM=OFF
+cmake --build "$BUILD" --target adoracc.py cgra-opt cgra-mapper tensor-opt -j2
+cmake --build "$BUILD" --target check-adora -j2
+```
+
+For device execution, activate a Python environment with cocotb 1.9.2,
+cocotbext-axi 0.1.28 and NumPy 2.4.4. Put Verilator, GNU Make and a C++17
+compiler on PATH. The tested combination uses Python 3.12.13, Verilator 5.044
+and GCC 15.2.0 for the model (`CXX` selects the executable). Icarus runs the separate software ownership suite. Set
+`CGEIST` to the Polygeist cgeist executable. The ADORA simulator uses the
+single `runtime/python/test_runif.py` implementation for both generated Python
+and the C++ TCP server.
+
+Set `RTL_ASSETS` to your offline target directory. Place the canonical
+`CGRAWithAXI.v` for the CSTORE generator in `$RTL_ASSETS/cstore/`.
+The generation entry is `tram.vitra.CStoreVerilogGen`, VITRA commit
+`da03f4ab0cf696466147ac9210518e7ead6c9589`. For the older IntVecAdd
+target, place the three `circuits/` files named in its manifest in
+`$RTL_ASSETS/intvecadd/`. Their immutable source is simulation commit
+`c48135347c8ea98b4c5b5da28ecdd16a67d5fef8`. The manifests identify
+each input by SHA-256, including the bundled wrappers and register maps.
+Availability of authorized copies of the runtime and legacy assets is a
+prerequisite for reproducing the local integration. See the
+[CSTORE generator handoff](test/spec/cgra_cstore_vitra/HANDOFF.md),
+[target definitions](test/spec/rtl_sim) and
+[runtime provenance](runtime/python/README.md).
+
+For a hardware handoff directory `CSTORE_GENERATED` containing the canonical
+Verilog, the launcher validates the bytes before installing them. The legacy
+target can be assembled directly from the three pinned blobs. Use a fresh
+`LEGACY_INPUT` directory for the downloads.
+
+```bash
+python -B "$ROOT/build_tools/rtl_sim.py" import --target cstore \
+  --from-dir "$CSTORE_GENERATED" --assets "$RTL_ASSETS"
+mkdir -p "$LEGACY_INPUT"
+base=https://raw.githubusercontent.com/lc13-JDI/CGRA-Cocotb-Sim/c48135347c8ea98b4c5b5da28ecdd16a67d5fef8/circuits
+for f in CGRAWithAXI.v axilite_spec.json vitra_cgra_adg.json; do
+  curl --fail --location "$base/$f" -o "$LEGACY_INPUT/$f" || exit 1
+done
+python -B "$ROOT/build_tools/rtl_sim.py" import --target intvecadd \
+  --from-dir "$LEGACY_INPUT" --assets "$RTL_ASSETS"
+```
+
+Set `RTL_WORK` to a new output root. The following commands can run from
+outside the checkout. Each run needs a fresh output directory. A verified
+model cache can serve multiple runs.
+
+```bash
+unset PYTHONPATH
+rtl=(python -B "$ROOT/build_tools/rtl_sim.py")
+"${rtl[@]}" verify --target cstore --assets "$RTL_ASSETS"
+"${rtl[@]}" run --case short-tail --assets "$RTL_ASSETS" --cache "$RTL_WORK/models" \
+  --output "$RTL_WORK/tail" --build-dir "$BUILD" --cgeist "$CGEIST"
+for case_name in vector-add tcp-client; do
+  "${rtl[@]}" run --case "$case_name" --assets "$RTL_ASSETS" \
+    --cache "$RTL_WORK/models" --output "$RTL_WORK/$case_name"
+done
+```
+
+To run those three cases through CMake with artifacts under
+`$BUILD/rtl-results/`, enable the optional target in the configured build.
+
+```bash
+cmake -S "$ROOT" -B "$BUILD" -DADORA_ENABLE_RTL_SIM=ON \
+  -DADORA_RTL_PYTHON="$(command -v python)" -DADORA_RTL_ASSETS="$RTL_ASSETS" \
+  -DADORA_RTL_CGEIST="$CGEIST"
+cmake --build "$BUILD" --target check-adora-rtl
+```
+
+The short-tail case compiles ordinary C and maps a new kernel. The test
+compares two frames of 353 host values and 17 guard words per frame after
+device readback. The Python and C++ examples each read back a 20-element
+vector sum. The TCP server binds loopback and accepts a selected port
+(`--port 0` selects a free one). To use a separately built client, start
+the server in its own shell with
+`"${rtl[@]}" run --case tcp-server --assets "$RTL_ASSETS" --cache "$RTL_WORK/models" --output "$RTL_WORK/server" --port 0`.
+Read the loopback endpoint from `$RTL_WORK/server/server.json`. The server
+exits after the last connected client disconnects. Use `--case ownership` with the short-tail
+arguments for fault injection and the longer device lease regression.
+Regenerate pre-ownership large-plan modules to obtain the private-stream
+cleanup protocol. For a target mismatch, check the named input and expected
+hash first. For execution failures inspect the output directory and the model
+build log in the cache.
+
 # Run an Example
 
 ## Quick Start — three built-in examples
