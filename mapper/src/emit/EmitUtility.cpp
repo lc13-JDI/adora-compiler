@@ -446,8 +446,11 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
 
   std::map<int, dfgIoInfo> dfg_io_infos;
   BYTES_LIST iob_ens((adg->numIobNodes()+7)/8);
-  const bool boundedLoads = std::any_of(dfg->ioNodes().begin(), dfg->ioNodes().end(),
-      [&](int id) { return dfg->node(id)->operation() == "LOAD"; });
+  const bool checkedMemoryIO = std::any_of(dfg->ioNodes().begin(), dfg->ioNodes().end(),
+      [&](int id) {
+        auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
+        return io && (io->operation() == "LOAD" || io->isSequentialCStore());
+      });
   bool invalid = false;
   auto reject = [&](int id, const std::string &reason) {
     kernel.emitError("incomplete I/O execution contract: node ") << id << ": " << reason;
@@ -467,7 +470,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
   int reductionCycles = 0, reductionCount = 0;
   int indexCycles = 0, indexCount = 0;
   std::vector<int> liveIndexAccs;
-  if (boundedLoads) {
+  if (checkedMemoryIO) {
     for (auto entry : dfg->nodes()) {
       auto *node = entry.second;
       if (!node->accumulative()) continue;
@@ -507,7 +510,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
   // common invocation count from sequential INPUTs, then validate EVERY role.
   // No OUTPUT start delay is added: every routed sample must be written.
   int streamCycles = 0;
-  if (boundedLoads && !reductionCount) {
+  if (checkedMemoryIO && !reductionCount) {
     for (int id : dfg->ioNodes()) {
       auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
       if (io && io->operation() == "INPUT" && io->pattern().size() == 1 &&
@@ -569,7 +572,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
           return bank < 0 || bank >= static_cast<int>(bank_status.size());
         }))
       reject(id, "no valid reachable SRAM bank");
-    if (boundedLoads) {
+    if (checkedMemoryIO) {
       if (io->isSequentialCStore() &&
           (io->operation() != "CSTORE" || !streamCycles ||
            io->sequentialCStoreSlots() != streamCycles ||
@@ -734,7 +737,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       for(auto& id : IONodes){
         DFGIONode* IoNode = dynamic_cast<DFGIONode*>(dfg->node(id));
         if(IoNode->memRefName() == BlockStoreName){
-          if (boundedLoads && IoNode->operation() == "CSTORE") {
+          if (checkedMemoryIO && IoNode->operation() == "CSTORE") {
             auto initial = blockstore.getSourceMemref().getDefiningOp<ADORA::DataBlockLoadOp>();
             auto found = dfg_io_infos.find(id);
             if (!initial || initial.getOriginalMemref() != blockstore.getTargetMemref() ||
@@ -816,7 +819,7 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
       // Ordinary LOAD kernels require a complete executable invocation. Keep
       // legacy graph-only CSTORE/scalar and cross-kernel emission contracts
       // separate: they do not acquire this new bounded-LOAD certification.
-      if (boundedLoads)
+      if (checkedMemoryIO)
         reject(id, "object " + io->memRefName() + " has no initialization/output or startup coverage");
       continue;
     }

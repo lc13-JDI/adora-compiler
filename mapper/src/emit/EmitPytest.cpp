@@ -1747,6 +1747,9 @@ void PytestEmitter::emitFunctionHead(func::FuncOp &funcop, llvm::raw_ostream &os
         load.getMemref().getDefiningOp<ADORA::DataBlockLoadOp>())
       boundedLoads = true;
   });
+  funcop.walk([&](ADORA::CondStoreOp store) {
+    if (store->hasAttr("adora.cstore_address_mode")) boundedLoads = true;
+  });
   if (boundedLoads) {
     // Check the declared input domain before creating a stream or issuing DMA.
     // These are runtime checks, deliberately not Python asserts (-O must not

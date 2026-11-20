@@ -27,6 +27,7 @@ def LowerCEntry : Pass<"adora-lower-c-entry", "ModuleOp"> {
     Option<"allowPartialWrites", "allow-partial-writes", "bool", "false",
            "Allow a guarded same-iteration store to an initialized inout object">,
     Option<"largeObjects", "large-objects", "bool", "false", "Prove a host-wide gather and emit its fixed 256-word local kernel">,
+    Option<"largeIndexed", "large-indexed", "bool", "true", "Use the legacy indexed ABI unless a compiler-owned same-slot packer is available for the proven large direct entry">,
     Option<"canvasMask", "canvas-mask", "bool", "false", "Prove two private-canvas loops and emit mask kernels">,
     Option<"canvasVariant", "canvas-variant", "std::string", "\"A\"", "Private canvas kernel variant A/B/C/D">,
     Option<"canvasKernel", "canvas-kernel", "std::string", "\"both\"", "Canvas output role: both, regular, or old-only">,

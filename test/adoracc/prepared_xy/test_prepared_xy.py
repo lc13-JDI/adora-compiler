@@ -24,6 +24,67 @@ def descriptor(items=4, nonzero=False):
 
 
 class HostProtocol(unittest.IsolatedAsyncioTestCase):
+    async def test_three_object_direct_preparation(self):
+        d = dict(descriptor(), support_version=4, value_mode='direct', range_lo=None,
+                 range_hi=None, packing_layout='same-slot', local_roles=['packed', 'enable', 'old'])
+        async def tile(runtime, packed, enable, dst):
+            self.calls.append((packed.copy(), enable.copy(), dst.copy()))
+            dst[enable != 0] = packed[enable != 0]
+        make, _, _ = self.bind(tile=tile, desc=d)
+        for mode in ('window', 'tile'):
+            plan = make(*self.arrays(), preparation=mode)
+            plan.descriptor['local_roles'].reverse()
+            self.assertEqual(plan.descriptor['local_roles'], ['packed', 'enable', 'old'])
+            old_plan = self.bind()[0](*self.arrays(), preparation=mode)
+            if mode == 'window':
+                self.assertEqual(old_plan.stats['plan_bytes'] - plan.stats['plan_bytes'], 512)
+            else:
+                self.assertIsNone(plan._positions)
+                self.assertEqual(len(plan._scratch), 3)
+            old_plan.close()
+            for value, previous in [(0, 39), (65535, 47)]:
+                src = np.arange(8193, dtype=np.uint16)
+                src[8192] = value
+                dst = np.full(4, previous, np.uint16)
+                await plan.execute(None, src, dst)
+                packed, enable, old = self.calls[-1]
+                np.testing.assert_array_equal(dst, [value, 0, previous, previous])
+                np.testing.assert_array_equal(enable[:4], [1, 1, 0, 0])
+                self.assertFalse(np.any(enable[4:]) or np.any(old[4:]) or np.any(packed[2:]))
+            plan.close()
+
+    async def test_incompatible_layout_and_stale_mapper_signature(self):
+        d = dict(descriptor(), support_version=4, value_mode='direct', range_lo=None,
+                 range_hi=None, packing_layout='same-slot', local_roles=['packed', 'enable', 'old'])
+        for changes in (dict(packing_layout='indexed'), dict(local_roles=['packed', 'old', 'enable']),
+                        dict(value_mode='nonzero', value_nonzero=True), dict(support_version=3)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.module._validate_descriptor(dict(d, **changes))
+        for key in ('packing_layout', 'local_roles'):
+            missing = dict(d)
+            del missing[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                self.module._validate_descriptor(missing)
+        spec = importlib.util.spec_from_file_location('c_entry', ROOT / 'tools/adoracc/c_entry.py')
+        compiler = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compiler)
+        # These are mapper outputs with the two genuinely different signatures.
+        body = """    stream = runtime.create_stream()
+    writeback_tasks = []
+    await stream.synchronize()
+    try:
+        apply_writeback_tasks(writeback_tasks)
+    except NameError:
+        pass
+"""
+        def raw(n):
+            params = ', '.join('arg_' + str(i) for i in range(n))
+            return f'async def _adora_large_tile(runtime, {params}):\n' + body
+        indexed = dict(d, packing_layout='indexed', local_roles=['packed', 'idx', 'enable', 'old'])
+        for proof, count in [(d, 3), (indexed, 4), (descriptor(), 4)]:
+            compiler.large_checked_module(raw(count), proof)
+            with self.assertRaisesRegex(ValueError, 'ABI signature'):
+                compiler.large_checked_module(raw(7 - count), proof)
     async def test_range_descriptor_is_explicit_and_fail_closed(self):
         d = dict(descriptor(), support_version=3, value_mode='range', range_lo=32768, range_hi=60000)
         self.module._validate_descriptor(d)

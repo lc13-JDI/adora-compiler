@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/OperationSupport.h"
 // #include "mlir/IR/OpDefinition.h"
@@ -2812,9 +2813,10 @@ static bool IsExclusiveLoopCStorePredicateLoad(mlir::Operation *owner,
 }
 
 // Sequential INPUT indices are controller metadata, not routed copies of the
-// loop-index ACC. Permit this role only for the bounded LOAD+CSTORE contract;
-// its object/range/effect preflight is run before CDFG construction.
-static bool IsSequentialDynamicCStoreInput(mlir::Operation *owner, mlir::Value source) {
+// loop-index ACC. Certified inout traversals prove this even when there is
+// no dynamic LOAD. Preserve the existing dynamic-LOAD path for other graphs.
+static bool IsSequentialCStoreInput(mlir::Operation *owner, mlir::Value source,
+                                    bool certifiedBoundedInout) {
   auto load = dyn_cast<affine::AffineLoadOp>(owner);
   auto loop = source.getParentBlock() ? dyn_cast<affine::AffineForOp>(source.getParentBlock()->getParentOp()) : affine::AffineForOp();
   if (!load || !loop || source != loop.getInductionVar() ||
@@ -2830,6 +2832,7 @@ static bool IsSequentialDynamicCStoreInput(mlir::Operation *owner, mlir::Value s
   if (map.getNumDims() != 1 || map.getNumSymbols() || map.getNumResults() != 1 ||
       map.getResult(0) != getAffineDimExpr(0, loop.getContext()) ||
       load.getMapOperands().size() != 1 || load.getMapOperands()[0] != source) return false;
+  if (certifiedBoundedInout) return true;
   bool dynamic = false;
   loop.walk([&](memref::LoadOp read) { if (read->getParentOp() == loop.getOperation()) dynamic = true; });
   return dynamic;
@@ -2841,7 +2844,8 @@ static bool IsPhysicalMemoryLeaf(mlir::Operation *owner) {
 }
 
 static CStoreIVUseFacts ClassifyCStoreIVUses(
-    mlir::Value value, llvm::DenseSet<mlir::Value> &visiting) {
+    mlir::Value value, llvm::DenseSet<mlir::Value> &visiting,
+    bool certifiedBoundedInout) {
   CStoreIVUseFacts facts;
   if (!visiting.insert(value).second) {
     facts.unsupported = true;
@@ -2862,7 +2866,7 @@ static CStoreIVUseFacts ClassifyCStoreIVUses(
     // transformation so a CSTORE address plus another live leaf fails closed.
     if (IsPhysicalMemoryLeaf(owner)) {
       if (IsExclusiveLoopCStorePredicateLoad(owner, value) ||
-          IsSequentialDynamicCStoreInput(owner, value))
+          IsSequentialCStoreInput(owner, value, certifiedBoundedInout))
         continue;
       facts.hasOtherLiveLeaf = true;
       continue;
@@ -2870,7 +2874,7 @@ static CStoreIVUseFacts ClassifyCStoreIVUses(
 
     CStoreIVUseFacts children;
     for (mlir::Value result : owner->getResults())
-      children.merge(ClassifyCStoreIVUses(result, visiting));
+      children.merge(ClassifyCStoreIVUses(result, visiting, certifiedBoundedInout));
     facts.merge(children);
 
     // A supported arith ADD/MUL is safe only when every live leaf beneath it
@@ -2912,7 +2916,8 @@ static bool IsCStoreLoopNestedInAffineFor(affine::AffineForOp forOp) {
 // Inspect actual affine IV uses before CDFG construction loses indirect-use
 // information. The v1 subset accepts direct CSTORE addresses and pure,
 // statically parameterized affine/arithmetic address chains ending there.
-static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
+static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel,
+                                                     bool certifiedBoundedInout) {
   bool invalid = false;
   kernel.walk([&](affine::AffineForOp forOp) {
     if (invalid)
@@ -2920,7 +2925,7 @@ static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
 
     llvm::DenseSet<mlir::Value> visiting;
     CStoreIVUseFacts facts =
-        ClassifyCStoreIVUses(forOp.getInductionVar(), visiting);
+        ClassifyCStoreIVUses(forOp.getInductionVar(), visiting, certifiedBoundedInout);
     auto reject = [&](llvm::StringRef reason) {
       forOp.emitError("unsupported loop-index CSTORE: ") << reason;
       invalid = true;
@@ -2964,7 +2969,7 @@ static LogicalResult PreflightCStoreLoopIndexUses(ADORA::KernelOp kernel) {
 // Lower only the narrow CSTORE loop-index subset described by the VITRA
 // contract. The affine.for remains an MLIR control construct; this replaces
 // its physical CDFG producer with an ACC and a real static step operand.
-static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
+static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG, bool certifiedBoundedInout) {
   constexpr int64_t kMaxUnsigned16 = 0xffff;
   constexpr int64_t kMaxTripCount = 4095;
 
@@ -2985,7 +2990,7 @@ static LogicalResult LowerCStoreLoopIndexToAcc(LLVMCDFG *CDFG) {
 
     llvm::DenseSet<mlir::Value> visiting;
     CStoreIVUseFacts facts =
-        ClassifyCStoreIVUses(forOp.getInductionVar(), visiting);
+        ClassifyCStoreIVUses(forOp.getInductionVar(), visiting, certifiedBoundedInout);
     if (!facts.reachesCStore)
       continue;
 
@@ -3478,7 +3483,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
   if(verbose) {kernel.dump();}
   _kernel_toDFG = &kernel;
 
-  if (failed(PreflightCStoreLoopIndexUses(kernel)))
+  if (failed(PreflightCStoreLoopIndexUses(kernel, certifiedBoundedInout)))
     return false;
 
   int level = 0, level_total;
@@ -4405,7 +4410,7 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
     return false;
   if(verbose) { CDFG->CDFGtoDOT(CDFG->name_str()+"_0_CDFG.dot");}
 
-  if (failed(LowerCStoreLoopIndexToAcc(CDFG)))
+  if (failed(LowerCStoreLoopIndexToAcc(CDFG, certifiedBoundedInout)))
     return false;
 
   ////////////////////////
@@ -4894,7 +4899,16 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     }
     hasDynamicLoad = true;
   });
-  if (!hasDynamicLoad) {
+  // A marker requests validation of the private three-object ABI. It is not a
+  // witness. Reconstruct its complete local body and object bindings on every
+  // invocation, including the mapper reading serialized MLIR.
+  const bool sameSlot = kernel->hasAttr("adora.large_direct_same_slot");
+  if (sameSlot && (!kernel->getAttrOfType<UnitAttr>("adora.large_direct_same_slot") ||
+                   hasDynamicLoad || !hasCStore)) {
+    reject(kernel, "same-slot tile requires sequential inputs and a conditional store");
+    return failure();
+  }
+  if (!hasDynamicLoad && !sameSlot) {
     if (hasCStoreClaim)
       reject(kernel, "sequential CSTORE metadata requires the complete initialized inout SSA proof");
     return failure(invalid);
@@ -4904,6 +4918,26 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       kernel->getParentOp() != function.getOperation()) {
     reject(kernel, "requires one function block with a direct kernel and no host control flow");
     return failure();
+  }
+  if (sameSlot) {
+    // The fixed tile wrapper owns three synchronous, whole-object transfers.
+    // Reject altered bindings or extra effects before inspecting their IDs.
+    function.walk([&](Operation *op) {
+      if (op->hasAttr("adora.no_access") || op->hasAttr("adora.require_no_access"))
+        reject(op, "same-slot tile cannot perform physical no-access reads");
+      if (!isa<ADORA::DataBlockLoadOp, ADORA::DataBlockStoreOp>(op)) return;
+      const bool load = isa<ADORA::DataBlockLoadOp>(op);
+      if (!op->getAttrOfType<StringAttr>("Id") || !op->getAttrOfType<StringAttr>("KernelName") ||
+          op->getNumOperands() != (load ? 1u : 2u) || op->getNumResults() != (load ? 1u : 0u))
+        reject(op, "same-slot tile requires named whole-object synchronous copies");
+      for (auto attr : op->getAttrs()) {
+        StringRef name = attr.getName().strref();
+        if (name != "Id" && name != "KernelName" && name != "map" && name != "operandSegmentSizes" &&
+            !(load && name == "adora.host_dtype"))
+          reject(op, "unexpected same-slot block copy attribute");
+      }
+    });
+    if (invalid) return failure();
   }
   if (function->hasAttr("adora.no_access") || function->hasAttr("adora.require_no_access")) {
     reject(function, "physical no-access is unsupported by ordinary LOAD");
@@ -5005,6 +5039,13 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
   });
   // A bounded reduction is a separate narrow role contract; legacy kernels
   // still require one invocation and stores inside that invocation.
+  if (sameSlot) {
+    if (function.getNumArguments() != 3 || conditionalWrites != 1) {
+      reject(kernel, "same-slot tile requires packed, enable and initialized destination");
+      return failure();
+    }
+    kernel.walk([&](ADORA::CondStoreOp store) { invocationLoop = store->getParentOp(); });
+  }
   auto reductionLoop = dyn_cast_or_null<affine::AffineForOp>(invocationLoop);
   bool reduction = reductionLoop && reductionLoop.getNumResults() == 2;
   bool stream = false;
@@ -5020,7 +5061,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       reject(reductionLoop, "stream requires lower zero, unit step and positive bounded constant length");
     else streamCount = reductionLoop.getConstantUpperBound();
   }
-  if (hasCStore && (!stream || conditionalWrites != 1 || dynamicReads != 1 || inoutObjects.size() != 1))
+  if (hasCStore && (!stream || conditionalWrites != 1 || dynamicReads != (sameSlot ? 0 : 1) || inoutObjects.size() != 1))
     reject(kernel, "conditional stream requires one dynamic LOAD and one initialized sequential CSTORE role");
   int64_t reductionCount = 1;
   affine::AffineLoadOp sequentialInput;
@@ -5069,6 +5110,41 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
         map.getNumResults() == 1 && map.getResult(0) == getAffineDimExpr(0, kernel.getContext()) &&
         store.getMapOperands().size() == 1 && store.getMapOperands()[0] == reductionLoop.getInductionVar();
   };
+  if (sameSlot) {
+    // Verify both local traversals, the predicate and the complete loop effects.
+    // The shared checks below also prove zero-based full copies, unique object
+    // identities, the dst[iv] CSTORE, disjoint bindings and matching writeback.
+    if (!stream || streamCount != 256 ||
+        reductionLoop.getBody()->getOperations().size() != 5) {
+      reject(kernel, "same-slot tile requires two reads, a validity test and one write in 256 slots");
+      return failure();
+    }
+    auto role = [&](mlir::Value memref, unsigned position, StringRef dtype) {
+      auto block = validObject(memref, /*allowInout=*/true);
+      auto hostType = block ? block->getAttrOfType<StringAttr>("adora.host_dtype") : StringAttr();
+      return block && block.getOriginalMemref() == function.getArgument(position) &&
+             cast<MemRefType>(memref.getType()).getNumElements() == 256 &&
+             block.getId() == "arg" + std::to_string(position) &&
+             hostType && hostType.getValue() == dtype;
+    };
+    auto readsRole = [&](affine::AffineLoadOp load, unsigned position, StringRef dtype) {
+      return load && load->getParentOp() == invocationLoop && sequentialRead(load) &&
+             load->getAttrs().size() == 1 && role(load.getMemRef(), position, dtype);
+    };
+    kernel.walk([&](ADORA::CondStoreOp store) {
+      auto data = store.getValue().getDefiningOp<affine::AffineLoadOp>();
+      auto test = store.getCondition().getDefiningOp<arith::CmpIOp>();
+      auto enable = test ? test.getRhs().getDefiningOp<affine::AffineLoadOp>() : affine::AffineLoadOp();
+      if (!readsRole(data, 0, "uint16") || !readsRole(enable, 1, "int16") ||
+          !role(store.getMemref(), 2, "uint16") || !test || test->getParentOp() != invocationLoop ||
+          test.getPredicate() != arith::CmpIPredicate::slt || !matchPattern(test.getLhs(), m_Zero()))
+        reject(store, "same-slot tile must conditionally write packed[iv] when validity[iv] is positive");
+    });
+    unsigned blockLoads = 0;
+    function.walk([&](ADORA::DataBlockLoadOp) { ++blockLoads; });
+    if (blockLoads != 3) reject(kernel, "same-slot tile requires three full input copies");
+    if (invalid) return failure();
+  }
   if (stream) {
     // All run-time values enter through certified sequential I/O. Host scalar
     // arguments and other block arguments have no stream transport contract.
@@ -5276,10 +5352,10 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
         if (user == block.getOperation() || (original && original->isAncestor(user))) continue;
         auto store = dyn_cast<ADORA::CondStoreOp>(user);
         auto read = store ? store.getValue().getDefiningOp<memref::LoadOp>() : memref::LoadOp();
-        if (store && !read) read = rangeSelectedRead(store);
+        if (store && !read && !sameSlot) read = rangeSelectedRead(store);
         if (!store || store->getParentOp() != invocationLoop || store.getIndices().size() != 1 ||
-            store.getIndices()[0] != reductionLoop.getInductionVar() || !read ||
-            read.getMemref() == store.getMemref() ||
+            store.getIndices()[0] != reductionLoop.getInductionVar() ||
+            (!sameSlot && (!read || read.getMemref() == store.getMemref())) ||
             llvm::any_of(store->getAttrs(), [](NamedAttribute attr) {
               auto name = attr.getName().strref();
               return name != "adora.cstore_address_mode" && name != "adora.cstore_slots" &&

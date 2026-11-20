@@ -342,27 +342,50 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
     function.erase();
     return success();
   }
+  // The per-query owned-copy packer writes each valid sample at its original
+  // tile slot and zero-fills every other slot. The same-slot kernel is selected
+  // only for the exact direct effect established above, after the canvas exit.
+  const bool sameSlot = !rangeMode && !nonzero && !largeIndexed;
+  proof["packing_layout"] = sameSlot ? "same-slot" : "indexed";
+  proof["local_roles"] = sameSlot ? llvm::json::Array{"packed", "enable", "old"}
+                                  : llvm::json::Array{"packed", "idx", "enable", "old"};
+  if (sameSlot)
+    proof["proof"] = "typed SSA exact enable and geometry guards, wide source address, unique direct same-iteration destination; owned per-query packer maps each valid query to its original slot, normalizes validity including tail, and initializes all 256 packed words";
   // Construct a local semantic equivalent only after the global proof passes.
   auto loc=function.getLoc(); OpBuilder b(function.getContext());
   function.getBody().getBlocks().clear();
   auto type=MemRefType::get({256},b.getI16Type());
-  function.setType(b.getFunctionType({type,type,type,type},{}));
+  SmallVector<Type> localTypes(sameSlot ? 3 : 4, type);
+  function.setType(b.getFunctionType(localTypes, {}));
   function.setSymName("_adora_large_tile");
   auto *body=function.addEntryBlock(); b.setInsertionPointToStart(body);
   auto zero=b.create<arith::ConstantIntOp>(loc,0,16);
-  auto limit=b.create<arith::ConstantIntOp>(loc,256,16);
+  Value limit;
+  if (!sameSlot) limit = b.create<arith::ConstantIntOp>(loc,256,16);
   auto localLoop=b.create<affine::AffineForOp>(loc,0,256);
   b.setInsertionPoint(localLoop.getBody()->getTerminator());
-  auto idx=b.create<memref::LoadOp>(loc,function.getArgument(1),ValueRange{localLoop.getInductionVar()});
-  auto en=b.create<memref::LoadOp>(loc,function.getArgument(2),ValueRange{localLoop.getInductionVar()});
-  auto active=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ne,en,zero);
-  auto lo=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sge,idx,zero);
-  auto hi=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,idx,limit);
-  auto bounds=b.create<arith::AndIOp>(loc,lo,hi);
-  auto guard=b.create<arith::AndIOp>(loc,active,bounds);
-  auto branch=b.create<scf::IfOp>(loc,guard,false); b.setInsertionPointToStart(&branch.getThenRegion().front());
-  auto addressIndex=b.create<arith::IndexCastOp>(loc,b.getIndexType(),idx);
-  auto pixel=b.create<memref::LoadOp>(loc,function.getArgument(0),ValueRange{addressIndex});
+  Value ivLocal = localLoop.getInductionVar();
+  Value pixel;
+  if (sameSlot) {
+    pixel = b.create<memref::LoadOp>(loc, function.getArgument(0), ValueRange{ivLocal});
+    auto valid = b.create<memref::LoadOp>(loc, function.getArgument(1), ValueRange{ivLocal});
+    // The private validity stream contains 0/1, including padded slots.
+    auto guard = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, zero, valid);
+    auto branch = b.create<scf::IfOp>(loc, guard, false);
+    b.setInsertionPointToStart(&branch.getThenRegion().front());
+  } else {
+    auto idx=b.create<memref::LoadOp>(loc,function.getArgument(1),ValueRange{ivLocal});
+    auto en=b.create<memref::LoadOp>(loc,function.getArgument(2),ValueRange{ivLocal});
+    auto active=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ne,en,zero);
+    auto lo=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::sge,idx,zero);
+    auto hi=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::slt,idx,limit);
+    auto bounds=b.create<arith::AndIOp>(loc,lo,hi);
+    auto guard=b.create<arith::AndIOp>(loc,active,bounds);
+    auto branch=b.create<scf::IfOp>(loc,guard,false);
+    b.setInsertionPointToStart(&branch.getThenRegion().front());
+    auto addressIndex=b.create<arith::IndexCastOp>(loc,b.getIndexType(),idx);
+    pixel=b.create<memref::LoadOp>(loc,function.getArgument(0),ValueRange{addressIndex});
+  }
   if(nonzero) {
     auto nz=b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ne,pixel,zero);
     auto inner=b.create<scf::IfOp>(loc,nz,false); b.setInsertionPointToStart(&inner.getThenRegion().front());
@@ -386,10 +409,11 @@ LogicalResult LowerCEntryPass::lowerLarge(func::FuncOp function,
     b.setInsertionPointAfter(selection);
     data=selection.getResult(0);
   }
-  b.create<memref::StoreOp>(loc,data,function.getArgument(3),ValueRange{localLoop.getInductionVar()});
+  b.create<memref::StoreOp>(loc,data,function.getArgument(localTypes.size()-1),ValueRange{ivLocal});
   b.setInsertionPointToEnd(body); b.create<func::ReturnOp>(loc);
   SmallVector<Object> localObjects{{256,"uint16",false},{256,"int16",false},{256,"int16",false},{256,"uint16",true,true}};
-  if(failed(lower(function,localObjects,rangeMode))) return failure();
+  if (sameSlot) localObjects.erase(localObjects.begin()+1);
+  if(failed(lower(function,localObjects,rangeMode,sameSlot))) return failure();
   std::error_code ec; llvm::raw_fd_ostream out(descriptor,ec,llvm::sys::fs::OF_Text);
   if(ec) return reject("cannot write verified descriptor");
   out << llvm::formatv("{0:2}\n",llvm::json::Value(std::move(proof)));

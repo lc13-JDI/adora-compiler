@@ -2,8 +2,9 @@
 
 `guarded-inplace-large` is an explicit capacity backend for a restricted ordinary
 C gather into a sequential inout destination. The compiler proves the original
-wide global access and effects, then emits a four-buffer M=N=256 local kernel
-through the existing LOAD/CSTORE, mapper, and generated runtime path. The source
+wide global access and effects, then emits a 256-slot local kernel through the mapper and generated runtime.
+A direct copy uses sequential input and a conditional store. The indexed
+implementation uses LOAD/CSTORE. The source
 image and destination can exceed one hardware bank. This is not a claim of
 hardware speedup or support for general scatter, aliasing, or dynamic device
 loops. Existing `guarded-stream` and `guarded-inplace` profiles retain their
@@ -162,13 +163,16 @@ execution. Distinct plans do not promise serialization on a shared runtime;
 callers must sequence them unless their runtime independently supports it.
 
 The descriptor schema is `adora.guarded-inplace-large.v1`, host support version
-3. New compiler proofs explicitly identify `value_mode` as `direct`, `nonzero`,
+4. New compiler proofs bind the private `packing_layout` and ordered
+`local_roles` to the generated tile ABI and explicitly identify `value_mode` as `direct`, `nonzero`,
 or `range`, with `range_lo`/`range_hi` integers for range mode and null bounds
 otherwise. `value_nonzero` must agree with the mode. Missing or contradictory
 proofs fail before mapping/publication. Kernel cache keys and module identities
-include value semantics; different intervals cannot reuse the wrong kernel.
-Version 3 also accepts legacy version 2 descriptors only when they contain no
-new mode/range fields. Previously generated modules retain their own embedded
+include value semantics and the ordered local ABI. An older driver that does
+not negotiate the compiler-owned layout gets the indexed lowering. A missing
+global guard or an inconsistent proof, signature or cache entry is rejected.
+Version 4 accepts legacy version 2/3 indexed descriptors. Version 2 omits
+mode and range fields. Both legacy versions omit layout fields. Previously generated modules retain their own embedded
 support and remain independently executable. Foreign-plan rejection is unchanged.
 Source and target each have a conservative maximum of 16,777,216 elements,
 checked before user-sized allocations. The compiler additionally restricts width and height to 1..32767.
@@ -243,16 +247,21 @@ replacement is involved.
 
 ## Packing and output
 
-Each 256-query output tile has four completely initialized 512-byte buffers:
-packed source, local index, enable, and old destination. Query slot j gets the
-current global source pixel at its proven offset, local index j, and enable 1.
-Invalid slots get index -1 and enable 0. Source dummy values and padded old
-output slots are zero. Real old destination slots come from the current frame.
-Only a tile with no valid read guard is skipped. Pixel values never select tasks,
-so the optional source-value-nonzero predicate remains on the device.
+For a proved direct copy the compiler owns both sides of the tile interface.
+It fills packed slot j from the current source at the wide offset for query j.
+The sequential device read therefore addresses j whenever the query is valid.
+All packed slots are initialized. The enable word combines the original
+coordinate bounds, enable and real tail length. Only enabled slots issue a
+physical CSTORE, including a zero-valued pixel. Each active block uploads
+packed, enable and old output (512 bytes each). The indexed ABI also uploads
+a 512-byte local-index stream. Both read back all 256 words. Fully inactive
+blocks leave the caller's old values in place and issue no device call.
 
-The window path precomputes immutable local indices, enable masks, valid packed
-positions, int64 source offsets, and safe destination gather indices. A batch
+The host gathers global pixels only at valid offsets. Both window and tile
+implementations omit the device-index buffer for the three-object ABI. Indexed
+plans set a valid local index to j and an invalid index to -1. The window path
+retains geometric gather/scatter positions and enable masks for both layouts;
+only indexed plans retain the local index template. A batch
 contains up to `window_tiles` active tiles in global order; skipped tiles consume
 no window slots. Each execution gathers current source and old destination
 values for just that batch. Invalid source offsets are never gathered; padded
@@ -267,13 +276,13 @@ is never copied beyond the real output range. The device still sees one serial
 
 On a 64-bit host, with T queries, V valid queries, A active tiles and
 B=min(window_tiles,A), immutable window ndarray payload is `6*T + 16*V +
-12*256*A` bytes. Persistent dynamic scratch is `4*256*B` bytes (packed and old
+R*256*A` bytes, with R=10 for same-slot and R=12 for indexed. Persistent dynamic scratch is `4*256*B` bytes (packed and old
 uint16 arrays). `execution_scratch_bound_bytes` conservatively allows
 `16*256*B` bytes for these arrays and NumPy gather temporaries. Thus the default
 32-tile capacity uses at most 32 KiB persistent dynamic scratch, with a 128 KiB
 execution payload bound; the maximum configurable capacity has a 1 MiB bound.
 All-invalid plans allocate zero dynamic payload. The tile fallback retains
-`14*T + ceil(T/256)` immutable bytes and 2,560 persistent scratch bytes, with a
+`14*T + ceil(T/256)` immutable bytes and 1,536 (same-slot) or 2,560 (indexed) persistent scratch bytes, with a
 6,144-byte execution payload bound. These execution bounds exclude the existing
 static plan and runtime-owned allocations.
 

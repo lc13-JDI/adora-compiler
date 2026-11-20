@@ -1,6 +1,7 @@
 """The large profile proves genuine SSA effects before emitting a bounded tile."""
 import copy
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -14,12 +15,13 @@ contract = {'entry':'large_overlay', 'objects':[
     'host_plan':dict(strategy='per-query',tile_items=256,bind_arguments=[1,2,3],ownership='copy')}
 with tempfile.TemporaryDirectory() as directory:
     root=Path(directory)
-    def run(text, c=contract, good=True, large=True, z=True):
+    def run(text, c=contract, good=True, large=True, z=True, indexed=False):
         (root/'input.mlir').write_text(text)
         (root/'contract.json').write_text(json.dumps(c))
         descriptor=root/'proof.json'; descriptor.unlink(missing_ok=True)
         opt=f'--adora-lower-c-entry=contract={root}/contract.json allow-partial-writes=true'
         if large: opt+=f' large-objects=true descriptor={descriptor}'
+        if large and not indexed: opt+=" large-indexed=false"
         r=subprocess.run([tool,str(root/'input.mlir'),opt,'--verify-each'],capture_output=True,text=True)
         assert (r.returncode==0)==good, r.stderr+r.stdout
         if good:
@@ -28,12 +30,53 @@ with tempfile.TemporaryDirectory() as directory:
             assert proof['tile_items']==256 and proof['value_nonzero']==z
             assert 'memref<256xi16>' in r.stdout and 'ADORA.kernel' in r.stdout
             assert 'i64' not in r.stdout and 'i32' not in r.stdout
+            same_slot = proof['value_mode'] == 'direct' and not indexed
+            assert proof['packing_layout'] == ('same-slot' if same_slot else 'indexed')
+            assert proof['local_roles'] == (['packed', 'enable', 'old'] if same_slot
+                                            else ['packed', 'idx', 'enable', 'old'])
+            signature = next(line for line in r.stdout.splitlines() if 'func.func' in line)
+            assert signature.count('memref<256xi16>') == len(proof['local_roles'])
+            if same_slot:
+                def dfg(ir, good):
+                    lowered = subprocess.run([tool, '-', '--adora-kernel-dfg-gen', '--verify-each'],
+                        cwd=root, input=ir, text=True, capture_output=True)
+                    assert (lowered.returncode == 0) == good, lowered.stderr
+                    return lowered.stdout
+                local = dfg(r.stdout, True)
+                dot = (root / '_adora_large_tile_CDFG.dot').read_text()
+                assert dot.count('opcode = "Input"') == 2 and 'opcode = "load"' not in dot.lower(), dot
+                assert 'cstore_address_mode="sequential"' in dot and 'cstore_slots="256"' in dot
+                data = re.search(r'^(\w+)\[opcode = "Input", ref_name="_adora_large_tile:arg0"', dot, re.M)
+                store = re.search(r'^(\w+)\[opcode = "CSTORE", ref_name="_adora_large_tile:arg2"', dot, re.M)
+                assert data and store, dot
+                edges = re.findall(r'^(\w+) -> ' + store[1] + r'\[.*?operand = (-?\d+)', dot, re.M)
+                assert sorted(port for _, port in edges) == ['0', '2'] and (data[1], '0') in edges, dot
+                assert dot.count('pattern="2,256"') == 3 and 'opcode = "output"' not in dot.lower()
+                # The mapper reads final MLIR and independently repeats the proof.
+                dfg(local, True)
+                for before, after in [
+                    ('arith.cmpi slt,', 'arith.cmpi sle,'),
+                    (', adora.large_direct_same_slot', ''),
+                    ('adora.host_dtype = "int16"', 'adora.host_dtype = "uint16"'),
+                    ('adora.cstore_slots = 256', 'adora.cstore_slots = 255'),
+                    ('ADORA.BlockLoad %arg1', 'ADORA.BlockLoad %arg0'),
+                    ('ADORA.BlockStore %result_1, %arg2', 'ADORA.BlockStore %result_1, %arg0'),
+                ]:
+                    assert before in local, local
+                    dfg(local.replace(before, after), False)
             return proof
         assert not descriptor.exists()
     run(source)
     single=copy.deepcopy(contract)
     for obj in single['objects'][1:]: obj['elements']=1
-    run(Path(fixture).with_name('large_single.txt').read_text(),single,z=False)
+    direct = Path(fixture).with_name('large_single.txt').read_text()
+    run(direct, single, z=False)
+    # A driver which did not negotiate owned same-slot packing keeps four roles.
+    run(direct, single, z=False, indexed=True)
+    forged = copy.deepcopy(single)
+    forged['host_plan']['packing_layout'] = 'same-slot'
+    run(direct, forged, good=False)
+    run(direct.replace('scf.if %16 {', 'scf.if %8 {'), single, good=False)
     renamed=copy.deepcopy(contract); renamed['entry']='unrelated'
     run(source.replace('large_overlay','unrelated').replace('%20','%pixel'),renamed)
     # Argument identity follows actual SSA, not a spelling/position heuristic.

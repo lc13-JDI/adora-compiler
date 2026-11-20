@@ -416,17 +416,34 @@ def validate_large_source_address(ast: dict, proof: dict) -> None:
         raise ValueError('large C source address must use the target 64-bit size_t domain')
 
 
-def large_local_contract() -> dict:
+def large_local_contract(proof=None, *, legacy=False) -> dict:
+    roles = ['packed', 'idx', 'enable', 'old']
+    if proof is not None:
+        if legacy:
+            if 'packing_layout' in proof or 'local_roles' in proof:
+                raise ValueError('large C entry: legacy indexed ABI cannot carry a packing layout')
+        else:
+            layout = proof.get('packing_layout')
+            if layout == 'same-slot' and proof.get('value_mode') == 'direct':
+                roles = ['packed', 'enable', 'old']
+            elif layout != 'indexed':
+                raise ValueError('large C entry: incompatible value mode and packing layout')
+            if proof.get('local_roles') != roles:
+                raise ValueError('large C entry: local ABI roles contradict compiler-proved layout')
     return {'entry': '_adora_large_tile', 'objects': [
-        {'argument_position': i, 'elements': 256, 'host_dtype': dtype,
-         'access_assertion': access, 'contiguous': True}
-        for i, dtype, access in [(0, 'uint16', 'read'), (1, 'int16', 'read'),
-                                 (2, 'int16', 'read'), (3, 'uint16', 'inout')]]}
+        {'argument_position': i, 'name': role, 'elements': 256,
+         'host_dtype': 'uint16' if role in ('packed', 'old') else 'int16',
+         'access_assertion': 'inout' if role == 'old' else 'read', 'contiguous': True}
+        for i, role in enumerate(roles)]}
 
 
 def large_checked_module(mapper_source: str, descriptor: dict) -> tuple[str, str]:
     """Embed the proven tile and versioned host support into one public module."""
-    tile_source, private_source = checked_module(mapper_source, large_local_contract(),
+    version = descriptor.get('support_version')
+    if type(version) is not int or version not in (2, 3, 4):
+        raise ValueError('large C entry: incompatible host support version')
+    contract = large_local_contract(descriptor, legacy=version < 4)
+    tile_source, private_source = checked_module(mapper_source, contract,
                                                 allow_partial=True, private_stream_ownership=True)
     support = Path(__file__).with_name('prepared_xy.py').read_text()
     entry = descriptor['entry']
@@ -438,13 +455,12 @@ def _adora_create_large_entry():
     public_namespace = globals()
     tile_namespace = {{'__name__': __name__ + '._tile', '__file__': __file__}}
     exec(compile({tile_source!r}, __file__, 'exec'), tile_namespace)
-    globals()['_tile'] = tile_namespace['_adora_large_tile']
+    tile = tile_namespace['_adora_large_tile']
+    globals()['_tile'] = tile
     support_namespace = {{'__name__': __name__ + '._support', '__file__': __file__}}
     exec(compile({support!r}, __file__, 'exec'), support_namespace)
-    async def dispatch(runtime, *buffers, _adora_stream):
-        return await public_namespace['_tile'](runtime, *buffers, _adora_stream=_adora_stream)
     make_plan, execute_plan, once = support_namespace['bind_prepared_entry'](
-        dispatch, {descriptor!r}, private_stream_ownership=True)
+        tile, {descriptor!r}, private_stream_ownership=True)
     public_namespace['make_plan'] = make_plan
     public_namespace['execute_plan'] = execute_plan
     public_namespace[{entry!r}] = once
@@ -490,8 +506,6 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
     shutil.copy2(ops_path, root / 'operations.json')
     normalized = root / 'contract.json'
     normalized.write_text(json.dumps(contract, indent=2) + '\n')
-    if large:
-        (root / 'local-contract.json').write_text(json.dumps(local_contract, indent=2) + '\n')
     tools = {'cgeist': require_tool('cgeist'), 'clang': require_tool('clang'),
              'cgra-opt': require_local('cgra-opt'), 'cgra-mapper': require_local('cgra-mapper')}
     name_file = os.environ.get('GeneralOpNameFile')
@@ -594,12 +608,14 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         run([tools['cgra-opt'], bridge_input,
              f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank}' +
              (' allow-partial-writes=true' if partial else '') +
-             (f' large-objects=true descriptor={root / "host-proof.json"}' if large else ''),
+             (f' large-objects=true large-indexed=false descriptor={root / "host-proof.json"}' if large else ''),
              '--verify-each', '-o', bridged], 'c-entry-bridge')
         if large:
             proof = json.loads((root / 'host-proof.json').read_text())
             validate_large_value_proof(proof)
             validate_large_source_address(json.loads(ast.read_text()), proof)
+            local_contract = large_local_contract(proof)
+            (root / 'local-contract.json').write_text(json.dumps(local_contract, indent=2) + '\n')
         final_ir = dirs['ir'] / 'final.mlir'
         run([tools['cgra-opt'], bridged, '--adora-kernel-dfg-gen', '--verify-each',
              '-o', final_ir], 'dfg', cwd=dirs['dfg'])
@@ -616,8 +632,9 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
             cache_base = args.kernel_cache.resolve()
             if cache_base == root or root in cache_base.parents:
                 raise ValueError('kernel cache must be outside this compilation artifact directory')
-            key = hashlib.sha256(b'adora-large-kernel-cache-v2' + bridged.read_bytes() +
-                json.dumps({name: proof[name] for name in ('value_mode', 'range_lo', 'range_hi')}, sort_keys=True).encode() +
+            key = hashlib.sha256(b'adora-large-kernel-cache-v3' + bridged.read_bytes() +
+                json.dumps({name: proof[name] for name in ('value_mode', 'range_lo', 'range_hi',
+                           'packing_layout', 'local_roles')}, sort_keys=True).encode() +
                 json.dumps(provenance['tools'], sort_keys=True).encode() +
                 (root / 'adg.json').read_bytes() + (root / 'operations.json').read_bytes() +
                 (root / 'GeneralOpName.txt').read_bytes() +
@@ -647,9 +664,9 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         if not raw_python.is_file() or not configs or any(not config.stat().st_size for config in configs):
             raise ValueError('mapper did not produce Python and nonempty hardware configuration')
         if large:
-            proof = json.loads((root / 'host-proof.json').read_text())
-            validate_large_value_proof(proof)
-            proof['support_version'] = 3
+            if json.loads((root / 'host-proof.json').read_text()) != proof:
+                raise ValueError('large C entry: typed proof changed after lowering')
+            proof['support_version'] = 4
             proof['module_identity'] = hashlib.sha256(source_copy.read_bytes() +
                 normalized.read_bytes() + bridged.read_bytes() + raw_python.read_bytes() +
                 json.dumps(proof, sort_keys=True).encode() +

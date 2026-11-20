@@ -101,7 +101,7 @@ struct CanvasProof {
 class LowerCEntryPass : public LowerCEntryBase<LowerCEntryPass> {
   void runOnOperation() override;
   LogicalResult lower(func::FuncOp function, SmallVector<Object> &objects,
-                      bool provenRange = false);
+                      bool provenRange = false, bool sameSlot = false);
   LogicalResult lowerLarge(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root, const CanvasProof *canvas = nullptr);
   LogicalResult lowerCanvas(func::FuncOp function, SmallVector<Object> &objects, llvm::json::Object &root);
   LogicalResult emitCanvas(func::FuncOp function, int64_t rangeLo, int64_t rangeHi);
@@ -176,6 +176,8 @@ void LowerCEntryPass::runOnOperation() {
   // effects outside the declared kernel. This explicit profile is one entry.
   for (auto other : module.getOps<func::FuncOp>())
     if (other != function) return reject("only the selected C entry is supported");
+  if (!largeIndexed && (!largeObjects || canvasMask))
+    return reject("same-slot packing requires the guarded-inplace-large profile");
   if (canvasMask) {
     if (canvasVariant != "A" && canvasVariant != "B" && canvasVariant != "C" && canvasVariant != "D")
       return reject("unknown private canvas variant");
@@ -191,7 +193,7 @@ void LowerCEntryPass::runOnOperation() {
 }
 
 LogicalResult LowerCEntryPass::lower(func::FuncOp function,
-                                   SmallVector<Object> &objects, bool provenRange) {
+                                   SmallVector<Object> &objects, bool provenRange, bool sameSlot) {
   auto reject = [&](Operation *op, Twine message) -> LogicalResult {
     op->emitError("C-entry: ") << message;
     return failure();
@@ -444,7 +446,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   }
   if (outputs != 1) error(function, "requires exactly one write object");
   if (bad) return failure();
-  if (!conditionalStores.empty()) {
+  if (!conditionalStores.empty() && !sameSlot) {
     // provenRange is internal to the fresh function built by lowerLarge after
     // its exhaustive effect proof; no user IR attribute can enable this path.
     if (dynamicLoads.size() != 1 || (!provenRange && conditionalStores.front().getValue() != dynamicLoads.front().getResult()))
@@ -457,6 +459,9 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   // Comparison narrowing is exact only for sign extensions and representable
   // signed constants. Unsigned promoted comparisons and arbitrary i32 reject.
   for (auto cmp : comparisons) {
+    // The freshly constructed tile compares i16 zero < valid[iv] directly.
+    // Preserve that target SLT; it does not participate in an index proof.
+    if (sameSlot) continue;
     auto type = cmp.getLhs().getType();
     if (!type.isInteger(32) && !type.isInteger(16))
       return reject(cmp, "only signed i16 promotion comparisons are supported");
@@ -622,6 +627,16 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
       store.erase();
     }
   }
+  if (sameSlot) {
+    // Only lowerLarge constructs this private, fully initialized three-object
+    // tile after proving the original guarded global read and direct store.
+    auto store = conditionalStores.front();
+    auto branch = cast<scf::IfOp>(store->getParentOp());
+    builder.setInsertionPoint(branch);
+    builder.create<CondStoreOp>(store.getLoc(), store.getValue(), store.getMemref(),
+                                store.getIndices(), branch.getCondition());
+    branch.erase();
+  }
   if (auto old = dyn_cast<scf::ForOp>(loop)) {
     builder.setInsertionPoint(old);
     auto replacement = builder.create<affine::AffineForOp>(old.getLoc(), 0, trips);
@@ -633,6 +648,7 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   builder.setInsertionPoint(loop);
   auto kernel = builder.create<KernelOp>(function.getLoc());
   kernel.setKernelName(kernelName);
+  if (sameSlot) kernel->setAttr("adora.large_direct_same_slot", builder.getUnitAttr());
   builder.setInsertionPointToEnd(&kernel.getBody().front());
   auto terminator = builder.create<TerminatorOp>(function.getLoc());
   loop->moveBefore(terminator);

@@ -13,7 +13,7 @@ import types
 
 import numpy as np
 
-SUPPORT_VERSION = 3
+SUPPORT_VERSION = 4
 SCHEMA = 'adora.guarded-inplace-large.v1'
 # Conservative allocation limits; checked before any user-sized allocation.
 MAX_ELEMENTS = 16 * 1024 * 1024
@@ -77,7 +77,7 @@ def _validate_descriptor(value):
         raise ValueError('prepared entry: descriptor must be a compiler-produced object')
     result = dict(value)
     version = result.get('support_version')
-    if result.get('schema') != SCHEMA or type(version) is not int or version not in (2, SUPPORT_VERSION):
+    if result.get('schema') != SCHEMA or type(version) is not int or version not in (2, 3, SUPPORT_VERSION):
         raise ValueError('prepared entry: incompatible descriptor/support version')
     if not isinstance(result.get('module_identity'), str) or not re.fullmatch('[0-9a-f]{64}', result['module_identity']):
         raise ValueError('prepared entry: missing compiled module identity')
@@ -109,6 +109,19 @@ def _validate_descriptor(value):
                                         'enable_argument', 'destination_argument')]
     if any(type(role) is not int for role in roles) or sorted(roles) != list(range(5)):
         raise ValueError('prepared entry: object roles must identify all five arguments')
+    if version < 4:
+        if 'packing_layout' in result or 'local_roles' in result:
+            raise ValueError('prepared entry: legacy indexed descriptor cannot specify a local layout')
+    else:
+        layout = result.get('packing_layout')
+        expected = ['packed', 'idx', 'enable', 'old']
+        if layout == 'same-slot' and result['value_mode'] == 'direct':
+            expected = ['packed', 'enable', 'old']
+        elif layout != 'indexed':
+            raise ValueError('prepared entry: unsupported local layout for this value mode')
+        if result.get('local_roles') != expected:
+            raise ValueError('prepared entry: local role order contradicts the compiled layout')
+        result['local_roles'] = tuple(expected)
     return result
 
 
@@ -156,7 +169,9 @@ class _PreparedPlan:
         tiles = (items + _TILE - 1) // _TILE
         # Wide arithmetic before allocations. Worst-case ndarray payload uses
         # all queries active; Python headers and construction peaks are separate.
-        payload_bound = (22 * items + 12 * tiles * _TILE if preparation == 'window'
+        indexed = descriptor.get('packing_layout', 'indexed') == 'indexed'
+        row_bytes = 12 if indexed else 10
+        payload_bound = (22 * items + row_bytes * tiles * _TILE if preparation == 'window'
                          else 14 * items + tiles)
         if payload_bound > MAX_PLAN_BYTES or payload_bound > np.iinfo(np.intp).max:
             raise ValueError(f'prepared plan: immutable payload exceeds {MAX_PLAN_BYTES} byte resource bound')
@@ -192,9 +207,10 @@ class _PreparedPlan:
             # Retain the original preparation algorithm as an explicit fallback
             # and control; it does not use precomputed window slot metadata.
             self._offsets, self._active = _immutable(offsets), _immutable(active)
-            self._scratch = (np.zeros(_TILE, np.uint16), np.full(_TILE, -1, np.int16),
+            index_buffer = (np.full(_TILE, -1, np.int16),) if indexed else ()
+            self._scratch = (np.zeros(_TILE, np.uint16), *index_buffer,
                              np.zeros(_TILE, np.int16), np.zeros(_TILE, np.uint16))
-            self._positions = np.arange(_TILE, dtype=np.int16)
+            self._positions = np.arange(_TILE, dtype=np.int16) if indexed else None
             static_bytes = self._offsets.nbytes + self._active.nbytes
         else:
             windows = []
@@ -206,12 +222,14 @@ class _PreparedPlan:
                 local_offsets = offsets[output_indices]
                 valid_slots = local_offsets >= 0
                 valid_slots[-1, count:] = False
-                idx = np.where(valid_slots, np.arange(_TILE, dtype=np.int16), -1).astype(np.int16)
+                indices = ()
+                if indexed:
+                    indices = (np.where(valid_slots, np.arange(_TILE, dtype=np.int16), np.int16(-1)),)
                 enabled_slots = valid_slots.astype(np.int16)
                 positions = np.flatnonzero(valid_slots)
                 source_offsets = local_offsets.ravel()[positions]
                 windows.append((ranges, *(_immutable(a) for a in
-                    (idx, enabled_slots, positions, source_offsets, output_indices))))
+                    (*indices, enabled_slots, positions, source_offsets, output_indices))))
             self._windows = tuple(windows)
             self._offsets = self._active = self._positions = None
             self._scratch = (np.zeros((capacity, _TILE), np.uint16),
@@ -242,7 +260,10 @@ class _PreparedPlan:
     @property
     def descriptor(self):
         """Detached metadata, never a writable access/offset schema."""
-        return dict(self._descriptor)
+        result = dict(self._descriptor)
+        if 'local_roles' in result:
+            result['local_roles'] = list(result['local_roles'])
+        return result
 
     @property
     def stats(self):
@@ -326,7 +347,7 @@ class _PreparedPlan:
         probes = self._probes
         if self._preparation == 'window':
             packed, old = self._scratch
-            for ranges, idx, enabled, positions, offsets, outputs in self._windows:
+            for ranges, *indices, enabled, positions, offsets, outputs in self._windows:
                 if probes:
                     stamp = time.perf_counter_ns()
                 size = len(ranges)
@@ -342,9 +363,13 @@ class _PreparedPlan:
                 if probes:
                     times['pack'] += time.perf_counter_ns() - stamp
                 for row, (begin, end) in enumerate(ranges):
-                    yield begin, end, packed[row], idx[row], enabled[row], old[row]
+                    if indices:
+                        buffers = (packed[row], indices[0][row], enabled[row], old[row])
+                    else:
+                        buffers = (packed[row], enabled[row], old[row])
+                    yield begin, end, buffers
         else:
-            packed, idx, enabled, old = self._scratch
+            packed, *indices, enabled, old = self._scratch
             for tile_number, active in enumerate(self._active):
                 if not active:
                     continue
@@ -354,12 +379,14 @@ class _PreparedPlan:
                 if probes:
                     stamp = time.perf_counter_ns()
                 packed.fill(0)
-                idx.fill(-1)
                 enabled.fill(0)
                 old.fill(0)
                 offsets = self._offsets[begin:end]
                 valid = offsets >= 0
-                idx[:count][valid] = self._positions[:count][valid]
+                if indices:
+                    idx = indices[0]
+                    idx.fill(-1)
+                    idx[:count][valid] = self._positions[:count][valid]
                 enabled[:count] = valid
                 old[:count] = dst[begin:end]
                 if probes:
@@ -368,7 +395,7 @@ class _PreparedPlan:
                 packed[:count][valid] = src[offsets[valid]]
                 if probes:
                     times['pack'] += time.perf_counter_ns() - stamp
-                yield begin, end, packed, idx, enabled, old
+                yield begin, end, self._scratch
 
     async def execute(self, runtime, src, dst):
         """Borrow src/dst exclusively through completion; reject concurrent reuse.
@@ -402,7 +429,7 @@ class _PreparedPlan:
         failed_range = None
         in_flight = False
         try:
-            for begin, end, packed, idx, enabled, old_dst in self._prepared_tiles(src, dst, times):
+            for begin, end, buffers in self._prepared_tiles(src, dst, times):
                 count = end - begin
                 failed_range = (begin, end)
                 if probes:
@@ -413,10 +440,9 @@ class _PreparedPlan:
                 self._retained = (runtime, src, dst, self._stream)
                 _INFLIGHT_PLANS.add(self)
                 if self._owns_stream:
-                    await self._tile(runtime, packed, idx, enabled, old_dst,
-                                     _adora_stream=self._stream)
+                    await self._tile(runtime, *buffers, _adora_stream=self._stream)
                 else:
-                    await self._tile(runtime, packed, idx, enabled, old_dst)
+                    await self._tile(runtime, *buffers)
                 in_flight = False
                 _INFLIGHT_PLANS.discard(self)
                 if self._owns_stream:
@@ -429,7 +455,7 @@ class _PreparedPlan:
                     stamp = time.perf_counter_ns()
                 # Copy every real returned slot; loaded-value decisions and
                 # conditional stores belong exclusively to the device.
-                dst[begin:end] = old_dst[:count]
+                dst[begin:end] = buffers[-1][:count]
                 self._cursor += 1
                 if completed is not None:
                     completed.append((begin, end))

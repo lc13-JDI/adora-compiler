@@ -134,6 +134,24 @@ You can find the Polygeist repository here:
 
 ---
 
+## Large guarded in-place gathers
+
+Compile ordinary C with `adoracc.py --profile guarded-inplace-large` and the
+five-object contract. For a proved direct copy, the generated plan packs the
+pixel for each valid query into that query's local slot. The device reads the
+packed stream in order and conditionally writes the destination. A valid zero
+writes zero. An invalid coordinate or disabled query preserves its old output.
+
+The private direct kernel uploads three 512-byte buffers per active tile
+(packed pixels, geometric enable, old output) and reads back 512 bytes. The
+indexed ABI uploads a fourth 512-byte buffer. Empty tiles skip the call.
+On the pinned full CSTORE RTL, the 353-query direct example measured 2,048 B
+versus 1,536 B of application H2D per active block, including its 97-item tail.
+Configuration traffic is measured separately. Both window and per-tile
+preparation use the same public five-array interface.
+Nonzero and range predicates retain their indexed implementation. See the
+[ordinary C example and prepared-plan API](docs/development/guarded-inplace-large-c-entry.md).
+
 ## Optional full RTL simulation
 
 The default build uses LLVM/MLIR and runs the ordinary regression suite with
