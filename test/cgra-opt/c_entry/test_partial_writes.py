@@ -84,4 +84,31 @@ with tempfile.TemporaryDirectory() as directory:
     run(overlay.replace("ne, %11, %c0_i32", "sgt, %11, %c0_i32"), spec, "zero comparison")
     run(overlay.replace("memref.store %10,", "memref.store %0,"), spec, "loaded value")
     run(overlay.replace("%10 = memref.load %arg0[%9]", "%10 = memref.load %arg0[%9] {adora.no_access}"), spec, "attributes")
+    # The same split can put the immediate on either side. Re-reading a
+    # disjoint read-only stream slot may reuse its dominating value.
+    fork = """scf.if %12 {
+          %again = memref.load %arg2[%arg4] : memref<?xi16>
+          %two = arith.constant 2 : i16
+          %keep = arith.cmpi eq, %again, %two : i16
+          scf.if %keep {
+            memref.store %10, %arg3[%arg4] : memref<?xi16>
+          }
+        } else {
+          %color = arith.constant 41 : i16
+          memref.store %color, %arg3[%arg4] : memref<?xi16>
+        }"""
+    original = "scf.if %12 {\n          " + store + "\n        }"
+    pair = overlay.replace(original, fork).replace("nonzero_overlay", "mark_sample")
+    pair_spec = dict(spec, entry="mark_sample")
+    merged = run(pair, pair_spec)
+    assert merged.count("memref.store ") == 1 and merged.count("memref.load ") == 1
+    assert "arith.select" in merged and "41 : i16" in merged
+    run(pair.replace("} else {", "}\n        scf.if %12 {"), pair_spec, "mutually exclusive")
+    run(pair.replace("memref.store %color, %arg3[%arg4]", "memref.store %color, %arg3[%9]"),
+        pair_spec, "same iteration")
+    run(pair.replace("%color = ", "%prior = memref.load %arg3[%arg4] : memref<?xi16>\n          %color = "),
+        pair_spec, "reads")
+    run(pair.replace("%again = memref.load %arg2[%arg4]", "%again = memref.load %arg2[%arg4] {volatile}"),
+        pair_spec, "attributes")
+
 print("C-entry partial-write structural tests passed")

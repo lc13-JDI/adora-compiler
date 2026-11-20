@@ -92,6 +92,8 @@ static void refine(Value guard, Value leaf, Range &range,
   }
 }
 
+#include "LocalWriteRegion.inc"
+
 struct CanvasProof {
   unsigned oldArgument;
   SmallVector<unsigned> originalPositions;
@@ -333,6 +335,11 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
          attr.getName().strref() != "operandSegmentSizes"))
       return reject(loop, "unsupported stream loop attributes");
   if (trips > 4095) return reject(loop, "trip count exceeds the fixed stream counter capacity");
+  Value selectedData;
+  DenseSet<Operation *> regionOps;
+  if (allowPartialWrites && !largeObjects &&
+      failed(mergeExclusiveWrites(loop, iv, objects, selectedData, regionOps)))
+    return failure();
   DenseMap<Value, unsigned> positions;
   for (auto arg : function.getArguments()) positions[arg] = arg.getArgNumber();
   SmallVector<memref::LoadOp> dynamicLoads;
@@ -348,9 +355,9 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
              arith::AndIOp, arith::IndexCastOp, arith::AddIOp,
              arith::MulIOp, memref::LoadOp, memref::StoreOp,
              affine::AffineLoadOp, affine::AffineStoreOp>(op) &&
-        // Only the fresh canvas emitter introduces this signed nonzero OR.
-        // The original source stream profiles keep their existing whitelist.
-        !(provenRange && canvasMask && isa<arith::OrIOp>(op))) {
+        // Extra predicates are local to the freshly generated region or canvas.
+        !(provenRange && canvasMask && isa<arith::OrIOp>(op)) &&
+        !regionOps.contains(op)) {
       error(op, "unsupported effect or operation in static C stream"); return;
     }
     if (op->hasAttr("adora.no_access") || op->hasAttr("adora.require_no_access"))
@@ -449,7 +456,17 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
   if (!conditionalStores.empty() && !sameSlot) {
     // provenRange is internal to the fresh function built by lowerLarge after
     // its exhaustive effect proof; no user IR attribute can enable this path.
-    if (dynamicLoads.size() != 1 || (!provenRange && conditionalStores.front().getValue() != dynamicLoads.front().getResult()))
+    if (dynamicLoads.size() != 1)
+      return reject(function, "conditional output requires exactly one guarded source loaded value");
+    Value sample = dynamicLoads.front().getResult();
+    Value data = conditionalStores.front().getValue();
+    if (selectedData) {
+      auto select = cast<arith::SelectOp>(selectedData.getDefiningOp());
+      if (data != selectedData ||
+          !((select.getTrueValue() == sample && constant(select.getFalseValue())) ||
+            (select.getFalseValue() == sample && constant(select.getTrueValue()))))
+        return reject(function, "paired writes require a choice between the guarded sample and an i16 constant");
+    } else if (!provenRange && data != sample)
       return reject(function, "conditional output requires exactly one guarded source loaded value");
     const auto &source = objects[positions[dynamicLoads.front().getMemref()]];
     if (source.write || source.dtype != "uint16" || source.reads != 1)

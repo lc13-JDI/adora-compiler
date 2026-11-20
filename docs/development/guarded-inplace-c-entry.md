@@ -56,8 +56,13 @@ Use the existing contract schema with exactly one `inout` object:
 
 `inout` declares preservation of unwritten elements. It does not authorize
 arbitrary reads of `dst` in the C kernel. The IR bridge checks the actual effects:
-one destination, one conditional assignment to `dst[i]`, and no reads or feedback
-from that destination. The same local object connects its initializing
+one destination, at most one write to `dst[i]` per iteration, and no reads or
+feedback from that destination. Two assignments under opposite arms of the same
+structured fork can share one CSTORE when they select between a guarded sample
+and an i16 constant. The bridge may reuse a dominating read of the same
+read-only stream slot when the generated entry has checked the host arrays for
+overlap. See the [ordinary C example](../../README.md#guarded-writes-to-the-current-output-slot).
+The same local object connects its initializing
 `ADORA.BlockLoad`, kernel CSTORE, and final `ADORA.BlockStore`.
 
 With the selected ADORA build and cgeist on `PATH`, compile to a new directory
@@ -120,8 +125,8 @@ allocation; legal BaseAddr relocation remains part of normal emission.
 
 The bridge proves signed coordinate promotions and every address intermediate
 before narrowing. General int32 coordinates, unproven wide arithmetic, floating
-point, dynamic trip counts, carry reductions, scatter, duplicate destination
-writes, source/destination feedback, and multi-bank objects are outside this
+point, dynamic trip counts, carry reductions, scatter, overlapping write paths,
+source/destination feedback, and multi-bank objects are outside this
 profile. Target bank capacity and representable execution fields remain checked;
 a count no greater than 4095 is necessary but does not guarantee mapping.
 

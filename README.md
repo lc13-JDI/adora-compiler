@@ -134,6 +134,48 @@ You can find the Polygeist repository here:
 
 ---
 
+## Guarded writes to the current output slot
+
+The `guarded-inplace` profile accepts a fixed-trip loop with two exclusive
+assignments to the same `dst[i]`. This example uses the four-object
+[`overlay.json` contract](docs/development/guarded-inplace-c-entry.md)
+with initialized `uint16` source and destination arrays and signed 16-bit
+index and mode arrays.
+
+```c
+void overlay(const unsigned short *src, const short *idx,
+             const short *mode, unsigned short *dst) {
+  for (int i = 0; i < M; ++i) {
+    int j = idx[i];
+    if (mode[i] != 0 && j >= 0 && j < N) {
+      unsigned short pixel = src[j];
+      if (pixel == 0)
+        dst[i] = 7;
+      else if (mode[i] == 2)
+        dst[i] = pixel;
+    }
+  }
+}
+```
+
+With the ADORA tools and `cgeist` on `PATH`, compile from the repository root.
+
+```bash
+run=$(mktemp -d)
+hw=test/spec/cgra_cstore_vitra/artifacts
+export GeneralOpNameFile="$PWD/lib/DFG/Documents/GeneralOpName.txt"
+build/bin/adoracc.py overlay.c --profile guarded-inplace --contract overlay.json \
+  --adg-path "$hw/adg.json" --op-file "$hw/operations.json" \
+  --seed 7 --max-iters 1000 --timeout 120000 --work-dir "$run" -o "$run/mapped.py"
+```
+
+Call `await mapped.overlay(runtime, src, idx, mode, dst)`. The generated entry
+checks all buffer ranges for overlap before creating the device stream. The
+device reads a safe source address on every slot and computes both the data
+and enable for one conditional store. When neither arm writes, the initialized
+destination retains its old value. Two independent conditionals that can both
+write in one iteration fail the mutual-exclusion check.
+
 ## Large guarded in-place gathers
 
 Compile ordinary C with `adoracc.py --profile guarded-inplace-large` and the
