@@ -428,6 +428,20 @@ def LocalMemAllocOp : ADORA_Op<"LocalMemAlloc", []>{
 // Conditional Store
 //===----------------------------------------------------------------------===//
 
+def ADORA_PrefixCountOp : ADORA_Op<"prefix_count", [NoMemoryEffect]> {
+  let summary = "inclusive count of negative mode samples in one eight-slot invocation";
+  let description = [{
+    Starts at zero on entry to the enclosing 0..8 kernel loop. At slot i,
+    returns the number of true predicates in slots 0 through i inclusive.
+    This ordered operation consumes one signed mode comparison per slot; its
+    private feedback does not access the input or output memory objects.
+  }];
+  let arguments = (ins I1:$negative);
+  let results = (outs I16:$count);
+  let hasVerifier = 1;
+  let assemblyFormat = "$negative attr-dict";
+}
+
 def ADORA_CondStoreOp : ADORA_Op<"cond_store", [
     TypesMatchWith<"type of 'value' matches element type of 'memref'",
                    "memref", "value",

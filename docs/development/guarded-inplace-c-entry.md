@@ -94,6 +94,33 @@ destination storage. Initialization cannot be inferred from arbitrary host
 memory and remains a caller requirement. Changing dimensions requires a new
 compilation.
 
+### Single break before a guarded copy
+
+For four disjoint eight-element objects, the ordinary C entry also accepts
+`if (mode[i] < 0) break` before the guarded copy. The source check requires
+one exit before the only assignment. The original C goes to cgeist. The IR
+bridge follows the loop-carried boolean, proves its initial true value and
+absorbing false path, and ties its signed comparison to the same mode slot
+used by the write guard. The bound, step, index checks, source read, slot of
+the store and unchanged destination binding are all checked in SSA.
+
+`ADORA.prefix_count` counts negative samples through the current slot. The
+count is in [0, 8]. An ACC with zero initial value and eight updates implements
+the count. Its result enables the existing write guard while the count is
+zero. The emitter checks the counter configuration and the path from the
+signed mode input through the predicate to the sequential CSTORE. Index
+accumulators and independent final-sample reductions retain their own timing
+checks. Every invocation transfers the original four arrays, executes all
+eight slots, waits and reads back the full destination. At the last slot the
+counter feedback returns to its initial value for the next invocation.
+
+A zero mode permits later slots to write. The first negative mode suppresses
+its own write and all following writes, including writes that would reproduce
+an old value. Safe source reads may still occur in those slots. The contract
+requires initialized ordinary memory. Writes before the exit, multiple exits,
+observable reads and data-dependent loop bounds are outside this subset.
+The root README has a [complete C and contract example](../../README.md#an-eight-slot-loop-with-a-break-before-the-write).
+
 The supported subset is a fixed positive zero-based unit-stride loop, a single
 dynamic read-only source, sequential coordinate/mask inputs, and one conditional
 destination element per iteration. Flattened two-dimensional coordinates retain

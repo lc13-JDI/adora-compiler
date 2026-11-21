@@ -291,6 +291,7 @@ def run_case(case, workdir, mapper, adg_source, operations_source, kernel):
 def run_dfg_contract_tests(mapper, operations):
     unit = mapper.with_name("cstore-dfg-contract-test")
     expected = {
+        "bounded-break-prefix": (0, ()),
         "sequential-record-valid": (0, ()),
         "sequential-record-sparse": (0, ()),
         "sequential-record-sparse-reordered": (0, ()),

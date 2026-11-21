@@ -176,6 +176,45 @@ and enable for one conditional store. When neither arm writes, the initialized
 destination retains its old value. Two independent conditionals that can both
 write in one iteration fail the mutual-exclusion check.
 
+### An eight-slot loop with a break before the write
+
+The same profile can stop writing at the first negative signed mode. The
+device receives the original four arrays. For example, from the repository
+root with `cgeist` and the matching Clang on `PATH`:
+
+```bash
+run=$(mktemp -d)
+cat > "$run/paint.c" <<'C'
+void paint(const unsigned short *src, const short *idx,
+           const short *mode, unsigned short *dst) {
+  for (int i = 0; i < 8; ++i) {
+    int j = idx[i];
+    if (mode[i] < 0) break;
+    if (mode[i] != 0 && j >= 0 && j < 8)
+      dst[i] = src[j];
+  }
+}
+C
+cat > "$run/contract.json" <<'JSON'
+{"entry":"paint","objects":[
+  {"argument_position":0,"elements":8,"host_dtype":"uint16","access_assertion":"read","contiguous":true},
+  {"argument_position":1,"elements":8,"host_dtype":"int16","access_assertion":"read","contiguous":true},
+  {"argument_position":2,"elements":8,"host_dtype":"int16","access_assertion":"read","contiguous":true},
+  {"argument_position":3,"elements":8,"host_dtype":"uint16","access_assertion":"inout","contiguous":true}
+]}
+JSON
+hw="$PWD/test/spec/cgra_cstore_vitra/artifacts"
+export GeneralOpNameFile="$PWD/lib/DFG/Documents/GeneralOpName.txt"
+build/bin/adoracc.py "$run/paint.c" --profile guarded-inplace --contract "$run/contract.json" \
+  --adg-path "$hw/adg.json" --op-file "$hw/operations.json" \
+  --seed 7 --max-iters 100 --timeout 30000 --work-dir "$run" -o "$run/mapped.py"
+```
+
+Call `await mapped.paint(runtime, src, idx, mode, dst)` with four distinct,
+initialized eight-element arrays. A zero mode skips one slot. A negative mode
+preserves that slot and the rest of `dst`. Each invocation starts at slot
+zero. The kernel still issues eight in-bounds source reads.
+
 ## Large guarded in-place gathers
 
 Compile ordinary C with `adoracc.py --profile guarded-inplace-large` and the

@@ -48,6 +48,8 @@ public:
     std::set<int> getInNodes();
     // Out nodes: OUTPUT/STORE/CSTORE node
     std::set<int> getOutNodes();
+    // Recognize the inclusive first-negative prefix on a bounded i16 stream.
+    DFGNode *boundedBreakPrefixAcc();
 
     // DFG nodes in topological order
     const std::vector<int>& topoNodes(){ return _topoNodes; }

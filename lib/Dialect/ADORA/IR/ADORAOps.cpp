@@ -1,6 +1,7 @@
 //===- ADORAOps.cpp - Operations of the ADORA dialect -------------------------===//
 //===----------------------------------------------------------------------===//
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 // #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 // #include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
@@ -54,6 +55,24 @@ static void printStrides(OpAsmPrinter &p, const llvm::ArrayRef<int64_t> strides)
 //===----------------------------------------------------------------------===//
 // CondStoreOp
 //===----------------------------------------------------------------------===//
+
+LogicalResult PrefixCountOp::verify() {
+  auto loop = dyn_cast_or_null<AffineForOp>((*this)->getParentOp());
+  if (!loop || !isa<KernelOp>(loop->getParentOp()) || loop.getNumResults() ||
+      !loop.hasConstantBounds() || loop.getConstantLowerBound() != 0 ||
+      loop.getConstantUpperBound() != 8 || !loop.getStep().isOne())
+    return emitOpError("requires a direct eight-slot kernel loop with zero start and unit step");
+  auto negative = getNegative().getDefiningOp<arith::CmpIOp>();
+  if (!negative || negative.getPredicate() != arith::CmpIPredicate::slt ||
+      !matchPattern(negative.getRhs(), m_Zero()))
+    return emitOpError("requires a signed mode < 0 predicate");
+  auto mode = negative.getLhs().getDefiningOp<AffineLoadOp>();
+  if (!mode || mode->getParentOp() != loop || !mode.getAffineMap().isIdentity() ||
+      mode.getMapOperands().size() != 1 || mode.getMapOperands()[0] != loop.getInductionVar() ||
+      !mode.getType().isInteger(16) || mode.getMemRefType().getShape() != ArrayRef<int64_t>{8})
+    return emitOpError("requires a sequential i16 mode read from the current slot");
+  return success();
+}
 
 LogicalResult CondStoreOp::verify() {
   auto memrefType = cast<MemRefType>(getMemref().getType());

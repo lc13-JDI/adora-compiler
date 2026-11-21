@@ -27,6 +27,79 @@ void addEdge(LLVMCDFG &cdfg, LLVMCDFGNode *source, LLVMCDFGNode *destination,
   cdfg.addEdge(source, destination, type);
 }
 
+// Exercise the post-ingest graph, including logical ports after immediates
+// were folded and transparent PASS nodes inserted by routing.
+bool recognizesPrefix(const std::string &variant) {
+  DFG graph;
+  graph.setId(0);
+  int nodeId = 0, edgeId = 0;
+  auto node = [&](DFGNode *n, const char *op) {
+    n->setId(++nodeId);
+    n->setOperation(op);
+    graph.addNode(n);
+    return n;
+  };
+  auto edge = [&](DFGNode *src, DFGNode *dst, int port) {
+    auto *e = new DFGEdge(++edgeId);
+    e->setEdge(src->id(), 0, dst->id(), port);
+    graph.addEdge(e);
+  };
+  auto io = [&](const char *op, const char *object, int stride) {
+    auto *n = new DFGIONode;
+    node(n, op);
+    graph.addIONode(n->id());
+    n->setMemSize(16);
+    n->setMemRefName(object);
+    n->addPatternLevel(stride, 8);
+    return n;
+  };
+  auto binary = [&](const char *op, DFGNode *lhs, DFGNode *rhs) {
+    auto *n = node(new DFGNode, op);
+    edge(lhs, n, 0);
+    edge(rhs, n, 1);
+    return n;
+  };
+  auto immediate = [&](const char *op, DFGNode *source, int constPort, int value) {
+    auto *n = node(new DFGNode, op);
+    edge(source, n, 1 - constPort);
+    n->setImmIdx(constPort);
+    n->setImm(value);
+    return n;
+  };
+  auto *mode = io("INPUT", "z", 2), *idx = io("INPUT", "y", 2);
+  auto *load = io("LOAD", "x", variant == "load-stride" ? 2 : 0);
+  auto *store = io("CSTORE", variant == "same-object" ? "x" : "w", 2);
+  if (variant != "explicit-store") store->setSequentialCStore(8, store->memRefName());
+  auto *negative = immediate("SLT", mode, 1, 0);
+  auto *nonzero = binary("OR", immediate("SLT", mode, 0, 0), negative);
+  auto *lower = immediate("SLE", idx, 0, 0);
+  auto *upper = immediate("SLT", idx, 1, variant == "bad-bound" ? 9 : 8);
+  auto *guard = binary("AND", upper, binary("AND", nonzero, lower));
+  auto *select = node(new DFGNode, "SEL");
+  select->setImmIdx(0);
+  select->setImm(variant == "unsafe-fallback" ? 8 : 0);
+  edge(idx, select, 1);
+  edge(variant == "unsafe-load" ? nonzero : guard, select, 2);
+  edge(immediate("MUL", select, 0, 2), load, 0);
+  auto *acc = node(new DFGNode, "ACC");
+  acc->setAccumulative(true);
+  acc->setInitVal(0);
+  acc->setInterval(1);
+  acc->setCycles(variant == "short-count" ? 7 : 8);
+  acc->setRepeats(1);
+  acc->setIsAccFirst(variant != "exclusive");
+  if (variant == "index-acc") acc->setLoopIndexAcc();
+  auto *sign = variant == "wrong-mode" ? immediate("SLT", idx, 1, 0) : negative;
+  edge(variant == "wrong-sign" ? immediate("SLT", mode, 0, 0) : sign, acc, 0);
+  auto *alive = immediate("SLE", acc, 1, variant == "late-stop" ? 1 : 0);
+  auto *gate = binary("AND", alive, guard);
+  auto *pass = node(new DFGNode, "PASS");
+  edge(variant == "missing-prefix" ? guard : gate, pass, 0);
+  edge(pass, store, 2);
+  edge(variant == "other-payload" ? mode : load, store, 0);
+  return graph.boundedBreakPrefixAcc() == acc;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -36,6 +109,19 @@ int main(int argc, char **argv) {
   }
 
   const std::string testCase = argv[1];
+  if (testCase == "bounded-break-prefix") {
+    Operations::Instance(argv[2]);
+    for (const char *variant : {"valid", "short-count", "exclusive", "index-acc",
+                                "late-stop", "missing-prefix", "wrong-mode", "wrong-sign",
+                                "unsafe-load", "unsafe-fallback", "bad-bound", "load-stride",
+                                "same-object", "explicit-store", "other-payload"}) {
+      if (recognizesPrefix(variant) != (std::string(variant) == "valid")) {
+        std::cerr << "unexpected break-prefix classification for " << variant << "\n";
+        return 1;
+      }
+    }
+    return 0;
+  }
   if (testCase == "json" && argc == 4) {
     Operations::Instance(argv[2]);
     DFGIR dfg(argv[3]);

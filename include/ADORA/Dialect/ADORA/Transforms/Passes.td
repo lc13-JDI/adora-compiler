@@ -26,6 +26,8 @@ def LowerCEntry : Pass<"adora-lower-c-entry", "ModuleOp"> {
     Option<"bankBytes", "bank-bytes", "int64_t", "8192", "Target scratchpad bank capacity in bytes">,
     Option<"allowPartialWrites", "allow-partial-writes", "bool", "false",
            "Allow a guarded same-iteration store to an initialized inout object">,
+    Option<"requirePrefixExit", "require-prefix-exit", "bool", "false",
+           "Require the source break to be represented by a proven loop-carried exit">,
     Option<"largeObjects", "large-objects", "bool", "false", "Prove a host-wide gather and emit its fixed 256-word local kernel">,
     Option<"largeIndexed", "large-indexed", "bool", "true", "Use the legacy indexed ABI unless a compiler-owned same-slot packer is available for the proven large direct entry">,
     Option<"canvasMask", "canvas-mask", "bool", "false", "Prove two private-canvas loops and emit mask kernels">,

@@ -93,6 +93,7 @@ static void refine(Value guard, Value leaf, Range &range,
 }
 
 #include "LocalWriteRegion.inc"
+#include "PrefixExitRegion.inc"
 
 struct CanvasProof {
   unsigned oldArgument;
@@ -180,6 +181,8 @@ void LowerCEntryPass::runOnOperation() {
     if (other != function) return reject("only the selected C entry is supported");
   if (!largeIndexed && (!largeObjects || canvasMask))
     return reject("same-slot packing requires the guarded-inplace-large profile");
+  if (requirePrefixExit && (!allowPartialWrites || largeObjects || canvasMask))
+    return reject("prefix exit requires the guarded-inplace profile");
   if (canvasMask) {
     if (canvasVariant != "A" && canvasVariant != "B" && canvasVariant != "C" && canvasVariant != "D")
       return reject("unknown private canvas variant");
@@ -257,6 +260,16 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
       builder.create<memref::StoreOp>(op->getLoc(), store.getValue(), store.getMemRef(), ValueRange{index});
     }
     op->erase();
+  }
+  Value prefixMode;
+  if (allowPartialWrites && !largeObjects) {
+    SmallVector<scf::ForOp> carried;
+    for (auto loop : function.front().getOps<scf::ForOp>())
+      if (loop.getNumResults()) carried.push_back(loop);
+    if (carried.size() > 1 || (requirePrefixExit && carried.empty()))
+      return reject(function, "prefix exit requires exactly one loop-carried active bit");
+    if (!carried.empty() && failed(normalizePrefixExit(carried.front(), objects, prefixMode)))
+      return failure();
   }
   bool hasLoop = false;
   function.walk([&](Operation *op) { hasLoop |= isa<scf::ForOp, affine::AffineForOp>(op); });
@@ -633,6 +646,18 @@ LogicalResult LowerCEntryPass::lower(func::FuncOp function,
     transfer->setAttr("adora.host_dtype", builder.getStringAttr(object.dtype));
     local.push_back(transfer->getResult(0));
     arg.replaceUsesWithIf(local.back(), [&](OpOperand &use) { return loop->isAncestor(use.getOwner()); });
+  }
+  if (prefixMode) {
+    builder.setInsertionPointAfter(prefixMode.getDefiningOp());
+    Location loc = prefixMode.getLoc();
+    Value zero = builder.create<arith::ConstantIntOp>(loc, 0, 16);
+    Value negative = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, prefixMode, zero);
+    Value count = builder.create<PrefixCountOp>(loc, builder.getI16Type(), negative);
+    Value alive = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle, count, zero);
+    auto store = conditionalStores.front();
+    builder.setInsertionPoint(store);
+    auto write = builder.create<scf::IfOp>(store.getLoc(), alive, false);
+    store->moveBefore(write.thenYield());
   }
   for (Operation *op : linearMemory) {
     builder.setInsertionPoint(op);

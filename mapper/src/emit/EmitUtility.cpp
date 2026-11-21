@@ -446,7 +446,9 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
 
   std::map<int, dfgIoInfo> dfg_io_infos;
   BYTES_LIST iob_ens((adg->numIobNodes()+7)/8);
-  const bool checkedMemoryIO = std::any_of(dfg->ioNodes().begin(), dfg->ioNodes().end(),
+  unsigned prefixOps = 0;
+  kernel.walk([&](ADORA::PrefixCountOp) { ++prefixOps; });
+  const bool checkedMemoryIO = prefixOps || std::any_of(dfg->ioNodes().begin(), dfg->ioNodes().end(),
       [&](int id) {
         auto *io = dynamic_cast<DFGIONode *>(dfg->node(id));
         return io && (io->operation() == "LOAD" || io->isSequentialCStore());
@@ -471,6 +473,11 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
   int indexCycles = 0, indexCount = 0;
   std::vector<int> liveIndexAccs;
   if (checkedMemoryIO) {
+    auto *prefixAcc = dfg->boundedBreakPrefixAcc();
+    if (prefixOps && (prefixOps != 1 || !prefixAcc)) {
+      reject(0, "prefix count requires one eight-slot signed break prefix gating the sequential CSTORE");
+      return mlir::failure();
+    }
     for (auto entry : dfg->nodes()) {
       auto *node = entry.second;
       if (!node->accumulative()) continue;
@@ -490,20 +497,26 @@ mlir::LogicalResult BaseEmitter::DataBlockOperationsToSPADInfo(ADORA::KernelOp& 
           reject(entry.first, "conditional stream requires representable index-ACC timing");
         continue;
       }
-      ++reductionCount;
       int64_t wi = int64_t(node->interval()) * mapper->_mapping->II();
       int64_t lat = mapper->_mapping->dfgNodeAttr(entry.first).lat - node->opLatency();
       if (node->operation() != "ACC" || node->initVal() != 0 ||
           node->interval() != 1 || node->repeats() != 1 ||
           !node->isAccFirst() || node->cycles() <= 0 ||
-          (reductionCycles && reductionCycles != node->cycles()) ||
           !fitsField(pe, "WI", wi) || !fitsField(pe, "Cycles", node->cycles()) ||
           !fitsField(pe, "Latency", lat) || !fitsField(pe, "Repeats", 1) ||
           !fitsField(pe, "InitVal", 0) || !fitsField(pe, "SkipFirst", 0))
         reject(entry.first, "bounded loop requires representable independent zero-initialized ACC timing");
+      // An inclusive prefix drives a same-slot predicate on every cycle.
+      // The CSTORE uses ordinary stream timing, including its old-dst H2D.
+      if (node == prefixAcc) continue;
+      ++reductionCount;
+      if (reductionCycles && reductionCycles != node->cycles())
+        reject(entry.first, "bounded reductions require the same cycle count");
       reductionCycles = node->cycles();
     }
-    if (reductionCount && (reductionCount != 2 || dfg->ioNodes().size() != 5))
+    if (reductionCount == 1 && dfg->ioNodes().size() == 4)
+      reject(0, "single stream ACC requires an eight-slot signed break prefix gating the sequential CSTORE");
+    else if (reductionCount && (reductionCount != 2 || dfg->ioNodes().size() != 5))
       reject(0, "bounded loop requires two ACCs and five fixed I/O roles");
   }
   // Fixed stream roles are separate from final-sample reductions. Infer the

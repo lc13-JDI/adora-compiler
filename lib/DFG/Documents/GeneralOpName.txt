@@ -64,6 +64,7 @@ arith.subf FSUB
 ADORA.merge MERGE
 ADORA.interleaver INTLV
 ADORA.deinterleaver DEINTLV
+ADORA.prefix_count ACC
 
 /// Load Store
 ADORA.cond_store CSTORE

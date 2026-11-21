@@ -160,6 +160,36 @@ class CheckedEntry(unittest.TestCase):
                 self.module.validate_hardware(bad_adg, bad_ops, contract())
 
     @unittest.skipUnless(shutil.which('clang'), 'semantic source checks need clang')
+    def test_guarded_prefix_exit(self):
+        guard = 'if (f[k] < 0) break;'
+        copy = 'if (f[k] != 0 && j >= 0 && j < 8) d[k] = a[j];'
+        preamble = 'void mark(const unsigned short *a, const short *x, const short *f, unsigned short *d)'
+        spec = {'entry': 'mark', 'objects': [
+            dict(argument_position=i, elements=8, host_dtype=t, access_assertion=e)
+            for i, (t, e) in enumerate([
+                ('uint16', 'read'), ('int16', 'read'), ('int16', 'read'), ('uint16', 'inout')])]}
+        def check(body, allow=True, condition='k<8'):
+            source = preamble + ' { for (int k=0; ' + condition + '; ++k) { int j=x[k]; ' + body + ' } }'
+            raw = subprocess.run(['clang', '-x', 'c', '-std=c11', '-target', self.module.TARGET,
+                                  '-Xclang', '-ast-dump=json', '-fsyntax-only', '-'], input=source,
+                                 text=True, capture_output=True, check=True)
+            return self.module.validate_source_ast(json.loads(raw.stdout), spec, allow_prefix_exit=allow)
+        self.assertTrue(check(guard + copy))
+        self.assertFalse(check(copy))
+        for body in [copy + guard, guard + guard + copy, 'd[k]=1;' + guard + copy,
+                     guard.replace('<', '==') + copy, guard + copy + 'd[k]=2;',
+                     guard + 'if (f[k] == 7) return;' + copy,
+                     'int unused=a[99];' + guard + copy, 'int unused=x[99];' + guard + copy,
+                     'int unused=d[k];' + guard + copy,
+                     guard + copy.replace('d[k] = a[j];', '{int unused=d[k]; d[k] = a[j];}')]:
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                check(body)
+        with self.assertRaises(ValueError):
+            check(guard + copy, allow=False)
+        with self.assertRaises(ValueError):
+            check(guard + copy, condition='(x[k], k<8)')
+
+    @unittest.skipUnless(shutil.which('clang'), 'semantic source checks need clang')
     def test_semantic_source_qualifiers_and_types(self):
         source = ('void renamed_entry(const unsigned short *src, const short *idx, '
                   'unsigned short *dst) { for (int i=0;i<4;++i) dst[i]=src[0]; }')

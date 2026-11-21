@@ -254,8 +254,105 @@ def _walk(node):
         yield from _walk(child)
 
 
+def _validate_prefix_exit(function, breaks, params, objects):
+    """Check source exit ordering even if cgeist would optimize away an effect."""
+    loops = [node for node in _walk(function) if node.get('kind') == 'ForStmt']
+    if len(breaks) != 1 or len(loops) != 1:
+        raise ValueError('prefix exit requires a single break in one for loop')
+    loop = loops[0]
+    entry_body = next(n for n in function['inner'] if n.get('kind') == 'CompoundStmt')
+    entry_statements = entry_body.get('inner', [])
+    if entry_statements and entry_statements[-1].get('kind') == 'ReturnStmt' and not entry_statements[-1].get('inner'):
+        entry_statements = entry_statements[:-1]
+    if len(entry_statements) != 1 or entry_statements[0] is not loop:
+        raise ValueError('prefix exit requires a single outermost loop')
+    init = loop['inner'][0].get('inner', [])
+    if len(init) != 1 or init[0].get('kind') != 'VarDecl':
+        raise ValueError('prefix exit requires a local induction variable')
+    iv = init[0]['id']
+    body = loop['inner'][-1]
+    if any(n.get('kind') == 'ArraySubscriptExpr' for header in loop['inner'][:-1]
+           for n in _walk(header)):
+        # The terminating loop test runs once with iv == 8.
+        raise ValueError('prefix exit requires memory-free loop bounds and increment')
+    statements = body.get('inner', [])
+    if body.get('kind') != 'CompoundStmt' or len(statements) < 2:
+        raise ValueError('prefix exit must precede a guarded write')
+
+    # Only plain declarations/reads may precede the break test. The bridge
+    # proves the actual read objects, loop index, mode and guarded copy in SSA.
+    pure_nodes = {'DeclStmt', 'VarDecl', 'ImplicitCastExpr', 'ParenExpr',
+                  'ArraySubscriptExpr', 'DeclRefExpr', 'IntegerLiteral'}
+    for statement in statements[:-2]:
+        if (statement.get('kind') != 'DeclStmt' or
+                any(n.get('kind') not in pure_nodes for n in _walk(statement))):
+            raise ValueError('prefix exit must dominate every write and other effect')
+    exit_if, copy_if = statements[-2:]
+    parts = exit_if.get('inner', [])
+    if exit_if.get('kind') != 'IfStmt' or len(parts) != 2 or copy_if.get('kind') != 'IfStmt':
+        raise ValueError('prefix exit must precede a guarded write')
+
+    def strip(node, wrappers):
+        while node.get('kind') in wrappers and len(node.get('inner', [])) == 1:
+            node = node['inner'][0]
+        return node
+
+    condition = strip(parts[0], {'ParenExpr'})
+    operands = condition.get('inner', [])
+    if strip(parts[1], {'CompoundStmt'}) is not breaks[0]:
+        raise ValueError('prefix exit must precede the guarded write')
+    if (condition.get('kind') != 'BinaryOperator' or
+            condition.get('opcode') not in ('<', '>') or len(operands) != 2):
+        raise ValueError('prefix exit requires a signed negative-slot test')
+    value, zero = operands if condition['opcode'] == '<' else reversed(operands)
+    if (strip(value, {'ImplicitCastExpr', 'ParenExpr'}).get('kind') != 'ArraySubscriptExpr' or
+            strip(zero, {'ParenExpr'}).get('kind') != 'IntegerLiteral' or
+            strip(zero, {'ParenExpr'}).get('value') != '0'):
+        raise ValueError('prefix exit requires a signed negative-slot test')
+    writes = []
+    for node in _walk(copy_if):
+        kind = node.get('kind')
+        if kind == 'BinaryOperator' and node.get('opcode') in ('=', '&&', '!=', '<', '>', '<=', '>='):
+            if node['opcode'] == '=':
+                writes.append(node)
+        elif kind not in pure_nodes | {'IfStmt', 'CompoundStmt'}:
+            raise ValueError('prefix exit requires a single guarded copy with no other effects')
+    if len(writes) != 1:
+        raise ValueError('prefix exit requires a single guarded copy')
+
+    # Optimized SSA can erase an unused C read. Check all source subscripts:
+    # signed streams use this loop's IV, the only uint16 source access occurs
+    # in the copy's true arm, and the inout occurrence is the assignment LHS.
+    def base(node):
+        return strip(node, {'ImplicitCastExpr', 'ParenExpr'})
+    def declaration(node):
+        return base(node).get('referencedDecl', {}).get('id')
+    roles = {param['id']: obj for param, obj in zip(params, objects)}
+    copy_parts = copy_if.get('inner', [])
+    if len(copy_parts) != 2:
+        raise ValueError('prefix exit requires a single true-arm copy')
+    true_arm = {id(n) for n in _walk(copy_parts[1])}
+    destination = base(writes[0]['inner'][0])
+    sources = 0
+    for subscript in (n for n in _walk(body) if n.get('kind') == 'ArraySubscriptExpr'):
+        obj, index = subscript['inner']
+        role = roles.get(declaration(obj), {})
+        if role.get('host_dtype') == 'int16' and role['access_assertion'] == 'read':
+            if declaration(index) != iv:
+                raise ValueError('prefix exit requires signed streams to use the current slot')
+        elif role.get('host_dtype') == 'uint16' and role['access_assertion'] == 'read':
+            if id(subscript) not in true_arm:
+                raise ValueError('prefix exit requires the uint16 source read inside the guarded copy')
+            sources += 1
+        elif (role.get('access_assertion') != 'inout' or subscript is not destination or
+              declaration(index) != iv):
+            raise ValueError('prefix exit permits only the same-slot assignment to the inout object')
+    if sources != 1 or destination.get('kind') != 'ArraySubscriptExpr':
+        raise ValueError('prefix exit requires exactly one guarded source read and destination write')
+
+
 def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False,
-                        allow_canvas: bool = False) -> None:
+                        allow_canvas: bool = False, allow_prefix_exit: bool = False) -> bool:
     """Check source properties lost by optimized MLIR, using Clang semantic AST."""
     # Clang JSON desugars scalar typedefs but may spell a pointer's pointee with
     # its typedef name. Resolve those names through actual TypedefDecl nodes.
@@ -320,6 +417,7 @@ def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False,
                             if node.get('kind') == 'VarDecl']
             if len(declarations) != 1 or source_type(declarations[0]) != 'int':
                 raise ValueError('large C entry requires a signed 32-bit source induction variable')
+    breaks = []
     for node in _walk(function):
         kind = node.get('kind', '')
         spelling = source_type(node)
@@ -327,9 +425,14 @@ def validate_source_ast(ast: dict, contract: dict, *, allow_large: bool = False,
             raise ValueError('volatile, atomic and address-space/MMIO accesses are unsupported')
         if kind.endswith('Attr'):
             raise ValueError('source attributes (including strong no-access annotations) are unsupported')
-        if kind in {'CallExpr', 'AtomicExpr', 'GCCAsmStmt', 'MSAsmStmt', 'BreakStmt',
+        if kind == 'BreakStmt' and allow_prefix_exit:
+            breaks.append(node)
+        elif kind in {'CallExpr', 'AtomicExpr', 'GCCAsmStmt', 'MSAsmStmt', 'BreakStmt',
                     'ContinueStmt', 'GotoStmt', 'IndirectGotoStmt', 'WhileStmt', 'DoStmt'}:
             raise ValueError(f'unsupported source construct: {kind}')
+    if breaks:
+        _validate_prefix_exit(function, breaks, params, contract['objects'])
+    return bool(breaks)
 
 
 def _sha256(path: Path) -> str:
@@ -577,7 +680,8 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         run([tools['clang'], '-x', 'c', '-std=c11', '-target', TARGET,
              '-Xclang', '-ast-dump=json', '-fsyntax-only', preprocessed],
             'source-ast', stdout=ast)
-        validate_source_ast(json.loads(ast.read_text()), contract, allow_large=large)
+        has_exit = validate_source_ast(json.loads(ast.read_text()), contract, allow_large=large,
+                                       allow_prefix_exit=(args.profile == 'guarded-inplace'))
         frontend_input = preprocessed
         if large:
             normalized_source, edits = normalize_unsigned_promotions(json.loads(ast.read_text()), preprocessed.read_text())
@@ -608,6 +712,7 @@ def run_profile(args, require_tool, require_local, strip_module_attrs) -> int:
         run([tools['cgra-opt'], bridge_input,
              f'--adora-lower-c-entry=contract={normalized} bank-bytes={bank}' +
              (' allow-partial-writes=true' if partial else '') +
+             (' require-prefix-exit=true' if has_exit else '') +
              (f' large-objects=true large-indexed=false descriptor={root / "host-proof.json"}' if large else ''),
              '--verify-each', '-o', bridged], 'c-entry-bridge')
         if large:

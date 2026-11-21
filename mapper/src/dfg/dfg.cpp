@@ -135,6 +135,123 @@ std::set<int> DFG::getOutNodes(){
     return outNodes;
 }
 
+namespace {
+// A routing PASS preserves its operand. A PASS materializing an immediate
+// does not. Read logical DFG operands, independently of physical GPE ports.
+DFGNode *operand(DFG &dfg, DFGNode *node, int port) {
+    std::set<int> visited;
+    while (node && visited.insert(node->id()).second) {
+        auto input = node->inputEdges().find(port);
+        if (input == node->inputEdges().end()) return nullptr;
+        auto *edge = dfg.edge(input->second);
+        if (!edge || edge->isMemEdge() || edge->isBackEdge() || edge->srcPortIdx() != 0)
+            return nullptr;
+        node = dfg.node(edge->srcId());
+        if (!node || node->operation() != "PASS") return node;
+        if (node->hasImm() || node->inputEdges().size() != 1) return nullptr;
+        port = 0;
+    }
+    return nullptr;
+}
+
+bool hasOp(DFGNode *node, const char *name) {
+    return node && node->operation() == name;
+}
+
+bool hasImmediate(DFGNode *node, const char *op, int port, uint64_t value) {
+    return hasOp(node, op) && node->immIdx() == port && node->imm() == value;
+}
+
+bool compare(DFG &dfg, DFGNode *node, const char *op, int constPort,
+             int value, DFGNode *source) {
+    return hasImmediate(node, op, constPort, value) && node->inputEdges().size() == 1 &&
+           operand(dfg, node, 1 - constPort) == source;
+}
+
+// The ordinary guard contains exactly three AND terms, in any order or
+// grouping: mode != 0, 0 <= index and index < 8.
+bool guardedIndex(DFG &dfg, DFGNode *guard, DFGNode *mode, DFGNode *index) {
+    unsigned splits = 0;
+    bool nonzero = false, lower = false, upper = false;
+    std::vector<DFGNode *> nodes{guard};
+    while (!nodes.empty()) {
+        auto *node = nodes.back();
+        nodes.pop_back();
+        if (hasOp(node, "AND") && !node->hasImm() && node->inputEdges().size() == 2) {
+            if (++splits > 2) return false;
+            nodes.push_back(operand(dfg, node, 0));
+            nodes.push_back(operand(dfg, node, 1));
+        } else if (hasOp(node, "OR") && !node->hasImm() && node->inputEdges().size() == 2) {
+            auto *lhs = operand(dfg, node, 0);
+            auto *rhs = operand(dfg, node, 1);
+            nonzero = (compare(dfg, lhs, "SLT", 1, 0, mode) &&
+                       compare(dfg, rhs, "SLT", 0, 0, mode)) ||
+                      (compare(dfg, rhs, "SLT", 1, 0, mode) &&
+                       compare(dfg, lhs, "SLT", 0, 0, mode));
+            if (!nonzero) return false;
+        } else if (compare(dfg, node, "SLE", 0, 0, index)) {
+            lower = true;
+        } else if (compare(dfg, node, "SLT", 1, 8, index)) {
+            upper = true;
+        } else {
+            return false;
+        }
+    }
+    return nonzero && lower && upper;
+}
+} // namespace
+
+DFGNode *DFG::boundedBreakPrefixAcc() {
+    DFGNode *acc = nullptr;
+    for (const auto &entry : nodes()) {
+        auto *n = entry.second;
+        if (!n->accumulative() && !hasOp(n, "ACC")) continue;
+        if (acc || !hasOp(n, "ACC") || !n->accumulative() || n->isLoopIndexAcc() ||
+            n->initVal() != 0 || n->cycles() != 8 || n->interval() != 1 ||
+            n->repeats() != 1 || !n->isAccFirst() || n->hasImm() ||
+            n->inputEdges().size() != 1) return nullptr;
+        acc = n;
+    }
+    if (!acc || ioNodes().size() != 4) return nullptr;
+    DFGIONode *load = nullptr, *store = nullptr;
+    std::set<std::string> objects;
+    for (int id : ioNodes()) {
+        auto *io = dynamic_cast<DFGIONode *>(node(id));
+        if (!io || io->memRefName().empty() || !objects.insert(io->memRefName()).second ||
+            io->memSize() != 16 || io->memOffset() || io->reducedMemOffset() ||
+            io->additionalStartDelay() || io->isPingpong() || io->hasImm() ||
+            io->pattern().size() != 1 ||
+            io->pattern()[0] != std::make_pair(hasOp(io, "LOAD") ? 0 : 2, 8)) return nullptr;
+        if (hasOp(io, "LOAD") && !load && io->inputEdges().size() == 1) load = io;
+        else if (hasOp(io, "CSTORE") && !store && io->isSequentialCStore() &&
+                 io->sequentialCStoreSlots() == 8 && io->sequentialCStoreObject() == io->memRefName() &&
+                 io->inputEdges().size() == 2) store = io;
+        else if (!hasOp(io, "INPUT") || !io->inputEdges().empty()) return nullptr;
+    }
+    if (!load || !store || operand(*this, store, 0) != load) return nullptr;
+    auto *scale = operand(*this, load, 0);
+    if ((!hasImmediate(scale, "MUL", 0, 2) && !hasImmediate(scale, "MUL", 1, 2)) ||
+        scale->inputEdges().size() != 1) return nullptr;
+    auto *select = operand(*this, scale, 1 - scale->immIdx());
+    if (!hasImmediate(select, "SEL", 0, 0) || select->inputEdges().size() != 2) return nullptr;
+    auto *index = operand(*this, select, 1);
+    auto *guard = operand(*this, select, 2);
+    auto *negative = operand(*this, acc, 0);
+    auto *mode = operand(*this, negative, 0);
+    if (!hasOp(index, "INPUT") || !hasOp(mode, "INPUT") || index == mode ||
+        !isIONode(index->id()) || !isIONode(mode->id()) ||
+        !compare(*this, negative, "SLT", 1, 0, mode) ||
+        !guardedIndex(*this, guard, mode, index)) return nullptr;
+    auto *enable = operand(*this, store, 2);
+    if (!hasOp(enable, "AND") || enable->hasImm() || enable->inputEdges().size() != 2)
+        return nullptr;
+    for (int port : {0, 1})
+        if (operand(*this, enable, port) == guard &&
+            compare(*this, operand(*this, enable, 1 - port), "SLE", 1, 0, acc))
+            return acc;
+    return nullptr;
+}
+
 
 // sort dfg nodes in topological order
 // depth-first search

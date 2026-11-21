@@ -3698,6 +3698,18 @@ bool generateCDFGfromKernelAfterOptimization(LLVMCDFG* CDFG, ADORA::KernelOp ker
           // // TODO: settle this
           return WalkResult::advance();
         } 
+        else if (isa<ADORA::PrefixCountOp>(op)) {
+          // An inclusive data accumulation. The input is the signed comparison
+          // for this slot; the index-ACC first-sample convention differs.
+          auto *node = CDFG->addNode(op, "ACC");
+          node->setLoopLevel(level);
+          node->setDataBits(16);
+          node->setAcc();
+          node->setACCinit("0");
+          node->setACCinterval("1");
+          node->setACCcount("8");
+          node->setACCrepeat("1");
+        }
         else if(op->getName().getStringRef() == "ADORA.interleaver"){
           ADORA::InterleaverOp interleaverop = dyn_cast<ADORA::InterleaverOp>(op);
           int interleavernum = interleaverop.getInterleaveNumber();
@@ -4901,6 +4913,25 @@ static memref::LoadOp localSelectedRead(ADORA::CondStoreOp store) {
   return {};
 }
 
+// After flattening, the original guard still protects the indirect read. The
+// prefix must gate just that guard at the unique store. Recheck this relation
+// when the mapper reads serialized kernel IR as well as during DFG export.
+static bool hasPrefixWritePath(ADORA::PrefixCountOp count, ADORA::CondStoreOp store) {
+  if (!count.getCount().hasOneUse()) return false;
+  auto alive = dyn_cast<arith::CmpIOp>(*count.getCount().getUsers().begin());
+  if (!alive || alive.getPredicate() != arith::CmpIPredicate::sle ||
+      alive.getLhs() != count.getCount() || !matchPattern(alive.getRhs(), m_Zero()) ||
+      !alive.getResult().hasOneUse()) return false;
+  auto gate = store.getCondition().getDefiningOp<arith::AndIOp>();
+  auto read = store.getValue().getDefiningOp<memref::LoadOp>();
+  if (!gate || !read || read.getIndices().size() != 1) return false;
+  auto address = read.getIndices().front().getDefiningOp<arith::IndexCastOp>();
+  auto safe = address ? address.getIn().getDefiningOp<arith::SelectOp>() : arith::SelectOp();
+  return safe && matchPattern(safe.getFalseValue(), m_Zero()) &&
+         ((gate.getLhs() == safe.getCondition() && gate.getRhs() == alive.getResult()) ||
+          (gate.getRhs() == safe.getCondition() && gate.getLhs() == alive.getResult()));
+}
+
 // Ordinary dynamic LOAD currently has a deliberately narrow execution contract.
 // Validate the disposable candidate before optimization, so fallback cannot
 // bypass the contract. The original kernel is still present only for rollback.
@@ -4927,6 +4958,11 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
     }
   });
   kernel.walk([&](ADORA::CondStoreOp) { hasCStore = true; });
+  ADORA::PrefixCountOp prefix;
+  kernel.walk([&](ADORA::PrefixCountOp op) {
+    if (prefix) reject(op, "only one prefix counter is supported");
+    prefix = op;
+  });
   kernel.walk([&](memref::LoadOp load) {
     // CSTORE graph construction deliberately omits unrelated direct memory.
     // Preserve that graph-only boundary, while validating every producer slice
@@ -4953,6 +4989,10 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
   // witness. Reconstruct its complete local body and object bindings on every
   // invocation, including the mapper reading serialized MLIR.
   const bool sameSlot = kernel->hasAttr("adora.large_direct_same_slot");
+  if (prefix && (!hasDynamicLoad || !hasCStore || sameSlot)) {
+    reject(prefix, "prefix requires a guarded dynamic read and a sequential conditional write");
+    return failure();
+  }
   if (sameSlot && (!kernel->getAttrOfType<UnitAttr>("adora.large_direct_same_slot") ||
                    hasDynamicLoad || !hasCStore)) {
     reject(kernel, "same-slot tile requires sequential inputs and a conditional store");
@@ -5160,6 +5200,19 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
         map.getNumResults() == 1 && map.getResult(0) == getAffineDimExpr(0, kernel.getContext()) &&
         store.getMapOperands().size() == 1 && store.getMapOperands()[0] == reductionLoop.getInductionVar();
   };
+  if (prefix) {
+    auto negative = prefix.getNegative().getDefiningOp<arith::CmpIOp>();
+    auto mode = negative ? negative.getLhs().getDefiningOp<affine::AffineLoadOp>() : affine::AffineLoadOp();
+    auto block = mode ? validObject(mode.getMemref()) : ADORA::DataBlockLoadOp();
+    auto dtype = block ? block->getAttrOfType<StringAttr>("adora.host_dtype") : StringAttr();
+    if (!stream || streamCount != 8 || function.getNumArguments() != 4 ||
+        !mode || !sequentialRead(mode) || !dtype || dtype.getValue() != "int16")
+      reject(prefix, "prefix requires an eight-slot stream from its read-only int16 mode object");
+    kernel.walk([&](ADORA::CondStoreOp store) {
+      if (!hasPrefixWritePath(prefix, store))
+        reject(store, "prefix must gate the guarded sample write with the inclusive count <= 0");
+    });
+  }
   if (sameSlot) {
     // Verify both local traversals, the predicate and the complete loop effects.
     // The shared checks below also prove zero-based full copies, unique object
@@ -5304,7 +5357,7 @@ static LogicalResult preflightBoundedDynamicLoads(ADORA::KernelOp kernel,
       }
       return;
     }
-    if (stream && isa<ADORA::CondStoreOp>(op)) return;
+    if (stream && isa<ADORA::CondStoreOp, ADORA::PrefixCountOp>(op)) return;
     if (!isa<affine::AffineYieldOp, arith::ConstantOp, arith::AddIOp,
              arith::MulIOp, arith::IndexCastOp, arith::SelectOp,
              memref::LoadOp, affine::AffineLoadOp, affine::AffineStoreOp>(op))
@@ -5644,6 +5697,12 @@ LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
   if (hasBoundedReads) {
     // Use the paired target's SLE/SLT/AND/OR/SUB operations. It does not
     // provide native NE/EQ/XOR. Run this only after the semantic range proof.
+    // mode != 0 lowers to (mode < 0) | (0 < mode). Share the signed
+    // comparison already driving the prefix counter on this same stream.
+    arith::CmpIOp prefixNegative;
+    fallbackKernel.walk([&](ADORA::PrefixCountOp count) {
+      prefixNegative = count.getNegative().getDefiningOp<arith::CmpIOp>();
+    });
     SmallVector<arith::CmpIOp> comparisons;
     fallbackKernel.walk([&](arith::CmpIOp cmp) {
       if (cmp.getPredicate() == arith::CmpIPredicate::sge ||
@@ -5659,7 +5718,13 @@ LogicalResult mlir::ADORA::generateCDFGfromKernel(LLVMCDFG* &CDFG,
       } else {
         auto predicate = cmp.getPredicate() == arith::CmpIPredicate::ne
             ? arith::CmpIPredicate::slt : arith::CmpIPredicate::sle;
-        auto lhs = builder.create<arith::CmpIOp>(cmp.getLoc(), predicate, cmp.getLhs(), cmp.getRhs());
+        mlir::Value lhs;
+        if (prefixNegative && predicate == arith::CmpIPredicate::slt &&
+            cmp.getLhs() == prefixNegative.getLhs() && matchPattern(cmp.getRhs(), m_Zero()) &&
+            prefixNegative->getBlock() == cmp->getBlock() && prefixNegative->isBeforeInBlock(cmp))
+          lhs = prefixNegative.getResult();
+        else
+          lhs = builder.create<arith::CmpIOp>(cmp.getLoc(), predicate, cmp.getLhs(), cmp.getRhs());
         auto rhs = builder.create<arith::CmpIOp>(cmp.getLoc(), predicate, cmp.getRhs(), cmp.getLhs());
         if (cmp.getPredicate() == arith::CmpIPredicate::ne)
           replacement = builder.create<arith::OrIOp>(cmp.getLoc(), lhs, rhs);
